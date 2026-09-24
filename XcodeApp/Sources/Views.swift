@@ -400,6 +400,11 @@ struct MessageRow: View {
                 }
                 if !msg.body.isEmpty {
                     Text(msg.body)
+                        .textSelection(.enabled)
+                        .contextMenu {
+                            Button("Copy") { NSPasteboard.general.setString(msg.body, forType: .string) }
+                        }
+                    LinkPreviewsView(text: msg.body)
                 }
                 ForEach(Array(msg.attachments.enumerated()), id: \.offset) { idx, att in
                     AttachmentRow(msg: msg, index: idx, att: att)
@@ -725,3 +730,100 @@ private func qrNSImage(_ string: String) -> NSImage? {
     guard let cg = context.createCGImage(scaled, from: scaled.extent) else { return nil }
     return NSImage(cgImage: cg, size: NSSize(width: 240, height: 240))
 }
+
+/// Extract URLs from text and display link previews
+struct LinkPreviewsView: View {
+    let text: String
+    @State private var previews: [URL: LinkPreview] = [:]
+    
+    private var urls: [URL] {
+        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        let matches = detector?.matches(in: text, range: NSRange(location: 0, length: text.utf16.count)) ?? []
+        return matches.compactMap { $0.url }
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(urls.prefix(3), id: \.self) { url in
+                LinkPreviewRow(url: url, preview: previews[url])
+                    .onAppear {
+                        if previews[url] == nil {
+                            Task { await fetchPreview(for: url) }
+                        }
+                    }
+            }
+        }
+    }
+    
+    private func fetchPreview(for url: URL) async {
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            if let html = String(data: data, encoding: .utf8),
+               let title = extractMeta(html, property: "og:title") ?? extractTag(html, tag: "title"),
+               let image = extractMeta(html, property: "og:image") {
+                let preview = LinkPreview(title: title, imageURL: URL(string: image), url: url)
+                await MainActor.run { previews[url] = preview }
+            }
+        } catch {
+            // Silently fail for link previews
+        }
+    }
+    
+    private func extractMeta(_ html: String, property: String) -> String? {
+        let pattern = "<meta property=\"\(property)\" content=\"([^\"]+)\""
+        let regex = try? NSRegularExpression(pattern: pattern)
+        let range = NSRange(location: 0, length: html.utf16.count)
+        return regex?.firstMatch(in: html, range: range).flatMap {
+            Range($0.range(at: 1), in: html).map { String(html[$0]) }
+        }
+    }
+    
+    private func extractTag(_ html: String, tag: String) -> String? {
+        let pattern = "<\(tag)[^>]*>([^<]+)</\(tag)>"
+        let regex = try? NSRegularExpression(pattern: pattern)
+        let range = NSRange(location: 0, length: html.utf16.count)
+        return regex?.firstMatch(in: html, range: range).flatMap {
+            Range($0.range(at: 1), in: html).map { String(html[$0]) }
+        }
+    }
+}
+
+struct LinkPreview {
+    let title: String
+    let imageURL: URL?
+    let url: URL
+}
+
+struct LinkPreviewRow: View {
+    let url: URL
+    let preview: LinkPreview?
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            if let preview = preview,
+               let imageURL = preview.imageURL {
+                AsyncImage(url: imageURL) { image in
+                    image.resizable().aspectRatio(contentMode: .fill)
+                } placeholder: {
+                    Color.gray.opacity(0.2)
+                }
+                .frame(width: 60, height: 60)
+                .cornerRadius(6)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(preview?.title ?? url.host ?? url.absoluteString)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                Text(url.absoluteString)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(8)
+        .background(Color.gray.opacity(0.08))
+        .cornerRadius(8)
+    }
+    }
