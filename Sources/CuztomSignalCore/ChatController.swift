@@ -94,6 +94,7 @@ public final class ChatController: @unchecked Sendable {
                     Log.info("live sync started")
                     if let me = try? await live.whoami() {
                         selfAci = me.aci
+                        live.selfAci = me.aci
                     }
                 } catch {
                     lastError = String(describing: error)

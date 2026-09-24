@@ -333,10 +333,48 @@ struct MessageRow: View {
 
     private let quickEmojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
 
+    private var isGroupMessage: Bool {
+        msg.author.groupId != nil
+    }
+
+    private var senderInitials: String {
+        // For group messages, show sender initials
+        if isGroupMessage {
+            if let authorName = msg.author.uuidString {
+                // Try to get initials from the ACI/UUID or use a hash-based approach
+                let name = msg.author.uuidString ?? "?"
+                let components = name.split(separator: " ")
+                if components.count >= 2 {
+                    return String(components[0].prefix(1)) + String(components[1].prefix(1))
+                } else {
+                    return String(name.prefix(2)).uppercased()
+                }
+            }
+        }
+        return ""
+    }
+
     var body: some View {
         HStack {
             if msg.direction == .outgoing { Spacer() }
             VStack(alignment: .leading, spacing: 4) {
+                // Sender name/initials for group messages (incoming only)
+                if isGroupMessage && msg.direction == .incoming {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(Color.accentColor.opacity(0.3))
+                            .frame(width: 24, height: 24)
+                            .overlay {
+                                Text(senderInitials)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.white)
+                            }
+                        Text(msg.author.uuidString?.prefix(8) ?? "Unknown")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.bottom, 2)
+                }
                 if !msg.body.isEmpty {
                     Text(msg.body)
                 }

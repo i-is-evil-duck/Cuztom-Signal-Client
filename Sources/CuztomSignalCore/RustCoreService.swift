@@ -131,6 +131,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private let dbPath: String
     private var didInit = false
     private var linked = false
+    /// Own ACI (resolved after linking via whoami) for identifying our own messages.
+    public var selfAci: String?
     /// Last roster snapshot, keyed by stable wire key (dedupe across refresh).
     private var messageCache: [String: RosterPayload.Message] = [:]
     private var uuidCache: [String: UUID] = [:]
@@ -692,7 +694,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             id: id,
             conversationId: m.thread,
             author: SignalAddress(
-                uuidString: m.outgoing ? nil : m.sender,
+                uuidString: m.outgoing ? (selfAci ?? "self") : m.sender,
                 groupId: isGroup ? m.thread : nil
             ),
             body: m.body.isEmpty ? (metas.isEmpty ? "" : "[attachment]") : m.body,
