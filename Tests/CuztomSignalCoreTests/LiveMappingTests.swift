@@ -57,20 +57,24 @@ private let rosterFixture = """
 }
 
 @Test func attachmentMetadataMaps() throws {
+    // chatMessage only links paths that exist on disk (stale cache prune).
+    let real = FileManager.default.temporaryDirectory.appendingPathComponent("cuztom-test-photo.jpg")
+    try "x".write(to: real, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: real) }
     let json = """
     {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],
      "messages":[{
       "key":"k","thread":"contact:x","sender":"x","sender_name":"X",
       "body":"","ts":9,"outgoing":false,
       "attachments":[
-        {"name":"photo.jpg","mime":"image/jpeg","size":123,"path":"/tmp/photo.jpg"},
+        {"name":"photo.jpg","mime":"image/jpeg","size":123,"path":"\(real.path)"},
         {"name":"big.mov","mime":"video/quicktime","size":999,"path":null}]}]}
     """
     let svc = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
     let payload = try JSONDecoder().decode(RosterPayload.self, from: Data(json.utf8))
     let msg = svc.chatMessage(payload.messages[0])
     #expect(msg.attachments.count == 2)
-    #expect(msg.attachments[0].localURL?.path == "/tmp/photo.jpg")
+    #expect(msg.attachments[0].localURL?.path == real.path)
     #expect(msg.attachments[1].localURL == nil)
     #expect(msg.body == "[attachment]")
 }

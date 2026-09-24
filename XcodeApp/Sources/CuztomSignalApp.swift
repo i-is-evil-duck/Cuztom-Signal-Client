@@ -194,13 +194,22 @@ final class ChatViewModel {
     func stageFiles(_ urls: [URL]) {
         let dir = pendingDir()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var staged = 0
         for url in urls {
+            // Finder drops / pasteboard URLs are security-scoped: without
+            // this the copy fails silently with a permission error.
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             let dest = dir.appendingPathComponent(url.lastPathComponent)
             try? FileManager.default.removeItem(at: dest)
             if (try? FileManager.default.copyItem(at: url, to: dest)) != nil {
                 if !pendingFiles.contains(dest) { pendingFiles.append(dest) }
+                staged += 1
+            } else {
+                Log.error("stage failed: \(url.lastPathComponent)")
             }
         }
+        Log.info("staged \(staged)/\(urls.count) files")
     }
 
     /// Paste images/files from the clipboard into the pending tray.

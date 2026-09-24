@@ -598,14 +598,25 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                             let reaction_only =
                                                 body_empty && pointers.is_empty();
                                             if !reaction_only {
-                                        // Eagerly fetch small attachments so
-                                        // the UI can render them inline.
+                                        // Eagerly fetch small media so the UI can
+                                        // render inline. Other file types stay
+                                        // metadata-only (manual Download).
                                         let thread = v.get("thread")
                                             .and_then(|t| t.as_str())
                                             .unwrap_or("")
                                             .to_string();
                                         let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
                                         for (i, ptr) in pointers.iter().enumerate() {
+                                            let is_media = ptr
+                                                .content_type
+                                                .as_deref()
+                                                .map(|m| {
+                                                    m.starts_with("image/") || m.starts_with("video/")
+                                                })
+                                                .unwrap_or(false);
+                                            if !is_media {
+                                                continue;
+                                            }
                                             match sync::download_attachment(
                                                 &mut manager, ptr, &thread, ts, i,
                                             )

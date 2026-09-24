@@ -15,8 +15,8 @@ struct AppKitVideoPlayer: NSViewRepresentable {
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.player = player
-        // No timeline/scrubber by design (scroll-to-seek removed).
-        view.controlsStyle = .none
+        // Native Apple controls (user asked); scrub timeline included.
+        view.controlsStyle = .inline
         return view
     }
 

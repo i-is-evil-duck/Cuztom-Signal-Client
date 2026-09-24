@@ -229,8 +229,11 @@ pub async fn thread_page(
     let self_aci = reg.service_ids.aci.to_string();
     let names = load_names(store).await;
     let thread = parse_thread(thread_id)?;
+    // The store casts bounds to i64: clamp u64::MAX ("latest") or it wraps
+    // to -1 and matches nothing. Real timestamps always fit in i64.
+    let before = before_sts.min(i64::MAX as u64);
     let mut msgs: Vec<Content> = store
-        .messages(&thread, ..before_sts)
+        .messages(&thread, ..before)
         .await
         .map_err(|e| format!("messages: {e}"))?
         .filter_map(|m| m.ok())

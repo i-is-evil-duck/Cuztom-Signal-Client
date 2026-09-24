@@ -135,6 +135,39 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private var messageCache: [String: RosterPayload.Message] = [:]
     private var uuidCache: [String: UUID] = [:]
     private var pumpTask: Task<Void, Never>?
+    /// Wire key -> local file path, persisted across launches so roster
+    /// re-seeds don't re-download (or re-prompt) every restart.
+    private var pathCache: [String: String] = [:]
+
+    private var pathCacheURL: URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))?.path ?? NSTemporaryDirectory()
+        return URL(fileURLWithPath: (base as NSString).appendingPathComponent("CuztomSignal/attachment_paths.json"))
+    }
+
+    private func loadPathCache() {
+        guard let data = try? Data(contentsOf: pathCacheURL),
+              let map = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+        // Prune entries whose files vanished (cache eviction, reinstalls).
+        pathCache = map.filter { FileManager.default.fileExists(atPath: $0.value) }
+    }
+
+    private func savePathCache() {
+        guard let data = try? JSONEncoder().encode(pathCache) else { return }
+        try? data.write(to: pathCacheURL, options: .atomic)
+    }
+
+    private func rememberPath(key: String, path: String) {
+        pathCache[key] = path
+        savePathCache()
+    }
+
+    /// Local override for on-demand downloads, keyed "thread/ts".
+    /// Consulted (and persisted) by `chatMessage`.
+    private var localPaths: [String: String] = [:]
+
+    public func bindLocalPath(thread: String, ts: Int64, path: String) {
+        localPaths["\(thread)/\(ts)"] = path
+    }
 
     public init(libraryPath: String? = nil, dbPath: String? = nil) {
         self.libraryPath = libraryPath
@@ -150,6 +183,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             libraryHandle = Self.openLibrary(at: path)
             if libraryHandle != nil { self.libraryPath = path }
         }
+        loadPathCache()
     }
 
     deinit {
@@ -564,12 +598,24 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
         let isGroup = m.thread.hasPrefix("group:")
         var metas: [AttachmentMeta] = []
-        for a in m.attachments {
+        for (index, a) in m.attachments.enumerated() {
+            // Newest source wins: live/on-demand override, then persisted
+            // cache, then the wire path. Missing files fall back to manual.
+            // Cache keys are per-attachment (message key + index).
+            let cacheKey = "\(m.key)/\(index)"
+            let candidate = localPaths["\(m.thread)/\(m.ts)"] ?? pathCache[cacheKey] ?? a.path
+            let resolved: URL? = {
+                guard let candidate, FileManager.default.fileExists(atPath: candidate) else { return nil }
+                return URL(fileURLWithPath: candidate)
+            }()
+            if let resolved {
+                rememberPath(key: cacheKey, path: resolved.path)
+            }
             metas.append(AttachmentMeta(
                 filename: a.name,
                 mimeType: a.mime,
                 byteCount: a.size,
-                localURL: a.path.map { URL(fileURLWithPath: $0) }
+                localURL: resolved
             ))
         }
         return ChatMessage(

@@ -18,9 +18,10 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use cuztom_signal_core::{
-    core_cmd_fetch_attachment, core_cmd_init, core_cmd_is_linked, core_cmd_request_contacts,
-    core_cmd_roster, core_cmd_send, core_cmd_thread, core_cmd_whoami, core_free_string,
-    core_last_error,
+    core_cmd_delete_local, core_cmd_fetch_attachment, core_cmd_init, core_cmd_is_linked,
+    core_cmd_profile, core_cmd_request_contacts, core_cmd_roster, core_cmd_send,
+    core_cmd_send_attachment, core_cmd_send_delete, core_cmd_send_reaction, core_cmd_thread,
+    core_cmd_whoami, core_free_string, core_last_error,
 };
 
 fn err() -> String {
@@ -53,7 +54,7 @@ fn default_db() -> String {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: live_test [db] <whoami|roster|thread <id> <limit>|send <thread> <body...>|fetch-attachment <thread> <ts> <index>|request-contacts>");
+    eprintln!("usage: live_test [db] <whoami|roster|thread <id> <limit>|send <thread> <body...>|send-attachment <thread> <path> [caption]|fetch-attachment <thread> <ts> <index>|send-delete <thread> <ts>|send-reaction <thread> <ts> <author> <emoji>|profile <uuid>|request-contacts>");
     std::process::exit(2);
 }
 
@@ -133,6 +134,70 @@ fn main() {
                 std::process::exit(1);
             }
             println!("sent to {} ts={ts}", args[1]);
+        }
+        "send-attachment" => {
+            if args.len() < 3 {
+                usage();
+            }
+            let caption = if args.len() > 3 { args[3..].join(" ") } else { String::new() };
+            let ts = unsafe {
+                core_cmd_send_attachment(
+                    cstr(&args[1]).as_ptr(),
+                    cstr(&args[2]).as_ptr(),
+                    cstr(&caption).as_ptr(),
+                )
+            };
+            if ts < 0 {
+                eprintln!("send-attachment failed: {}", err());
+                std::process::exit(1);
+            }
+            println!("attachment sent to {} ts={ts}", args[1]);
+        }
+        "send-delete" => {
+            if args.len() < 3 {
+                usage();
+            }
+            let target: u64 = args[2].parse().expect("ts");
+            let ts = unsafe { core_cmd_send_delete(cstr(&args[1]).as_ptr(), target) };
+            if ts < 0 {
+                eprintln!("send-delete failed: {}", err());
+                std::process::exit(1);
+            }
+            println!("tombstone sent to {} ts={ts}", args[1]);
+        }
+        "send-reaction" => {
+            if args.len() < 5 {
+                usage();
+            }
+            let target: u64 = args[2].parse().expect("ts");
+            let ts = unsafe {
+                core_cmd_send_reaction(
+                    cstr(&args[1]).as_ptr(),
+                    target,
+                    cstr(&args[3]).as_ptr(),
+                    cstr(&args[4]).as_ptr(),
+                    0,
+                )
+            };
+            if ts < 0 {
+                eprintln!("send-reaction failed: {}", err());
+                std::process::exit(1);
+            }
+            println!("reaction sent to {} ts={ts}", args[1]);
+        }
+        "profile" => {
+            if args.len() < 2 {
+                usage();
+            }
+            println!("{}", take_string(unsafe { core_cmd_profile(cstr(&args[1]).as_ptr()) }, "profile"));
+        }
+        "delete-local" => {
+            if args.len() < 3 {
+                usage();
+            }
+            let sts: u64 = args[2].parse().expect("sts");
+            let rc = unsafe { core_cmd_delete_local(cstr(&args[1]).as_ptr(), sts) };
+            println!("delete-local: {rc}");
         }
         "fetch-attachment" => {
             if args.len() < 4 {

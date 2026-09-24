@@ -107,6 +107,7 @@ struct MessageListView: View {
     @Environment(ChatViewModel.self) private var vm
     @State private var draft = ""
     @State private var loadingMore = false
+    @State private var dropActive = false
 
     var body: some View {
         @Bindable var vm = vm
@@ -243,7 +244,7 @@ struct MessageListView: View {
                         .disabled((draft.trimmingCharacters(in: .whitespaces).isEmpty && vm.pendingFiles.isEmpty) || vm.sendingAttachment)
                 }
                 .padding()
-                .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                .onDrop(of: [.fileURL], isTargeted: $dropActive) { providers in
                     for p in providers {
                         // NOTE: this callback is nonisolated and must not
                         // capture the view model — relay through DropRelay.
@@ -252,6 +253,13 @@ struct MessageListView: View {
                         }
                     }
                     return true
+                }
+                .overlay {
+                    if dropActive {
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.accentColor, lineWidth: 3)
+                            .padding(6)
+                    }
                 }
             }
         }

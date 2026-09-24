@@ -219,7 +219,17 @@ public final class ChatController: @unchecked Sendable {
 
     /// Upload + send a local file (`caption` = message body, may be empty).
     public func sendAttachment(fileURL: URL, caption: String) async -> Bool {
-        guard let id = selectedId, let live = service as? RustCoreService else { return false }
+        Log.info("attachment send start: \(fileURL.lastPathComponent) caption=\(caption.count) chars")
+        guard let id = selectedId else {
+            lastError = "no conversation selected"
+            Log.error("attachment send: no conversation selected")
+            return false
+        }
+        guard let live = service as? RustCoreService else {
+            lastError = "attachments need the live backend"
+            Log.error("attachment send: no live backend")
+            return false
+        }
         do {
             let sent = try await live.sendAttachment(thread: id, path: fileURL.path, caption: caption)
             let meta = AttachmentMeta(filename: sent.name, mimeType: sent.mime, byteCount: sent.size, localURL: fileURL)
@@ -476,6 +486,7 @@ public final class ChatController: @unchecked Sendable {
                 ts: sts,
                 index: index
             )
+            live.bindLocalPath(thread: stored.conversationId, ts: sts, path: url.path)
             await store.updateMessage(id: messageId) { $0.attachments[index].localURL = url }
             if stored.conversationId == selectedId {
                 messages = await store.messages(in: stored.conversationId)
@@ -499,7 +510,8 @@ public final class ChatController: @unchecked Sendable {
     }
 
     /// Auto-fetch missing attachments after launch (roster seeds metadata
-    /// only). Bounded: newest-first, capped count, core skips oversized.
+    /// only). Media (images/video, incl. GIFs) fetch automatically; other
+    /// file types stay manual. Bounded: newest-first, capped count.
     /// Fire-and-forget from `finish()`; failures stay quiet in the log.
     public func autoFetchMissing(maxFiles: Int = 20) async {
         guard service is RustCoreService else { return }
@@ -509,7 +521,10 @@ public final class ChatController: @unchecked Sendable {
             let list = await store.messages(in: conv.id)
             for m in list.reversed() {
                 if fetched >= maxFiles { break }
-                for idx in m.attachments.indices where m.attachments[idx].localURL == nil {
+                for idx in m.attachments.indices {
+                    let att = m.attachments[idx]
+                    guard att.localURL == nil,
+                          att.mimeType.hasPrefix("image/") || att.mimeType.hasPrefix("video/") else { continue }
                     if await downloadAttachment(messageId: m.id, index: idx) {
                         fetched += 1
                     }
