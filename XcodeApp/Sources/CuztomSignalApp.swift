@@ -123,7 +123,15 @@ final class ChatViewModel {
             return
         }
         backendName = "Live"
-        let controller = ChatController(service: live)
+        let store: any MessageStoring
+        do {
+            store = try SQLiteMessageStore()
+            Log.info("SQLiteMessageStore initialized")
+        } catch {
+            Log.error("SQLiteMessageStore init failed, falling back to in-memory: \(error)")
+            store = InMemoryMessageStore()
+        }
+        let controller = ChatController(service: live, store: store)
         self.controller = controller
         self.liveService = live
         guard await controller.begin() else {
