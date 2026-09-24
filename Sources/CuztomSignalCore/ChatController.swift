@@ -25,10 +25,16 @@ public final class ChatController: @unchecked Sendable {
     private var store: any MessageStoring
     private var observerTask: Task<Void, Never>?
     private var watchTask: Task<Void, Never>?
+    private let pluginHost: PluginHost
 
-    public init(service: any SignalService, store: any MessageStoring = InMemoryMessageStore()) {
+    public init(
+        service: any SignalService,
+        store: any MessageStoring = InMemoryMessageStore(),
+        pluginHost: PluginHost = PluginHost()
+    ) {
         self.service = service
         self.store = store
+        self.pluginHost = pluginHost
     }
 
     public var isLinked: Bool {
@@ -510,6 +516,20 @@ public final class ChatController: @unchecked Sendable {
         if message.conversationId == selectedId {
             messages = await store.messages(in: message.conversationId)
         }
+        // Fan out to plugins (onMessage hooks) — capture actor-isolated values here
+        let currentConversations = conversations
+        let currentSelectedId = selectedId
+        let currentSelfAci = selfAci
+        let ctx = PluginContext(
+            conversations: { currentConversations },
+            selectedThread: { currentSelectedId },
+            recentMessages: { id, limit in await self.store.messages(in: id, limit: limit) },
+            diagnostics: { await self.diagnostics() },
+            account: { currentSelfAci ?? "unknown" },
+            rosterSummary: { "\(currentConversations.count) conversations" },
+            requestSync: { await self.requestSync() }
+        )
+        await pluginHost.notifyMessage(message, ctx: ctx)
     }
 
     /// Auto-fetch missing attachments after launch (roster seeds metadata

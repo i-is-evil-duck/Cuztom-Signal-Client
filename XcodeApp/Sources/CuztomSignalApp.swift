@@ -131,7 +131,7 @@ final class ChatViewModel {
             Log.error("SQLiteMessageStore init failed, falling back to in-memory: \(error)")
             store = InMemoryMessageStore()
         }
-        let controller = ChatController(service: live, store: store)
+        let controller = ChatController(service: live, store: store, pluginHost: plugins)
         self.controller = controller
         self.liveService = live
         guard await controller.begin() else {
