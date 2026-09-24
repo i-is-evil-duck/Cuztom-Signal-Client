@@ -646,3 +646,54 @@ pub async fn upload_file(
         .map_err(|e| format!("upload: {e}"))?
         .map_err(|e| format!("upload rejected: {e:?}"))
 }
+
+/// Send a read/delivery receipt for the given message timestamps (store clocks).
+/// `kind` is "read" or "delivered".
+pub async fn send_receipt(
+    manager: &mut StoredManager,
+    thread: &str,
+    timestamps: &[u64],
+    kind: &str,
+) -> Result<(), String> {
+    use presage::libsignal_service::proto::ReceiptMessage;
+    use presage::libsignal_service::protocol::{Aci, ServiceId};
+    use presage::libsignal_service::content::ContentBody;
+
+    let receipt_type = match kind {
+        "read" => 1i32,
+        "delivered" => 0i32,
+        _ => return Err("invalid receipt kind".to_string()),
+    };
+
+    // Parse thread to get recipient ServiceId
+    let recipient = if let Some(uuid) = thread.strip_prefix("contact:") {
+        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
+        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
+        ServiceId::Aci(Aci::from(parsed))
+    } else if let Some(_hexkey) = thread.strip_prefix("group:") {
+        // For groups, send to self (multi-device sync will distribute)
+        // Receipts for groups are handled differently - just skip for now
+        return Err("group receipts not yet supported".to_string());
+    } else {
+        return Err("bad thread id".to_string());
+    };
+
+    let receipt_msg = ReceiptMessage {
+        r#type: Some(receipt_type),
+        timestamp: timestamps.iter().map(|&ts| ts as u64).collect(),
+    };
+
+    let content_body: ContentBody = ContentBody::ReceiptMessage(receipt_msg);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("time error: {e}"))?
+        .as_millis() as u64;
+
+    // Use the manager's public send_message which accepts any ContentBody
+    manager
+        .send_message(recipient, content_body, timestamp)
+        .await
+        .map_err(|e| format!("send receipt: {e}"))?;
+
+    Ok(())
+}

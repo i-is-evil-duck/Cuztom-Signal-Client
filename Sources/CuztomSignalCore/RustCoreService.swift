@@ -402,6 +402,19 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         guard ts >= 0 else { throw SignalError.network("reaction failed: \(lastError(sym))") }
     }
 
+    /// Send a read/delivery receipt for the given message timestamps (store clocks).
+    /// `kind` is "read" or "delivered".
+    public func sendReceipt(thread: String, timestamps: [Int64], kind: String) async throws {
+        let sym = try await initCore()
+        let tsArray = timestamps.map { UInt64(bitPattern: $0) }
+        let rc = thread.withCString { t in
+            kind.withCString { k in
+                sym.sendReceipt(t, tsArray, UInt64(tsArray.count), k)
+            }
+        }
+        guard rc == 0 else { throw SignalError.network("send receipt failed: \(lastError(sym))") }
+    }
+
     /// Profile display name for a contact uuid (nil when unavailable).
     public func profileName(uuid: String) async -> String? {
         guard let sym = try? await initCore() else { return nil }
@@ -524,6 +537,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let sendReply: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int64
         let sendDelete: @convention(c) (UnsafePointer<CChar>, UInt64) -> Int64
         let sendReaction: @convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>, Int32) -> Int64
+        let sendReceipt: @convention(c) (UnsafePointer<CChar>, UnsafePointer<UInt64>, UInt64, UnsafePointer<CChar>) -> Int32
         let deleteLocal: @convention(c) (UnsafePointer<CChar>, UInt64) -> Int32
         let profile: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let whoami: @convention(c) () -> UnsafeMutablePointer<CChar>?
@@ -768,6 +782,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let sr = dlsym(handle, "core_cmd_send_reply"),
               let sd = dlsym(handle, "core_cmd_send_delete"),
               let se = dlsym(handle, "core_cmd_send_reaction"),
+              let srec = dlsym(handle, "core_cmd_send_receipt"),
               let dl = dlsym(handle, "core_cmd_delete_local"),
               let pf = dlsym(handle, "core_cmd_profile"),
               let w = dlsym(handle, "core_cmd_whoami"),
@@ -790,6 +805,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             sendReply: unsafeBitCast(sr, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int64).self),
             sendDelete: unsafeBitCast(sd, to: (@convention(c) (UnsafePointer<CChar>, UInt64) -> Int64).self),
             sendReaction: unsafeBitCast(se, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>, Int32) -> Int64).self),
+            sendReceipt: unsafeBitCast(srec, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<UInt64>, UInt64, UnsafePointer<CChar>) -> Int32).self),
             deleteLocal: unsafeBitCast(dl, to: (@convention(c) (UnsafePointer<CChar>, UInt64) -> Int32).self),
             profile: unsafeBitCast(pf, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             whoami: unsafeBitCast(w, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),

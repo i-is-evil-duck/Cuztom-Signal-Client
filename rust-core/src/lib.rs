@@ -114,6 +114,12 @@ enum Command {
         sts: u64,
         reply: oneshot::Sender<Result<bool, String>>,
     },
+    SendReceipt {
+        thread: String,
+        timestamps: Vec<u64>,
+        kind: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -156,6 +162,12 @@ enum LoopCtrl {
         emoji: String,
         remove: bool,
         reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
+    SendReceipt {
+        thread: String,
+        timestamps: Vec<u64>,
+        kind: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     FetchAttachment {
         thread_id: String,
@@ -329,6 +341,10 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                         }
                         Command::DeleteLocal { thread_id, sts, reply } => {
                             let result = cmd_delete_local(&state, &thread_id, sts).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::SendReceipt { thread, timestamps, kind, reply } => {
+                            let result = cmd_send_receipt(&mut state, &thread, timestamps, &kind).await;
                             let _ = reply.send(result);
                         }
                         Command::Logout { reply } => {
@@ -565,6 +581,10 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(LoopCtrl::SendReaction { thread, target_sts, target_author, emoji, remove, reply }) => {
                                     let r = send_reaction_inner(&mut manager, &thread, target_sts, &target_author, &emoji, remove).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::SendReceipt { thread, timestamps, kind, reply }) => {
+                                    let r = sync::send_receipt(&mut manager, &thread, &timestamps, &kind).await;
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::FetchAttachment { thread_id, ts, index, reply }) => {
@@ -919,6 +939,31 @@ async fn cmd_delete_local(state: &WorkerState, thread_id: &str, sts: u64) -> Res
                     .await
                     .map_err(|e| format!("delete: {e}"))
             }
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Send a read/delivery receipt for the given message timestamps.
+async fn cmd_send_receipt(
+    state: &mut WorkerState,
+    thread: &str,
+    timestamps: Vec<u64>,
+    kind: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendReceipt {
+                thread: thread.to_string(),
+                timestamps,
+                kind: kind.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
         }
         _ => Err("not linked".to_string()),
     }
@@ -1290,6 +1335,43 @@ pub extern "C" fn core_cmd_delete_local(thread: *const c_char, sts: u64) -> i32 
     match roundtrip(|reply| Command::DeleteLocal { thread_id: t, sts, reply }) {
         Ok(Ok(true)) => 1,
         Ok(Ok(false)) => 0,
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
+/// Send a read/delivery receipt for the given timestamps (store clocks).
+/// `kind` = "read" | "delivered". 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_receipt(
+    thread: *const c_char,
+    timestamps_ptr: *const u64,
+    timestamps_len: usize,
+    kind: *const c_char,
+) -> i32 {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let k = match c_str_arg(kind, "kind") {
+        Ok(k) => k,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let timestamps = if timestamps_ptr.is_null() || timestamps_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(timestamps_ptr, timestamps_len).to_vec() }
+    };
+    match roundtrip(|reply| Command::SendReceipt { thread: t, timestamps, kind: k, reply }) {
+        Ok(Ok(())) => 0,
         Ok(Err(e)) | Err(e) => {
             set_last_error(e);
             -1
