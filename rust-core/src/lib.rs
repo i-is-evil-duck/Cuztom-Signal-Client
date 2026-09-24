@@ -200,6 +200,19 @@ enum Command {
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
+    // M3: Message edits
+    SendMessageEdit {
+        thread: String,
+        target_ts: u64,
+        new_body: String,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    // M3: Typing indicators
+    SendTyping {
+        thread: String,
+        started: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Control plane into the running sync loop (which owns `&mut Manager`).
@@ -244,6 +257,19 @@ enum LoopCtrl {
         thread: String,
         timestamps: Vec<u64>,
         kind: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    // M3: Message edits
+    SendMessageEdit {
+        thread: String,
+        target_ts: u64,
+        new_body: String,
+        reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
+    // M3: Typing indicators
+    SendTyping {
+        thread: String,
+        started: bool,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     // M2: Group management
@@ -494,6 +520,16 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                         }
                         Command::SendReceipt { thread, timestamps, kind, reply } => {
                             let result = cmd_send_receipt(&mut state, &thread, timestamps, &kind).await;
+                            let _ = reply.send(result);
+                        }
+                        // M3: Message edits
+                        Command::SendMessageEdit { thread, target_ts, new_body, reply } => {
+                            let result = cmd_send_message_edit(&mut state, &thread, target_ts, &new_body).await;
+                            let _ = reply.send(result);
+                        }
+                        // M3: Typing indicators
+                        Command::SendTyping { thread, started, reply } => {
+                            let result = cmd_send_typing(&mut state, &thread, started).await;
                             let _ = reply.send(result);
                         }
                         // M2: Group management
@@ -792,6 +828,16 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(LoopCtrl::SendReceipt { thread, timestamps, kind, reply }) => {
                                     let r = sync::send_receipt(&mut manager, &thread, &timestamps, &kind).await;
+                                    let _ = reply.send(r);
+                                }
+                                // M3: Message edits
+                                Some(LoopCtrl::SendMessageEdit { thread, target_ts, new_body, reply }) => {
+                                    let r = sync::send_message_edit(&mut manager, &thread, target_ts, &new_body).await;
+                                    let _ = reply.send(r);
+                                }
+                                // M3: Typing indicators
+                                Some(LoopCtrl::SendTyping { thread, started, reply }) => {
+                                    let r = sync::send_typing(&mut manager, &thread, started).await;
                                     let _ = reply.send(r);
                                 }
                                 // M2: Group management
@@ -1225,6 +1271,54 @@ async fn cmd_send_receipt(
                 thread: thread.to_string(),
                 timestamps,
                 kind: kind.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Send a message edit (replaces content).
+async fn cmd_send_message_edit(
+    state: &mut WorkerState,
+    thread: &str,
+    target_ts: u64,
+    new_body: &str,
+) -> Result<u64, String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendMessageEdit {
+                thread: thread.to_string(),
+                target_ts,
+                new_body: new_body.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Send a typing indicator.
+async fn cmd_send_typing(
+    state: &mut WorkerState,
+    thread: &str,
+    started: bool,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendTyping {
+                thread: thread.to_string(),
+                started,
                 reply: tx,
             })
             .map_err(|_| "sync loop is gone".to_string())?;
@@ -1898,6 +1992,43 @@ pub extern "C" fn core_cmd_send_receipt(
             set_last_error(e);
             -1
         }
+    }
+}
+
+/// Send a message edit (replaces content). Returns sent timestamp (ms), or -1 on error.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_message_edit(
+    thread: *const c_char,
+    target_ts: u64,
+    new_body: *const c_char,
+) -> i64 {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let b = match c_str_arg(new_body, "new_body") {
+        Ok(b) => b,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::SendMessageEdit { thread: t, target_ts, new_body: b, reply }) {
+        Ok(Ok(ts)) => ts as i64,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Send a typing indicator. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_typing(
+    thread: *const c_char,
+    started: i32,
+) -> i32 {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::SendTyping { thread: t, started: started != 0, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
     }
 }
 

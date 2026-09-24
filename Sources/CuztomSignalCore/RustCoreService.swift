@@ -417,6 +417,30 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         guard rc == 0 else { throw SignalError.network("send receipt failed: \(lastError(sym))") }
     }
 
+    // MARK: - M3: Message Edits & Typing
+
+    /// Send a message edit (replaces content). Returns sent timestamp (ms).
+    public func sendMessageEdit(thread: String, targetTs: Int64, newBody: String) async throws -> Int64 {
+        let sym = try await initCore()
+        var ts: Int64 = -1
+        thread.withCString { t in
+            newBody.withCString { b in
+                ts = sym.sendMessageEdit(t, UInt64(bitPattern: targetTs), b)
+            }
+        }
+        guard ts >= 0 else { throw SignalError.network("send message edit failed: \(lastError(sym))") }
+        return ts
+    }
+
+    /// Send a typing indicator.
+    public func sendTyping(thread: String, started: Bool) async throws {
+        let sym = try await initCore()
+        let rc = thread.withCString { t in
+            sym.sendTyping(t, started ? 1 : 0)
+        }
+        guard rc == 0 else { throw SignalError.network("send typing failed: \(lastError(sym))") }
+    }
+
     // MARK: - M4: Call Signaling
 
     /// Send a call offer (SDP) to start a call.
@@ -592,6 +616,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let sendDelete: @convention(c) (UnsafePointer<CChar>, UInt64) -> Int64
         let sendReaction: @convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>, Int32) -> Int64
         let sendReceipt: @convention(c) (UnsafePointer<CChar>, UnsafePointer<UInt64>, UInt64, UnsafePointer<CChar>) -> Int32
+        let sendMessageEdit: @convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>) -> Int64
+        let sendTyping: @convention(c) (UnsafePointer<CChar>, Int32) -> Int32
         let sendCallOffer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let sendCallAnswer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let sendCallIce: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UInt32) -> Int32
@@ -841,6 +867,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let sd = dlsym(handle, "core_cmd_send_delete"),
               let se = dlsym(handle, "core_cmd_send_reaction"),
               let srec = dlsym(handle, "core_cmd_send_receipt"),
+              let sme = dlsym(handle, "core_cmd_send_message_edit"),
+              let sty = dlsym(handle, "core_cmd_send_typing"),
               let sco = dlsym(handle, "core_cmd_send_call_offer"),
               let sca = dlsym(handle, "core_cmd_send_call_answer"),
               let sci = dlsym(handle, "core_cmd_send_call_ice"),
@@ -868,6 +896,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             sendDelete: unsafeBitCast(sd, to: (@convention(c) (UnsafePointer<CChar>, UInt64) -> Int64).self),
             sendReaction: unsafeBitCast(se, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>, Int32) -> Int64).self),
             sendReceipt: unsafeBitCast(srec, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<UInt64>, UInt64, UnsafePointer<CChar>) -> Int32).self),
+            sendMessageEdit: unsafeBitCast(sme, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>) -> Int64).self),
+            sendTyping: unsafeBitCast(sty, to: (@convention(c) (UnsafePointer<CChar>, Int32) -> Int32).self),
             sendCallOffer: unsafeBitCast(sco, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             sendCallAnswer: unsafeBitCast(sca, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             sendCallIce: unsafeBitCast(sci, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UInt32) -> Int32).self),

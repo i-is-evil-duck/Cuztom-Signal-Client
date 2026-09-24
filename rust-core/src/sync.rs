@@ -749,3 +749,89 @@ pub async fn send_call_hangup_inner(
     // TODO: M4 - Send hangup via Signal's call signaling
     Ok(())
 }
+
+/// Send a message edit to the remote peer via Signal's websocket.
+pub async fn send_message_edit(
+    manager: &mut StoredManager,
+    thread: &str,
+    target_ts: u64,
+    new_body: &str,
+) -> Result<u64, String> {
+    use presage::libsignal_service::proto::EditMessage;
+    use presage::libsignal_service::content::ContentBody;
+    use presage::libsignal_service::protocol::{Aci, ServiceId};
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("time error: {e}"))?
+        .as_millis() as u64;
+
+    // Parse thread to get recipient ServiceId
+    let recipient = if let Some(uuid) = thread.strip_prefix("contact:") {
+        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
+        let parsed: uuid::Uuid = uuid.parse().map_err(|_| "bad contact id".to_string())?;
+        ServiceId::Aci(Aci::from(parsed))
+    } else if let Some(_hexkey) = thread.strip_prefix("group:") {
+        return Err("group message edits not yet supported".to_string());
+    } else {
+        return Err("bad thread id".to_string());
+    };
+
+    let edit_msg = presage::proto::EditMessage {
+        target_sent_timestamp: Some(target_ts),
+        data_message: Some(presage::proto::DataMessage {
+            body: Some(new_body.to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let content_body: ContentBody = ContentBody::EditMessage(edit_msg);
+
+    manager
+        .send_message(recipient, content_body, timestamp)
+        .await
+        .map_err(|e| format!("send edit: {e}"))?;
+
+    Ok(timestamp)
+}
+
+/// Send a typing indicator to the remote peer via Signal's websocket.
+pub async fn send_typing(
+    manager: &mut StoredManager,
+    thread: &str,
+    started: bool,
+) -> Result<(), String> {
+    use presage::libsignal_service::content::ContentBody;
+    use presage::libsignal_service::proto::TypingMessage;
+    use presage::libsignal_service::protocol::{Aci, ServiceId};
+
+    let recipient = if let Some(uuid) = thread.strip_prefix("contact:") {
+        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
+        let parsed: uuid::Uuid = uuid.parse().map_err(|_| "bad contact id".to_string())?;
+        ServiceId::Aci(Aci::from(parsed))
+    } else if let Some(_hexkey) = thread.strip_prefix("group:") {
+        // For groups, typing indicators work similarly
+        return Err("group typing not yet supported".to_string());
+    } else {
+        return Err("bad thread id".to_string());
+    };
+
+    let typing_msg = TypingMessage {
+        action: if started { Some(0) } else { Some(1) }, // 0 = started, 1 = stopped
+        ..Default::default()
+    };
+
+    let content_body: ContentBody = ContentBody::TypingMessage(typing_msg);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("time error: {e}"))?
+        .as_millis() as u64;
+
+    manager
+        .send_message(recipient, content_body, timestamp)
+        .await
+        .map_err(|e| format!("send typing: {e}"))?;
+
+    Ok(())
+}
