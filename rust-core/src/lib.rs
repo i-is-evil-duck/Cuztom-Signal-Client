@@ -66,6 +66,33 @@ enum Command {
         body: String,
         reply: oneshot::Sender<Result<u64, String>>,
     },
+    SendAttachment {
+        thread: String,
+        path: String,
+        caption: String,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    SendReply {
+        thread: String,
+        body: String,
+        quote_ts: u64,
+        quote_author: String,
+        quote_body: String,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    SendDelete {
+        thread: String,
+        target_ts: u64,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    SendReaction {
+        thread: String,
+        target_sts: u64,
+        target_author: String,
+        emoji: String,
+        remove: bool,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
     ThreadPage {
         thread_id: String,
         limit: usize,
@@ -77,6 +104,15 @@ enum Command {
         ts: u64,
         index: usize,
         reply: oneshot::Sender<Result<String, String>>,
+    },
+    Profile {
+        uuid: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    DeleteLocal {
+        thread_id: String,
+        sts: u64,
+        reply: oneshot::Sender<Result<bool, String>>,
     },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
@@ -94,10 +130,41 @@ enum LoopCtrl {
         body: String,
         reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
     },
+    SendAttachment {
+        thread: String,
+        path: String,
+        caption: String,
+        reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
+    SendReply {
+        thread: String,
+        body: String,
+        quote_ts: u64,
+        quote_author: String,
+        quote_body: String,
+        reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
+    SendDelete {
+        thread: String,
+        target_ts: u64,
+        reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
+    SendReaction {
+        thread: String,
+        target_sts: u64,
+        target_author: String,
+        emoji: String,
+        remove: bool,
+        reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
     FetchAttachment {
         thread_id: String,
         ts: u64,
         index: usize,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    Profile {
+        uuid: String,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
 }
@@ -232,12 +299,36 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                             let result = cmd_send(&mut state, &thread, &body).await;
                             let _ = reply.send(result);
                         }
+                        Command::SendAttachment { thread, path, caption, reply } => {
+                            let result = cmd_send_attachment(&mut state, &thread, &path, &caption).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::SendReply { thread, body, quote_ts, quote_author, quote_body, reply } => {
+                            let result = cmd_send_reply(&mut state, &thread, &body, quote_ts, &quote_author, &quote_body).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::SendDelete { thread, target_ts, reply } => {
+                            let result = cmd_send_delete(&mut state, &thread, target_ts).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::SendReaction { thread, target_sts, target_author, emoji, remove, reply } => {
+                            let result = cmd_send_reaction(&mut state, &thread, target_sts, &target_author, &emoji, remove).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::Profile { uuid, reply } => {
+                            let result = cmd_profile(&mut state, &uuid).await;
+                            let _ = reply.send(result);
+                        }
                         Command::ThreadPage { thread_id, limit, before_ts, reply } => {
                             let result = cmd_thread_page(&state, &thread_id, limit, before_ts).await;
                             let _ = reply.send(result);
                         }
                         Command::FetchAttachment { thread_id, ts, index, reply } => {
                             let result = cmd_fetch_attachment(&mut state, &thread_id, ts, index).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::DeleteLocal { thread_id, sts, reply } => {
+                            let result = cmd_delete_local(&state, &thread_id, sts).await;
                             let _ = reply.send(result);
                         }
                         Command::Logout { reply } => {
@@ -445,17 +536,68 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                     let r = sync::do_send(&mut manager, &thread, &body).await;
                                     let _ = reply.send(r);
                                 }
+                                Some(LoopCtrl::SendAttachment { thread, path, caption, reply }) => {
+                                    let r = cmd_send_attachment_inner(&mut manager, &thread, &path, &caption).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::SendReply { thread, body, quote_ts, quote_author, quote_body, reply }) => {
+                                    let quote = sync::make_quote(quote_ts, &quote_author, &quote_body);
+                                    let r = sync::do_send_full(
+                                        &mut manager,
+                                        &thread,
+                                        &body,
+                                        Vec::new(),
+                                        sync::SendExtras { quote: Some(quote), delete_ts: None },
+                                    )
+                                    .await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::SendDelete { thread, target_ts, reply }) => {
+                                    let r = sync::do_send_full(
+                                        &mut manager,
+                                        &thread,
+                                        "",
+                                        Vec::new(),
+                                        sync::SendExtras { quote: None, delete_ts: Some(target_ts) },
+                                    )
+                                    .await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::SendReaction { thread, target_sts, target_author, emoji, remove, reply }) => {
+                                    let r = send_reaction_inner(&mut manager, &thread, target_sts, &target_author, &emoji, remove).await;
+                                    let _ = reply.send(r);
+                                }
                                 Some(LoopCtrl::FetchAttachment { thread_id, ts, index, reply }) => {
                                     let r = sync::fetch_attachment(&mut manager, &thread_id, ts, index).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::Profile { uuid, reply }) => {
+                                    let r = sync::profile_name(&mut manager, &uuid).await;
                                     let _ = reply.send(r);
                                 }
                                 None => break,
                             },
                             next = stream.next() => match next {
                                 Some(Received::Content(c)) => {
-                                    if let Some((mut v, pointers)) =
-                                        sync::content_parts(&c, &self_aci, &names)
-                                    {
+                                    // Reactions + receipts travel as message
+                                    // envelopes; emit them as events, never rows.
+                                    if let Some(rv) = sync::receipt_part(&c, &names) {
+                                        let _ = event_tx.send(rv.to_string());
+                                    } else {
+                                        if let Some(rv) = sync::reaction_part(&c, &names) {
+                                            let _ = event_tx.send(rv.to_string());
+                                        }
+                                        if let Some((mut v, pointers)) =
+                                            sync::content_parts(&c, &self_aci, &names)
+                                        {
+                                            let body_empty = v
+                                                .get("body")
+                                                .and_then(|b| b.as_str())
+                                                .map(|b| b.is_empty())
+                                                .unwrap_or(true);
+                                            let reaction_only =
+                                                body_empty && pointers.is_empty();
+                                            if !reaction_only {
                                         // Eagerly fetch small attachments so
                                         // the UI can render them inline.
                                         let thread = v.get("thread")
@@ -486,7 +628,9 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                             serde_json::json!({"type": "message", "message": v})
                                                 .to_string(),
                                         );
+                                        }
                                     }
+                                }
                                 }
                                 Some(received) => {
                                     if matches!(received, Received::Contacts) {
@@ -570,6 +714,200 @@ async fn cmd_thread_page(
         WorkerState::Linked(linked) => {
             let store = linked.open_store().await?;
             sync::thread_page(&store, thread_id, limit, before_ts).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Upload + send a local file. `caption` becomes the message body.
+async fn cmd_send_attachment_inner(
+    manager: &mut StoredManager,
+    thread: &str,
+    path: &str,
+    caption: &str,
+) -> Result<u64, String> {
+    let ptr = sync::upload_file(manager, std::path::Path::new(path)).await?;
+    sync::do_send_full(manager, thread, caption, vec![ptr], sync::SendExtras::default()).await
+}
+
+async fn cmd_send_attachment(
+    state: &mut WorkerState,
+    thread: &str,
+    path: &str,
+    caption: &str,
+) -> Result<u64, String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendAttachment {
+                thread: thread.to_string(),
+                path: path.to_string(),
+                caption: caption.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+async fn cmd_send_reply(
+    state: &mut WorkerState,
+    thread: &str,
+    body: &str,
+    quote_ts: u64,
+    quote_author: &str,
+    quote_body: &str,
+) -> Result<u64, String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendReply {
+                thread: thread.to_string(),
+                body: body.to_string(),
+                quote_ts,
+                quote_author: quote_author.to_string(),
+                quote_body: quote_body.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+async fn cmd_send_delete(state: &mut WorkerState, thread: &str, target_ts: u64) -> Result<u64, String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendDelete { thread: thread.to_string(), target_ts, reply: tx })
+                .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+async fn cmd_send_reaction(
+    state: &mut WorkerState,
+    thread: &str,
+    target_sts: u64,
+    target_author: &str,
+    emoji: &str,
+    remove: bool,
+) -> Result<u64, String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendReaction {
+                thread: thread.to_string(),
+                target_sts,
+                target_author: target_author.to_string(),
+                emoji: emoji.to_string(),
+                remove,
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+async fn send_reaction_inner(
+    manager: &mut StoredManager,
+    thread: &str,
+    target_sts: u64,
+    target_author: &str,
+    emoji: &str,
+    remove: bool,
+) -> Result<u64, String> {
+    use presage::libsignal_service::content::Reaction;
+    let reaction = Reaction {
+        emoji: Some(emoji.to_string()),
+        remove: Some(remove),
+        target_author_aci: Some(target_author.to_string()),
+        target_sent_timestamp: Some(target_sts),
+        ..Default::default()
+    };
+    let ts = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    };
+    let msg = presage::libsignal_service::content::DataMessage {
+        reaction: Some(reaction),
+        timestamp: Some(ts),
+        ..Default::default()
+    };
+    let content_body: presage::libsignal_service::content::ContentBody = msg.into();
+    if let Some(hexkey) = thread.strip_prefix("group:") {
+        let bytes = hex::decode(hexkey).map_err(|_| "bad group id".to_string())?;
+        manager
+            .send_message_to_group(&bytes, content_body, ts)
+            .await
+            .map(|_| ts)
+            .map_err(|e| format!("send: {e}"))
+    } else if let Some(uuid) = thread.strip_prefix("contact:") {
+        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
+        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
+        manager
+            .send_message(
+                presage::libsignal_service::protocol::ServiceId::Aci(
+                    presage::libsignal_service::protocol::Aci::from(parsed),
+                ),
+                content_body,
+                ts,
+            )
+            .await
+            .map(|_| ts)
+            .map_err(|e| format!("send: {e}"))
+    } else {
+        Err("bad thread id".to_string())
+    }
+}
+
+/// Profile display-name lookup (network). Errors when no profile key exists.
+async fn cmd_profile(state: &mut WorkerState, uuid: &str) -> Result<String, String> {
+    match state {
+        WorkerState::Linked(linked) => {
+            if let Some(manager) = linked.manager.as_mut() {
+                sync::profile_name(manager, uuid).await
+            } else if let Some(ctrl) = linked.ctrl.as_ref() {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                ctrl.send(LoopCtrl::Profile { uuid: uuid.to_string(), reply: tx })
+                    .map_err(|_| "sync loop is gone".to_string())?;
+                rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+            } else {
+                Err("sync loop not running".to_string())
+            }
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Local-only delete of one message (store tombstone, no network).
+async fn cmd_delete_local(state: &WorkerState, thread_id: &str, sts: u64) -> Result<bool, String> {
+    match state {
+        WorkerState::Linked(linked) => {
+            let mut store = linked.open_store().await?;
+            let thread = sync::parse_thread(thread_id)?;
+            {
+                use presage::store::ContentsStore;
+                store
+                    .delete_message(&thread, sts)
+                    .await
+                    .map_err(|e| format!("delete: {e}"))
+            }
         }
         _ => Err("not linked".to_string()),
     }
@@ -827,6 +1165,139 @@ pub extern "C" fn core_cmd_fetch_attachment(thread: *const c_char, ts: u64, inde
     };
     match roundtrip(|reply| Command::FetchAttachment { thread_id: t, ts, index: index as usize, reply }) {
         Ok(Ok(path)) => ok_string(path),
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn roundtrip_ts<F>(build: F) -> i64
+where
+    F: FnOnce(tokio::sync::oneshot::Sender<Result<u64, String>>) -> Command,
+{
+    match roundtrip(build) {
+        Ok(Ok(ts)) => ts as i64,
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
+/// Send a local file as attachment (`caption` = message body). Returns sent
+/// ts, or -1 (see `core_last_error`).
+#[no_mangle]
+pub extern "C" fn core_cmd_send_attachment(
+    thread: *const c_char,
+    path: *const c_char,
+    caption: *const c_char,
+) -> i64 {
+    let (t, p, c) = match (c_str_arg(thread, "thread"), c_str_arg(path, "path"), c_str_arg(caption, "caption")) {
+        (Ok(t), Ok(p), Ok(c)) => (t, p, c),
+        _ => {
+            set_last_error("thread/path/caption: null or invalid UTF-8".to_string());
+            return -1;
+        }
+    };
+    roundtrip_ts(|reply| Command::SendAttachment { thread: t, path: p, caption: c, reply })
+}
+
+/// Reply with `body`, quoting (`q_ts`, `q_author`, `q_body`). Returns sent ts.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_reply(
+    thread: *const c_char,
+    body: *const c_char,
+    q_ts: u64,
+    q_author: *const c_char,
+    q_body: *const c_char,
+) -> i64 {
+    let parts = (
+        c_str_arg(thread, "thread"),
+        c_str_arg(body, "body"),
+        c_str_arg(q_author, "q_author"),
+        c_str_arg(q_body, "q_body"),
+    );
+    match parts {
+        (Ok(t), Ok(b), Ok(qa), Ok(qb)) => roundtrip_ts(|reply| Command::SendReply {
+            thread: t, body: b, quote_ts: q_ts, quote_author: qa, quote_body: qb, reply,
+        }),
+        _ => {
+            set_last_error("reply args: null or invalid UTF-8".to_string());
+            -1
+        }
+    }
+}
+
+/// Delete-for-everyone tombstone for our message at `target_ts`.
+/// Returns tombstone ts, or -1. Local removal is separate (`delete_local`).
+#[no_mangle]
+pub extern "C" fn core_cmd_send_delete(thread: *const c_char, target_ts: u64) -> i64 {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    roundtrip_ts(|reply| Command::SendDelete { thread: t, target_ts, reply })
+}
+
+/// Toggle/add reaction `emoji` on the message at `target_sts` by
+/// `target_author`. `remove` = 1 un-reacts. Returns sent ts, or -1.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_reaction(
+    thread: *const c_char,
+    target_sts: u64,
+    target_author: *const c_char,
+    emoji: *const c_char,
+    remove: i32,
+) -> i64 {
+    let parts = (c_str_arg(thread, "thread"), c_str_arg(target_author, "author"), c_str_arg(emoji, "emoji"));
+    match parts {
+        (Ok(t), Ok(a), Ok(e)) if !e.is_empty() => roundtrip_ts(|reply| Command::SendReaction {
+            thread: t, target_sts, target_author: a, emoji: e, remove: remove != 0, reply,
+        }),
+        _ => {
+            set_last_error("reaction args: null/empty".to_string());
+            -1
+        }
+    }
+}
+
+/// Local-only delete of the message at store-clock `sts`. 1 deleted,
+/// 0 absent, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_delete_local(thread: *const c_char, sts: u64) -> i32 {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    match roundtrip(|reply| Command::DeleteLocal { thread_id: t, sts, reply }) {
+        Ok(Ok(true)) => 1,
+        Ok(Ok(false)) => 0,
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
+/// Profile display name for a contact uuid, or null (no key / no name).
+#[no_mangle]
+pub extern "C" fn core_cmd_profile(uuid: *const c_char) -> *mut c_char {
+    let u = match c_str_arg(uuid, "uuid") {
+        Ok(u) => u,
+        Err(e) => {
+            set_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+    match roundtrip(|reply| Command::Profile { uuid: u, reply }) {
+        Ok(Ok(name)) => ok_string(name),
         Ok(Err(e)) | Err(e) => {
             set_last_error(e);
             std::ptr::null_mut()

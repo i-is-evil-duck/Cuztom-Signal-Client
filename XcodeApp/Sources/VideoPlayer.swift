@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVKit
+import AVFoundation
 
 /// Video playback via AppKit directly.
 ///
@@ -9,18 +10,19 @@ import AVKit
 /// (`_AVKit_SwiftUI` metadata init → SIGABRT, crash 2026-09-23).
 /// `AVPlayerView` has no such issue.
 struct AppKitVideoPlayer: NSViewRepresentable {
-    var url: URL
+    var player: AVPlayer
 
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
-        view.player = AVPlayer(url: url)
-        view.controlsStyle = .inline
+        view.player = player
+        // No timeline/scrubber by design (scroll-to-seek removed).
+        view.controlsStyle = .none
         return view
     }
 
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
-        if let current = (nsView.player?.currentItem?.asset as? AVURLAsset)?.url, current != url {
-            nsView.player = AVPlayer(url: url)
+        if nsView.player !== player {
+            nsView.player = player
         }
     }
 
@@ -28,4 +30,79 @@ struct AppKitVideoPlayer: NSViewRepresentable {
         nsView.player?.pause()
         nsView.player = nil
     }
+}
+
+/// Video thumbnail with a play button; opens the full player on tap.
+/// Thumbnails are cached under Caches/CuztomSignal/thumbs/.
+struct VideoThumbnail: View {
+    @Environment(ChatViewModel.self) private var vm
+    var url: URL
+    var filename: String
+    @State private var thumb: NSImage?
+
+    var body: some View {
+        Button {
+            vm.preview = PreviewItem(url: url, mime: "video/*", filename: filename)
+        } label: {
+            ZStack {
+                Group {
+                    if let thumb {
+                        Image(nsImage: thumb)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        Rectangle().fill(Color.gray.opacity(0.2))
+                    }
+                }
+                .frame(width: 240, height: 140)
+                .cornerRadius(6)
+                .clipped()
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.white)
+                    .shadow(radius: 4)
+            }
+        }
+        .buttonStyle(.plain)
+        .task {
+            if thumb == nil {
+                thumb = await Task.detached(priority: .utility) {
+                    cachedVideoThumbnail(url: url)
+                }.value
+            }
+        }
+    }
+}
+
+private func thumbsDir() -> URL {
+    let base = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)) ?? FileManager.default.temporaryDirectory
+    return base.appendingPathComponent("CuztomSignal/thumbs")
+}
+
+private func cachedVideoThumbnail(url: URL) -> NSImage? {
+    let key = "\(url.path.hashValue)-\(url.lastPathComponent)"
+    let dest = thumbsDir().appendingPathComponent(key).appendingPathExtension("jpg")
+    if let img = NSImage(contentsOf: dest) {
+        return img
+    }
+    guard let img = renderVideoThumbnail(url: url),
+          let tiff = img.tiffRepresentation,
+          let rep = NSBitmapImageRep(data: tiff),
+          let jpg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7]) else {
+        return nil
+    }
+    try? FileManager.default.createDirectory(at: thumbsDir(), withIntermediateDirectories: true)
+    try? jpg.write(to: dest)
+    return img
+}
+
+private func renderVideoThumbnail(url: URL) -> NSImage? {
+    let asset = AVAsset(url: url)
+    let gen = AVAssetImageGenerator(asset: asset)
+    gen.appliesPreferredTrackTransform = true
+    gen.maximumSize = CGSize(width: 480, height: 480)
+    guard let cg = try? gen.copyCGImage(at: CMTime(seconds: 0.5, preferredTimescale: 600), actualTime: nil) else {
+        return nil
+    }
+    return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
 }

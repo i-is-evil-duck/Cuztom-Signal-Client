@@ -173,3 +173,61 @@ import Testing
     #expect(await store.totalMessageCount() == 1)
     #expect(await store.messageCount(in: "c1") == 0)
 }
+
+@Test func storeDeletesSingleMessage() async {
+    let store = MessageStore()
+    let m1 = ChatMessage(conversationId: "c1", author: SignalAddress(phone: "+1"),
+                         body: "one", direction: .incoming)
+    let m2 = ChatMessage(conversationId: "c1", author: SignalAddress(phone: "+1"),
+                         body: "two", direction: .incoming)
+    await store.saveMessage(m1)
+    await store.saveMessage(m2)
+    let removed = await store.deleteMessage(id: m1.id)
+    #expect(removed?.body == "one")
+    #expect(await store.messageCount(in: "c1") == 1)
+    #expect(await store.deleteMessage(id: UUID()) == nil)
+}
+
+@Test func controllerDeletesForMeWithMock() async {
+    let conv = Conversation(id: "c1", title: "Peer", peer: SignalAddress(phone: "+1"))
+    let svc = MockSignalService(seedConversations: [conv])
+    let controller = await ChatController(service: svc)
+    await controller.link()
+    await controller.select("c1")
+    await controller.send("bye")
+    let id = await controller.messages.first?.id
+    #expect(id != nil)
+    // Mock has no live backend: for-me works locally, for-everyone refuses.
+    #expect(await controller.deleteMessage(id: id!, forEveryone: false))
+    #expect(await controller.messages.isEmpty)
+    #expect(!(await controller.deleteMessage(id: UUID(), forEveryone: true)))
+}
+
+@Test func controllerAppliesReactionsAndReceipts() async {
+    let conv = Conversation(id: "c1", title: "Peer", peer: SignalAddress(phone: "+1"))
+    let svc = MockSignalService(seedConversations: [conv])
+    let controller = await ChatController(service: svc)
+    await controller.link()
+    await controller.select("c1")
+    await controller.send("hi")
+    guard let sent = await controller.messages.first else {
+        Issue.record("no sent message")
+        return
+    }
+    // Reactions keyed by store timestamp (nil here -> server ms fallback path
+    // uses sentAt; applyReaction matches storeTs first).
+    await controller.applyReaction(thread: "c1", targetSts: sent.storeTs ?? 0, emoji: "👍", remove: false, senderName: "Peer")
+    // storeTs is nil for mock echoes, so no match: seed one with explicit sts.
+    let withSts = ChatMessage(conversationId: "c1", author: SignalAddress(phone: "+1"),
+                              body: "yo", direction: .incoming, storeTs: 424242)
+    await controller.receive(withSts)
+    await controller.applyReaction(thread: "c1", targetSts: 424242, emoji: "❤️", remove: false, senderName: "Peer")
+    let list = await controller.messages
+    #expect(list.last?.reactions == ["❤️"])
+    await controller.applyReaction(thread: "c1", targetSts: 424242, emoji: "❤️", remove: true, senderName: "Peer")
+    let after = await controller.messages
+    #expect(after.last?.reactions.isEmpty == true)
+    await controller.applyReceipt(kind: "read", timestamps: [424242], senderName: "Peer")
+    // Incoming messages don't collect receipts; must not crash.
+    #expect(await controller.messages.count == 2)
+}

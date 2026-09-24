@@ -80,6 +80,25 @@ public actor MessageStore {
         return false
     }
 
+    /// Remove a message by id, returning it (for remote delete flows).
+    public func deleteMessage(id: UUID) -> ChatMessage? {
+        for (thread, var list) in messages {
+            if let idx = list.firstIndex(where: { $0.id == id }) {
+                let removed = list.remove(at: idx)
+                messages[thread] = list
+                return removed
+            }
+        }
+        return nil
+    }
+
+    public func renameConversation(id: String, title: String) {
+        if var conv = conversations[id] {
+            conv.title = title
+            conversations[id] = conv
+        }
+    }
+
     public func totalMessageCount() -> Int {
         messages.values.reduce(0) { $0 + $1.count }
     }

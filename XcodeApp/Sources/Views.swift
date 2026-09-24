@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVKit
+import CoreMedia
 import CoreImage.CIFilterBuiltins
 import CuztomSignalCore
 
@@ -110,11 +111,28 @@ struct MessageListView: View {
                 // Send-target header: always shows exactly where Send goes.
                 if let id = vm.selectedId {
                     let title = vm.conversations.first(where: { $0.id == id })?.title ?? id
-                    Text("To: \(title)")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12).padding(.vertical, 4)
-                        .background(Color.gray.opacity(0.08))
+                    HStack {
+                        Text("To: \(title)")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button { vm.showCallsSoon = true } label: {
+                            Image(systemName: "phone")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Voice call (M4)")
+                        Button { vm.showCallsSoon = true } label: {
+                            Image(systemName: "video")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Video call (M4)")
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 4)
+                    .background(Color.gray.opacity(0.08))
+                    .alert("Calls aren't here yet", isPresented: $vm.showCallsSoon) {
+                        Button("OK", role: .cancel) {}
+                    } message: {
+                        Text("Voice/video calls land in M4 (RingRTC). Everything else in this build is live.")
+                    }
                 }
                 if vm.selectedId != nil {
                     if vm.historyExhausted {
@@ -143,19 +161,72 @@ struct MessageListView: View {
                     .padding()
                 }
                 Divider()
+                if let quote = vm.replyingTo {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Replying").font(.caption2).foregroundStyle(.secondary)
+                            Text(quote.body.isEmpty ? "[attachment]" : String(quote.body.prefix(80)))
+                                .font(.caption).lineLimit(1)
+                        }
+                        Spacer()
+                        Button { vm.replyingTo = nil } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Color.accentColor.opacity(0.08))
+                }
                 HStack {
+                    Button {
+                        let panel = NSOpenPanel()
+                        panel.allowsMultipleSelection = false
+                        panel.canChooseFiles = true
+                        panel.canChooseDirectories = false
+                        if panel.runModal() == .OK, let url = panel.url {
+                            let caption = draft
+                            draft = ""
+                            vm.replyingTo = nil
+                            Task { await vm.sendAttachment(url: url, caption: caption) }
+                        }
+                    } label: {
+                        Image(systemName: "paperclip")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Send a file (draft text becomes the caption)")
+                    .disabled(vm.sendingAttachment)
                     TextField("Message  (/help for commands)", text: $draft)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { send() }
-                    Button("Send") { send() }
+                    Button(vm.sendingAttachment ? "Sending…" : "Send") { send() }
                         .keyboardShortcut(.return)
-                        .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty || vm.sendingAttachment)
                 }
                 .padding()
             }
         }
         .sheet(item: $vm.preview) { item in
             AttachmentPreview(item: item)
+        }
+        .popover(item: $vm.receiptTarget) { msg in
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Message info").font(.headline)
+                if !msg.readBy.isEmpty {
+                    Text("Seen by").font(.caption).foregroundStyle(.secondary)
+                    ForEach(msg.readBy, id: \.self) { Text("✓ \($0)") }
+                }
+                if !msg.deliveredTo.isEmpty {
+                    Text("Delivered to").font(.caption).foregroundStyle(.secondary)
+                    ForEach(msg.deliveredTo, id: \.self) { Text("✓ \($0)") }
+                }
+                if msg.readBy.isEmpty && msg.deliveredTo.isEmpty {
+                    Text("No receipts yet.").foregroundStyle(.secondary)
+                }
+                Text("Note: this client displays receipts but doesn't send read receipts yet.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding()
+            .frame(minWidth: 260)
         }
     }
 
@@ -171,6 +242,8 @@ struct MessageRow: View {
     @Environment(ChatViewModel.self) private var vm
     var msg: ChatMessage
 
+    private let quickEmojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
+
     var body: some View {
         HStack {
             if msg.direction == .outgoing { Spacer() }
@@ -181,12 +254,54 @@ struct MessageRow: View {
                 ForEach(Array(msg.attachments.enumerated()), id: \.offset) { idx, att in
                     AttachmentRow(msg: msg, index: idx, att: att)
                 }
+                if !msg.reactions.isEmpty {
+                    Text(msg.reactions.joined(separator: " "))
+                        .font(.caption)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.gray.opacity(0.12))
+                        .cornerRadius(8)
+                }
+                if msg.direction == .outgoing && (!msg.readBy.isEmpty || !msg.deliveredTo.isEmpty) {
+                    Button {
+                        vm.receiptTarget = msg
+                    } label: {
+                        Text(receiptLine).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(8)
             .background(msg.direction == .outgoing ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 10))
+            .contextMenu {
+                Button("Reply") { vm.replyingTo = msg }
+                Menu("React") {
+                    ForEach(quickEmojis, id: \.self) { emoji in
+                        Button("\(emoji) \(msg.reactions.contains(emoji) ? "✓" : "")") {
+                            Task { await vm.react(message: msg, emoji: emoji) }
+                        }
+                    }
+                }
+                if msg.direction == .outgoing {
+                    Menu("Delete") {
+                        Button("Delete for me", role: .destructive) {
+                            Task { await vm.deleteMessage(msg, forEveryone: false) }
+                        }
+                        Button("Delete for everyone", role: .destructive) {
+                            Task { await vm.deleteMessage(msg, forEveryone: true) }
+                        }
+                    }
+                }
+            }
             if msg.direction == .incoming { Spacer() }
         }
+    }
+
+    private var receiptLine: String {
+        var parts: [String] = []
+        if !msg.readBy.isEmpty { parts.append("Seen by \(msg.readBy.joined(separator: ", "))") }
+        if !msg.deliveredTo.isEmpty { parts.append("Delivered to \(msg.deliveredTo.joined(separator: ", "))") }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -209,19 +324,7 @@ struct AttachmentRow: View {
                         vm.preview = PreviewItem(url: url, mime: att.mimeType, filename: att.filename)
                     }
             } else if att.mimeType.hasPrefix("video/"), let url = att.localURL {
-                VStack(alignment: .leading, spacing: 4) {
-                    // NOTE: SwiftUI's `VideoPlayer` aborts at view-creation
-                    // time on this OS (see crash 2026-09-23, _AVKit_SwiftUI
-                    // metadata init → SIGABRT). AppKit's AVPlayerView is used
-                    // directly instead and is rock solid.
-                    AppKitVideoPlayer(url: url)
-                        .frame(height: 240)
-                        .cornerRadius(6)
-                    Button("Expand") {
-                        vm.preview = PreviewItem(url: url, mime: att.mimeType, filename: att.filename)
-                    }
-                    .font(.caption)
-                }
+                VideoThumbnail(url: url, filename: att.filename)
             } else {
                 HStack(spacing: 8) {
                     Image(systemName: icon)
@@ -276,7 +379,7 @@ struct AttachmentPreview: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                 } else if item.mime.hasPrefix("video/") {
-                    AppKitVideoPlayer(url: item.url)
+                    SheetVideoPlayer(url: item.url)
                 } else {
                     Image(systemName: "doc").font(.system(size: 64))
                     Text(item.mime).foregroundStyle(.secondary)
@@ -294,6 +397,73 @@ struct AttachmentPreview: View {
         .padding()
         .frame(minWidth: 600, minHeight: 520)
     }
+}
+
+/// Video player without a scrub timeline (scroll-to-seek removed by design),
+/// auto-sized to the media aspect.
+struct SheetVideoPlayer: View {
+    var url: URL
+    @State private var player: AVPlayer?
+    @State private var playing = false
+    @State private var aspect: CGFloat = 16.0 / 9.0
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Group {
+                if let player {
+                    AppKitVideoPlayer(player: player)
+                        .frame(width: frameSize.width, height: frameSize.height)
+                        .cornerRadius(8)
+                } else {
+                    ProgressView().frame(width: 480, height: 270)
+                }
+            }
+            HStack {
+                Button(playing ? "Pause" : "Play") {
+                    guard let player else { return }
+                    if playing { player.pause() } else { player.play() }
+                    playing.toggle()
+                }
+                .keyboardShortcut(.space)
+                Text(itemDuration).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .task {
+            let p = AVPlayer(url: url)
+            player = p
+            aspect = await videoAspect(url: url) ?? (16.0 / 9.0)
+            p.play()
+            playing = true
+        }
+        .onDisappear {
+            player?.pause()
+        }
+    }
+
+    private var frameSize: CGSize {
+        let maxW: CGFloat = 640
+        let maxH: CGFloat = 460
+        let h = min(maxH, maxW / aspect)
+        return CGSize(width: h * aspect, height: h)
+    }
+
+    private var itemDuration: String {
+        guard let d = player?.currentItem?.duration, d.isValid, !d.isIndefinite else { return "" }
+        let s = Int(CMTimeGetSeconds(d))
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+}
+
+private func videoAspect(url: URL) async -> CGFloat? {
+    let asset = AVAsset(url: url)
+    guard let track = try? await asset.loadTracks(withMediaType: .video).first else { return nil }
+    let size = try? await track.load(.naturalSize)
+    let transform = try? await track.load(.preferredTransform)
+    guard let size, size.width > 0, size.height > 0 else { return nil }
+    let t = transform ?? CGAffineTransform.identity
+    let rect = CGRect(origin: .zero, size: size).applying(t)
+    guard rect.width > 0, rect.height > 0 else { return nil }
+    return abs(rect.width / rect.height)
 }
 
 struct LinkDeviceView: View {

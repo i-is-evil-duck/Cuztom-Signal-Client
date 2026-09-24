@@ -18,6 +18,8 @@ public final class ChatController: @unchecked Sendable {
     public private(set) var lastSyncNote: String?
     /// Thread id of the most recent send (send-target tracing).
     public private(set) var lastSentThread: String?
+    /// Own ACI for quoting/authoring (resolved at link time).
+    public private(set) var selfAci: String?
 
     private let service: any SignalService
     private var store: MessageStore
@@ -75,9 +77,18 @@ public final class ChatController: @unchecked Sendable {
                 live.onSyncEvent = { [weak self] note in
                     Task { await self?.noteSync(note) }
                 }
+                live.onReaction = { [weak self] thread, sts, emoji, remove, sender in
+                    Task { await self?.applyReaction(thread: thread, targetSts: sts, emoji: emoji, remove: remove, senderName: sender) }
+                }
+                live.onReceipt = { [weak self] sender, kind, stamps in
+                    Task { await self?.applyReceipt(kind: kind, timestamps: stamps, senderName: sender) }
+                }
                 do {
                     try await live.startLiveSync()
                     Log.info("live sync started")
+                    if let me = try? await live.whoami() {
+                        selfAci = me.aci
+                    }
                 } catch {
                     lastError = String(describing: error)
                     Log.error("live sync failed: \(error)")
@@ -99,6 +110,182 @@ public final class ChatController: @unchecked Sendable {
     private func noteSync(_ note: String) {
         lastSyncNote = note
         Log.info("sync event: \(note)")
+    }
+
+    /// Apply a live reaction to the targeted message (matched by store ts).
+    public func applyReaction(thread: String, targetSts: Int64, emoji: String, remove: Bool, senderName: String) async {
+        let list = await store.messages(in: thread)
+        guard let target = list.first(where: { ($0.storeTs ?? Int64($0.sentAt.timeIntervalSince1970 * 1000)) == targetSts }) else { return }
+        await store.updateMessage(id: target.id) { msg in
+            if remove {
+                msg.reactions.removeAll { $0 == emoji }
+            } else if !msg.reactions.contains(emoji) {
+                msg.reactions.append(emoji)
+            }
+        }
+        if thread == selectedId {
+            messages = await store.messages(in: thread)
+        }
+        Log.info("reaction \(emoji) from \(senderName) in \(thread)")
+    }
+
+    /// Apply a read/delivery receipt to matching own messages.
+    public func applyReceipt(kind: String, timestamps: [Int64], senderName: String) async {
+        var touched: String?
+        for (thread, list) in await allThreadLists() {
+            for m in list where m.direction == .outgoing {
+                let ms = Int64(m.sentAt.timeIntervalSince1970 * 1000)
+                if timestamps.contains(ms) || (m.storeTs.map { timestamps.contains($0) } ?? false) {
+                    await store.updateMessage(id: m.id) { msg in
+                        if kind == "read" {
+                            if !msg.readBy.contains(senderName) { msg.readBy.append(senderName) }
+                        } else {
+                            if !msg.deliveredTo.contains(senderName) { msg.deliveredTo.append(senderName) }
+                        }
+                    }
+                    touched = thread
+                }
+            }
+        }
+        if let touched, touched == selectedId {
+            messages = await store.messages(in: touched)
+        }
+    }
+
+    private func allThreadLists() async -> [(String, [ChatMessage])] {
+        var out: [(String, [ChatMessage])] = []
+        for c in conversations {
+            out.append((c.id, await store.messages(in: c.id)))
+        }
+        return out
+    }
+
+    /// Toggle/add an emoji reaction on a message.
+    public func react(messageId: UUID, emoji: String) async -> Bool {
+        guard let live = service as? RustCoreService,
+              let stored = await store.message(id: messageId) else { return false }
+        let author = stored.direction == .outgoing ? (selfAci ?? stored.author.uuidString ?? "") : (stored.author.uuidString ?? "")
+        let sts = stored.storeTs ?? Int64(stored.sentAt.timeIntervalSince1970 * 1000)
+        let remove = stored.reactions.contains(emoji)
+        do {
+            try await live.sendReaction(thread: stored.conversationId, targetSts: sts, author: author, emoji: emoji, remove: remove)
+            await store.updateMessage(id: messageId) { msg in
+                if remove {
+                    msg.reactions.removeAll { $0 == emoji }
+                } else if !msg.reactions.contains(emoji) {
+                    msg.reactions.append(emoji)
+                }
+            }
+            if stored.conversationId == selectedId {
+                messages = await store.messages(in: stored.conversationId)
+            }
+            return true
+        } catch {
+            lastError = String(describing: error)
+            Log.error("react failed: \(error)")
+            return false
+        }
+    }
+
+    /// Delete a message. `forEveryone` sends a remote tombstone first (own
+    /// messages only); local removal always also clears the Rust store row
+    /// so refreshes never resurrect it.
+    public func deleteMessage(id: UUID, forEveryone: Bool) async -> Bool {
+        guard let stored = await store.message(id: id) else { return false }
+        let sts = stored.storeTs ?? Int64(stored.sentAt.timeIntervalSince1970 * 1000)
+        if forEveryone {
+            guard stored.direction == .outgoing, let live = service as? RustCoreService else { return false }
+            do {
+                try await live.sendDeleteTombstone(thread: stored.conversationId, targetTs: sts)
+            } catch {
+                lastError = String(describing: error)
+                Log.error("remote delete failed: \(error)")
+                return false
+            }
+        }
+        if let live = service as? RustCoreService {
+            _ = try? await live.deleteLocal(thread: stored.conversationId, sts: sts)
+        }
+        _ = await store.deleteMessage(id: id)
+        if stored.conversationId == selectedId {
+            messages = await store.messages(in: stored.conversationId)
+        }
+        conversations = await store.allConversations()
+        Log.info("deleted \(id) everyone=\(forEveryone)")
+        return true
+    }
+
+    /// Upload + send a local file (`caption` = message body, may be empty).
+    public func sendAttachment(fileURL: URL, caption: String) async -> Bool {
+        guard let id = selectedId, let live = service as? RustCoreService else { return false }
+        do {
+            let sent = try await live.sendAttachment(thread: id, path: fileURL.path, caption: caption)
+            let meta = AttachmentMeta(filename: sent.name, mimeType: sent.mime, byteCount: sent.size, localURL: fileURL)
+            let msg = ChatMessage(
+                conversationId: id,
+                author: SignalAddress(uuidString: "self"),
+                body: caption,
+                direction: .outgoing,
+                status: .sent,
+                attachments: [meta],
+                storeTs: sent.ts
+            )
+            lastSentThread = id
+            await store.saveMessage(msg)
+            messages = await store.messages(in: id)
+            Log.info("sent attachment \(sent.name) to \(id)")
+            return true
+        } catch {
+            lastError = String(describing: error)
+            Log.error("attachment send failed: \(error)")
+            return false
+        }
+    }
+
+    /// Reply quoting another message.
+    public func sendReply(body: String, to id: String, quote: ChatMessage) async {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let live = service as? RustCoreService else {
+            await send(body)
+            return
+        }
+        let qTs = quote.storeTs ?? Int64(quote.sentAt.timeIntervalSince1970 * 1000)
+        let qAuthor = quote.direction == .outgoing ? (selfAci ?? "") : (quote.author.uuidString ?? "")
+        do {
+            let ts = try await live.sendReply(thread: id, body: trimmed, qTs: qTs, qAuthor: qAuthor, qBody: String(quote.body.prefix(200)))
+            let msg = ChatMessage(
+                conversationId: id,
+                author: SignalAddress(uuidString: "self"),
+                body: trimmed,
+                direction: .outgoing,
+                status: .sent,
+                sentAt: Date(timeIntervalSince1970: Double(ts) / 1000),
+                storeTs: ts
+            )
+            lastSentThread = id
+            await store.saveMessage(msg)
+            messages = await store.messages(in: id)
+            Log.info("sent reply to \(id)")
+        } catch {
+            lastError = String(describing: error)
+            Log.error("reply failed: \(error)")
+        }
+    }
+
+    /// Fill in profile display names for contacts whose synced row is blank
+    /// (typically added by phone number). Keeps existing titles otherwise.
+    public func enrichNames() async {
+        guard let live = service as? RustCoreService else { return }
+        for conv in conversations where !conv.peer.isGroup {
+            let looksBare = conv.title.count == 8 || conv.title.hasPrefix("+") || conv.title == conv.peer.uuidString
+            guard looksBare, let uuid = conv.peer.uuidString else { continue }
+            if let name = await live.profileName(uuid: uuid), !name.isEmpty {
+                await store.renameConversation(id: conv.id, title: name)
+                Log.info("resolved name for \(uuid): \(name)")
+            }
+        }
+        conversations = await store.allConversations()
     }
 
     /// Stream live inbound messages into the store for the session lifetime.
@@ -123,6 +310,8 @@ public final class ChatController: @unchecked Sendable {
         if let id = selectedId {
             messages = await store.messages(in: id)
         }
+        await enrichNames()
+        conversations = await store.allConversations()
         Log.info("refresh: \(conversations.count) conversations, \(await store.totalMessageCount()) messages")
     }
 

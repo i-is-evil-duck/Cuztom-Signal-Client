@@ -311,6 +311,28 @@ pub async fn load_names(store: &SqliteStore) -> HashMap<String, String> {
     map
 }
 
+/// Display name from the Signal profile (for contacts added by phone
+/// number, whose synced contact row has no name). Needs the contact's
+/// profile key, which only exists after at least one message exchange —
+/// otherwise errors and the caller keeps the fallback label.
+pub async fn profile_name(manager: &mut StoredManager, uuid: &str) -> Result<String, String> {
+    let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
+    let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
+    let sid = ServiceId::Aci(Aci::from(parsed));
+    let key = manager
+        .store()
+        .profile_key(&sid)
+        .await
+        .map_err(|e| format!("profile key: {e}"))?
+        .ok_or_else(|| "no profile key yet".to_string())?;
+    let profile = manager
+        .retrieve_profile_by_uuid(Aci::from(parsed), key)
+        .await
+        .map_err(|e| format!("profile: {e}"))?;
+    let name = profile.name.ok_or_else(|| "no name set".to_string())?;
+    Ok(name.given_name)
+}
+
 /// Offline snapshot: self + contacts + groups + last 50 messages per thread.
 pub async fn build_roster(store: &SqliteStore) -> Result<String, String> {
     let reg = store
@@ -400,18 +422,124 @@ pub async fn whoami(store: &SqliteStore) -> Result<String, String> {
     .map_err(|e| format!("encode whoami: {e}"))
 }
 
-/// Send a text to "contact:<uuid>" or "group:<hex>". Returns sent timestamp.
-pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> Result<u64, String> {
-    use presage::libsignal_service::content::DataMessage;
-    eprintln!("[core] send start thread={thread} body_len={}", body.len());
+pub fn received_event(r: &Received, self_aci: &str, names: &HashMap<String, String>) -> Option<String> {
+    let v = match r {
+        Received::Content(c) => {
+            if reaction_part(c, names).is_some() || receipt_part(c, names).is_some() {
+                // Reaction/receipt-only envelopes are emitted as their own
+                // events by the loop; they must not become message rows.
+                return None;
+            }
+            let (m, _) = content_parts(c, self_aci, names)?;
+            serde_json::json!({"type": "message", "message": m})
+        }
+        Received::Contacts => serde_json::json!({"type": "contacts_synced"}),
+        Received::QueueEmpty => serde_json::json!({"type": "queue_empty"}),
+        Received::DecryptionError(sid) => {
+            serde_json::json!({"type": "decryption_error", "sender": service_uuid(sid)})
+        }
+    };
+    Some(v.to_string())
+}
+
+/// Reaction envelope → {"type":"reaction","thread","target_sts","emoji",
+/// "remove","sender","sender_name"}. `target_sts` is the store-clock ts of
+/// the targeted message.
+pub fn reaction_part(content: &Content, names: &HashMap<String, String>) -> Option<serde_json::Value> {
+    let (reaction, thread_id) = match &content.body {
+        ContentBody::DataMessage(m) => (m.reaction.as_ref()?, thread_of_content(content)?),
+        ContentBody::SynchronizeMessage(s) => match &s.content {
+            Some(SyncContent::Sent(sent)) => {
+                let dm = sent.message.as_ref()?;
+                (dm.reaction.as_ref()?, thread_of_content(content)?)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let sender = service_uuid(&content.metadata.sender);
+    Some(serde_json::json!({
+        "type": "reaction",
+        "thread": thread_id,
+        "target_sts": reaction.target_sent_timestamp.unwrap_or(0),
+        "emoji": reaction.emoji.clone().unwrap_or_default(),
+        "remove": reaction.remove.unwrap_or(false),
+        "sender": sender,
+        "sender_name": display_name(names, &sender),
+    }))
+}
+
+/// Read/delivery receipt → {"type":"receipt","sender","sender_name",
+/// "kind":"read"|"delivered","timestamps":[…]}. Timestamps are sender (store)
+/// clocks of the messages being acked.
+pub fn receipt_part(content: &Content, names: &HashMap<String, String>) -> Option<serde_json::Value> {
+    let receipt = match &content.body {
+        ContentBody::ReceiptMessage(r) => r,
+        _ => return None,
+    };
+    // Proto enum: 0 = delivered, 1 = read (stable numbering; Viewed skips).
+    let kind = match receipt.r#type.unwrap_or(-1) {
+        1 => "read",
+        0 => "delivered",
+        _ => return None,
+    };
+    let sender = service_uuid(&content.metadata.sender);
+    Some(serde_json::json!({
+        "type": "receipt",
+        "sender": sender,
+        "sender_name": display_name(names, &sender),
+        "kind": kind,
+        "timestamps": receipt.timestamp,
+    }))
+}
+
+fn thread_of_content(content: &Content) -> Option<String> {
+    let thread = Thread::try_from(content).ok()?;
+    Some(match &thread {
+        Thread::Contact(sid) => format!("contact:{}", service_uuid(sid)),
+        Thread::Group(key) => format!("group:{}", hex::encode(key)),
+    })
+}
+
+use presage::libsignal_service::content::DataMessage;
+use presage::libsignal_service::proto::data_message::{Delete, Quote};
+use presage::libsignal_service::sender::AttachmentSpec;
+
+/// Optional extras for an outgoing message.
+#[derive(Default)]
+pub struct SendExtras {
+    pub quote: Option<Quote>,
+    pub delete_ts: Option<u64>,
+}
+
+/// Full send: text + uploaded attachments + quote/ref + delete tombstone.
+pub async fn do_send_full(
+    manager: &mut StoredManager,
+    thread: &str,
+    body: &str,
+    uploads: Vec<AttachmentPointer>,
+    extras: SendExtras,
+) -> Result<u64, String> {
     let ts = now_millis();
     let msg = DataMessage {
         body: Some(body.to_string()),
         timestamp: Some(ts),
+        attachments: uploads,
+        quote: extras.quote,
+        delete: extras.delete_ts.map(|t| Delete { target_sent_timestamp: Some(t) }),
         ..Default::default()
     };
     let content_body: ContentBody = msg.into();
-    let result = if let Some(hexkey) = thread.strip_prefix("group:") {
+    send_content(manager, thread, content_body, ts).await
+}
+
+async fn send_content(
+    manager: &mut StoredManager,
+    thread: &str,
+    content_body: ContentBody,
+    ts: u64,
+) -> Result<u64, String> {
+    if let Some(hexkey) = thread.strip_prefix("group:") {
         let bytes = hex::decode(hexkey).map_err(|_| "bad group id".to_string())?;
         eprintln!("[core] send group key_len={}", bytes.len());
         manager
@@ -420,7 +548,6 @@ pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> R
             .map(|_| ts)
             .map_err(|e| format!("send: {e}"))
     } else if let Some(uuid) = thread.strip_prefix("contact:") {
-        // Our wire ids are bare uuids; tolerate a "PNI:" prefix defensively.
         let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
         eprintln!("[core] send contact id={bare}");
         let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
@@ -431,7 +558,13 @@ pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> R
             .map_err(|e| format!("send: {e}"))
     } else {
         Err("bad thread id".to_string())
-    };
+    }
+}
+
+/// Send a text to "contact:<uuid>" or "group:<hex>". Returns sent timestamp.
+pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> Result<u64, String> {
+    eprintln!("[core] send start thread={thread} body_len={}", body.len());
+    let result = do_send_full(manager, thread, body, Vec::new(), SendExtras::default()).await;
     match &result {
         Ok(sent_ts) => eprintln!("[core] send ok ts={sent_ts}"),
         Err(e) => eprintln!("[core] send failed: {e}"),
@@ -439,17 +572,74 @@ pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> R
     result
 }
 
-pub fn received_event(r: &Received, self_aci: &str, names: &HashMap<String, String>) -> Option<String> {
-    let v = match r {
-        Received::Content(c) => {
-            let m = content_event(c, self_aci, names)?;
-            serde_json::json!({"type": "message", "message": m})
-        }
-        Received::Contacts => serde_json::json!({"type": "contacts_synced"}),
-        Received::QueueEmpty => serde_json::json!({"type": "queue_empty"}),
-        Received::DecryptionError(sid) => {
-            serde_json::json!({"type": "decryption_error", "sender": service_uuid(sid)})
-        }
+/// Reply prefabs: quote block pointing at a previous message.
+pub fn make_quote(ts: u64, author_aci: &str, body: &str) -> Quote {
+    // PNI senders can't be quoted by ACI (unknown mapping) — pass through;
+    // the server accepts ACI authors, PNI-authored quotes may not render.
+    let author = author_aci.strip_prefix("PNI:").unwrap_or(author_aci);
+    Quote {
+        id: Some(ts),
+        author_aci: Some(author.to_string()),
+        text: Some(body.chars().take(200).collect()),
+        ..Default::default()
+    }
+}
+
+/// Guess a content-type from a file extension (upload metadata).
+pub fn guess_mime(path: &std::path::Path) -> String {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "heic" => "image/heic",
+        "webp" => "image/webp",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Max outbound attachment (100 MB, Signal's CDN cap neighborhood).
+pub const MAX_UPLOAD_BYTES: u64 = 100_000_000;
+
+/// Read + upload a local file, returning its attachment pointer.
+pub async fn upload_file(
+    manager: &mut StoredManager,
+    path: &std::path::Path,
+) -> Result<AttachmentPointer, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read file: {e}"))?;
+    if bytes.len() as u64 > MAX_UPLOAD_BYTES {
+        return Err("file exceeds 100 MB".to_string());
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let spec = AttachmentSpec {
+        content_type: guess_mime(path),
+        length: bytes.len(),
+        file_name: Some(name),
+        preview: None,
+        voice_note: None,
+        borderless: None,
+        width: None,
+        height: None,
+        caption: None,
+        blur_hash: None,
     };
-    Some(v.to_string())
+    manager
+        .upload_attachment(spec, bytes)
+        .await
+        .map_err(|e| format!("upload: {e}"))?
+        .map_err(|e| format!("upload rejected: {e:?}"))
 }

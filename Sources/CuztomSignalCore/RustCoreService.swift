@@ -85,6 +85,22 @@ public struct RosterPayload: Decodable, Sendable {
 struct LiveEvent: Decodable {
     var type: String
     var message: RosterPayload.Message?
+    // reaction
+    var thread: String?
+    var targetSts: Int64?
+    var emoji: String?
+    var remove: Bool?
+    var sender: String?
+    var senderName: String?
+    // receipt
+    var kind: String?
+    var timestamps: [Int64]?
+
+    private enum CodingKeys: String, CodingKey {
+        case type, message, thread, emoji, remove, sender, kind, timestamps
+        case targetSts = "target_sts"
+        case senderName = "sender_name"
+    }
 }
 
 /// M1: `SignalService` backed by `rust-core/` (`presage` Manager) over C FFI.
@@ -284,6 +300,87 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         return URL(fileURLWithPath: String(cString: ptr))
     }
 
+    /// Upload a local file and send it. Returns (sent ts, filename, mime, size).
+    public func sendAttachment(thread: String, path: String, caption: String) async throws -> (ts: Int64, name: String, mime: String, size: Int) {
+        let sym = try await initCore()
+        var ts: Int64 = -1
+        thread.withCString { t in
+            path.withCString { p in
+                caption.withCString { c in
+                    ts = sym.sendAttachment(t, p, c)
+                }
+            }
+        }
+        guard ts >= 0 else { throw SignalError.network("attachment send failed: \(lastError(sym))") }
+        let url = URL(fileURLWithPath: path)
+        return (ts, url.lastPathComponent, mimeFor(url: url), fileSize(url: url))
+    }
+
+    /// Reply quoting (`qTs` store-clock, `qAuthor` service id, `qBody`).
+    public func sendReply(thread: String, body: String, qTs: Int64, qAuthor: String, qBody: String) async throws -> Int64 {
+        let sym = try await initCore()
+        var ts: Int64 = -1
+        thread.withCString { t in
+            body.withCString { b in
+                qAuthor.withCString { a in
+                    qBody.withCString { q in
+                        ts = sym.sendReply(t, b, UInt64(bitPattern: qTs), a, q)
+                    }
+                }
+            }
+        }
+        guard ts >= 0 else { throw SignalError.network("reply failed: \(lastError(sym))") }
+        return ts
+    }
+
+    /// Delete-for-everyone tombstone. Local removal is separate.
+    public func sendDeleteTombstone(thread: String, targetTs: Int64) async throws {
+        let sym = try await initCore()
+        var ts: Int64 = -1
+        thread.withCString { t in
+            ts = sym.sendDelete(t, UInt64(bitPattern: targetTs))
+        }
+        guard ts >= 0 else { throw SignalError.network("delete send failed: \(lastError(sym))") }
+    }
+
+    /// Local-only store removal. Returns true when a row existed.
+    public func deleteLocal(thread: String, sts: Int64) async throws -> Bool {
+        let sym = try await initCore()
+        var rc: Int32 = -1
+        thread.withCString { t in
+            rc = sym.deleteLocal(t, UInt64(bitPattern: sts))
+        }
+        guard rc >= 0 else { throw SignalError.network("local delete failed: \(lastError(sym))") }
+        return rc == 1
+    }
+
+    /// Toggle/add `emoji` reaction on the message at `targetSts`.
+    public func sendReaction(thread: String, targetSts: Int64, author: String, emoji: String, remove: Bool) async throws {
+        let sym = try await initCore()
+        var ts: Int64 = -1
+        thread.withCString { t in
+            author.withCString { a in
+                emoji.withCString { e in
+                    ts = sym.sendReaction(t, UInt64(bitPattern: targetSts), a, e, remove ? 1 : 0)
+                }
+            }
+        }
+        guard ts >= 0 else { throw SignalError.network("reaction failed: \(lastError(sym))") }
+    }
+
+    /// Profile display name for a contact uuid (nil when unavailable).
+    public func profileName(uuid: String) async -> String? {
+        guard let sym = try? await initCore() else { return nil }
+        var ptr: UnsafeMutablePointer<CChar>? = nil
+        uuid.withCString { u in
+            ptr = sym.profile(u)
+        }
+        guard let ptr else { return nil }
+        defer { sym.freeString(ptr) }
+        let name = String(cString: ptr)
+        return name.isEmpty ? nil : name
+    }
+
     public func sendText(_ body: String, to conversationId: String) async throws -> ChatMessage {
         guard linked || isLinkedNow() else { throw SignalError.notLinked }
         let sym = try await initCore()
@@ -389,6 +486,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let pollEvent: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let threadPage: @convention(c) (UnsafePointer<CChar>, UInt64, UInt64) -> UnsafeMutablePointer<CChar>?
         let fetchAttachment: @convention(c) (UnsafePointer<CChar>, UInt64, UInt64) -> UnsafeMutablePointer<CChar>?
+        let sendAttachment: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int64
+        let sendReply: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int64
+        let sendDelete: @convention(c) (UnsafePointer<CChar>, UInt64) -> Int64
+        let sendReaction: @convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>, Int32) -> Int64
+        let deleteLocal: @convention(c) (UnsafePointer<CChar>, UInt64) -> Int32
+        let profile: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let whoami: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let logout: @convention(c) () -> Int32
         let lastError: @convention(c) () -> UnsafePointer<CChar>?
@@ -398,6 +501,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// Non-message sync traffic ("queue_empty", "contacts_synced",
     /// "sync_error:…"). Fires on an internal task — hop threads as needed.
     public var onSyncEvent: ((String) -> Void)?
+
+    /// Live reaction: (thread, target store-ts, emoji, remove, sender name).
+    public var onReaction: ((String, Int64, String, Bool, String) -> Void)?
+
+    /// Live receipt: (sender name, "read"|"delivered", message timestamps).
+    public var onReceipt: ((String, String, [Int64]) -> Void)?
 
     /// "12 contacts, 3 groups, 45 msgs @ 22:01" or "never".
     public private(set) var lastRosterSummary = "never"
@@ -498,10 +607,22 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             let text = String(cString: ptr)
             guard let data = text.data(using: .utf8),
                   let event = try? JSONDecoder().decode(LiveEvent.self, from: data) else { continue }
-            if event.type == "message", let msg = event.message {
-                messageCache[msg.key] = msg
-                incomingContinuation.yield(chatMessage(msg))
-            } else {
+            switch event.type {
+            case "message":
+                if let msg = event.message {
+                    messageCache[msg.key] = msg
+                    incomingContinuation.yield(chatMessage(msg))
+                }
+            case "reaction":
+                if let thread = event.thread, let sts = event.targetSts,
+                   let emoji = event.emoji, !emoji.isEmpty {
+                    onReaction?(thread, sts, emoji, event.remove ?? false, event.senderName ?? "?")
+                }
+            case "receipt":
+                if let kind = event.kind, let stamps = event.timestamps {
+                    onReceipt?(event.senderName ?? event.sender ?? "?", kind, stamps)
+                }
+            default:
                 onSyncEvent?(event.type)
             }
         }
@@ -531,6 +652,30 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private func lastError(_ sym: Symbols) -> String {
         guard let ptr = sym.lastError() else { return "unknown" }
         return String(cString: ptr)
+    }
+
+    private func mimeFor(url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "heic": return "image/heic"
+        case "webp": return "image/webp"
+        case "mp4", "m4v": return "video/mp4"
+        case "mov": return "video/quicktime"
+        case "webm": return "video/webm"
+        case "mp3": return "audio/mpeg"
+        case "m4a": return "audio/mp4"
+        case "wav": return "audio/wav"
+        case "pdf": return "application/pdf"
+        case "txt", "md": return "text/plain"
+        case "zip": return "application/zip"
+        default: return "application/octet-stream"
+        }
+    }
+
+    private func fileSize(url: URL) -> Int {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
     }
 
     private func callString(_ fn: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?, _ arg: String, what: String) throws -> String {
@@ -563,6 +708,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let v = dlsym(handle, "core_cmd_poll_event"),
               let t = dlsym(handle, "core_cmd_thread"),
               let a = dlsym(handle, "core_cmd_fetch_attachment"),
+              let sa = dlsym(handle, "core_cmd_send_attachment"),
+              let sr = dlsym(handle, "core_cmd_send_reply"),
+              let sd = dlsym(handle, "core_cmd_send_delete"),
+              let se = dlsym(handle, "core_cmd_send_reaction"),
+              let dl = dlsym(handle, "core_cmd_delete_local"),
+              let pf = dlsym(handle, "core_cmd_profile"),
               let w = dlsym(handle, "core_cmd_whoami"),
               let o = dlsym(handle, "core_cmd_logout"),
               let e = dlsym(handle, "core_last_error"),
@@ -579,6 +730,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             pollEvent: unsafeBitCast(v, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             threadPage: unsafeBitCast(t, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UInt64) -> UnsafeMutablePointer<CChar>?).self),
             fetchAttachment: unsafeBitCast(a, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UInt64) -> UnsafeMutablePointer<CChar>?).self),
+            sendAttachment: unsafeBitCast(sa, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int64).self),
+            sendReply: unsafeBitCast(sr, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int64).self),
+            sendDelete: unsafeBitCast(sd, to: (@convention(c) (UnsafePointer<CChar>, UInt64) -> Int64).self),
+            sendReaction: unsafeBitCast(se, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>, Int32) -> Int64).self),
+            deleteLocal: unsafeBitCast(dl, to: (@convention(c) (UnsafePointer<CChar>, UInt64) -> Int32).self),
+            profile: unsafeBitCast(pf, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             whoami: unsafeBitCast(w, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             logout: unsafeBitCast(o, to: (@convention(c) () -> Int32).self),
             lastError: unsafeBitCast(e, to: (@convention(c) () -> UnsafePointer<CChar>?).self),

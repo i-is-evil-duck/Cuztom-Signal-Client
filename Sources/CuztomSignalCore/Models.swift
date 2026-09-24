@@ -53,6 +53,12 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
     /// Store-clock timestamp (SQLite `ts` column basis) for paging/lookup.
     /// Nil for mock/local messages, which page trivially.
     public var storeTs: Int64?
+    /// Emoji reactions on this message (display only).
+    public var reactions: [String] = []
+    /// Display names that have read this message (own messages).
+    public var readBy: [String] = []
+    /// Display names whose devices confirmed delivery (own messages).
+    public var deliveredTo: [String] = []
 
     public init(
         id: UUID = UUID(),
@@ -63,7 +69,10 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
         status: MessageStatus = .queued,
         sentAt: Date = Date(),
         attachments: [AttachmentMeta] = [],
-        storeTs: Int64? = nil
+        storeTs: Int64? = nil,
+        reactions: [String] = [],
+        readBy: [String] = [],
+        deliveredTo: [String] = []
     ) {
         self.id = id
         self.conversationId = conversationId
@@ -74,6 +83,9 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
         self.sentAt = sentAt
         self.attachments = attachments
         self.storeTs = storeTs
+        self.reactions = reactions
+        self.readBy = readBy
+        self.deliveredTo = deliveredTo
     }
 }
 

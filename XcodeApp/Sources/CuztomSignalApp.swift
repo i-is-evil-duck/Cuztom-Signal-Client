@@ -96,6 +96,10 @@ final class ChatViewModel {
     var diagnosticsText = ""
     var historyExhausted = false
     var preview: PreviewItem?
+    var replyingTo: ChatMessage?
+    var receiptTarget: ChatMessage?
+    var showCallsSoon = false
+    var sendingAttachment = false
 
     func start() async {
         phase = .starting
@@ -146,7 +150,30 @@ final class ChatViewModel {
             sync()
             return
         }
+        if let quote = replyingTo, let id = controller.selectedId {
+            replyingTo = nil
+            await controller.sendReply(body: body, to: id, quote: quote)
+            sync()
+            return
+        }
         await controller.send(body)
+        sync()
+    }
+
+    func react(message: ChatMessage, emoji: String) async {
+        await controller?.react(messageId: message.id, emoji: emoji)
+        sync()
+    }
+
+    func deleteMessage(_ message: ChatMessage, forEveryone: Bool) async {
+        await controller?.deleteMessage(id: message.id, forEveryone: forEveryone)
+        sync()
+    }
+
+    func sendAttachment(url: URL, caption: String) async {
+        sendingAttachment = true
+        await controller?.sendAttachment(fileURL: url, caption: caption)
+        sendingAttachment = false
         sync()
     }
 
