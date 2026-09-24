@@ -47,7 +47,7 @@ public final class CallController: ObservableObject {
 
     /// Incoming call signal handler
     private var signalTask: Task<Void, Never>?
-    private var transport: CallSignalTransport?
+    private var rustCore: RustCoreService?
     private var signalService: (any SignalService)?
 
     private init() {}
@@ -55,7 +55,10 @@ public final class CallController: ObservableObject {
     /// Configure with live signal service (for websocket transport)
     public func configure(with service: any SignalService, transport: CallSignalTransport) {
         self.signalService = service
-        self.transport = transport
+        // Also store RustCoreService if it's the live backend
+        if let rust = service as? RustCoreService {
+            self.rustCore = rust
+        }
         startListening()
     }
 
@@ -143,14 +146,9 @@ public final class CallController: ObservableObject {
     }
 
     private func startListening() {
-        signalTask?.cancel()
-        guard let transport else { return }
-
-        signalTask = Task { [weak self] in
-            for await signal in transport.incomingCallSignals {
-                await self?.handleIncomingSignal(signal)
-            }
-        }
+        // TODO: M4 - Implement inbound call signal listening via websocket
+        // For now, we only support outbound signaling via RustCoreService FFI
+        // The inbound path would need a websocket connection to Signal's call signaling
     }
 
     private func handleIncomingSignal(_ signal: CallSignalMessage) async {
@@ -221,45 +219,62 @@ public final class CallController: ObservableObject {
         activeCall = nil
     }
 
-    // MARK: - Signaling (to be implemented with RingRTC)
-
     private func sendOffer(callId: String, to conversationId: String, mediaType: CallMediaType) async throws {
-        // TODO: Generate SDP offer via RingRTC
-        // For now, send placeholder
-        let signal = CallSignalMessage(
-            callId: callId,
-            type: .offer,
-            from: "self", // will be filled by transport
-            to: conversationId,
-            payload: "v=0\r\no=- \(Int64(Date().timeIntervalSince1970)) 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
-        )
-        try await transport?.sendCallSignal(signal)
+        guard let rust = rustCore else { throw CallError.signalingFailed("No RustCoreService") }
+        // Generate a basic SDP offer for the media type
+        let sdp = generateSdpOffer(mediaType: mediaType)
+        try await rust.sendCallOffer(callId: callId, to: conversationId, mediaType: mediaType.rawValue, sdp: sdp)
     }
 
     private func sendAnswer(callId: String) async throws {
-        // TODO: Generate SDP answer via RingRTC
+        guard let rust = rustCore else { throw CallError.signalingFailed("No RustCoreService") }
+        // Generate a basic SDP answer
+        let sdp = generateSdpAnswer()
+        try await rust.sendCallAnswer(callId: callId, sdp: sdp)
     }
 
     private func sendHangup(callId: String, reason: CallEndReason) async throws {
-        let signal = CallSignalMessage(
-            callId: callId,
-            type: .hangup,
-            from: "self",
-            to: activeCall?.callRecord.remotePeer.uuidString ?? "",
-            payload: reason.rawValue
-        )
-        try await transport?.sendCallSignal(signal)
+        guard let rust = rustCore else { throw CallError.signalingFailed("No RustCoreService") }
+        try await rust.sendCallHangup(callId: callId, reason: reason.rawValue)
     }
 
     private func sendBusy(callId: String) async throws {
-        let signal = CallSignalMessage(
-            callId: callId,
-            type: .busy,
-            from: "self",
-            to: "",
-            payload: ""
-        )
-        try await transport?.sendCallSignal(signal)
+        guard let rust = rustCore else { throw CallError.signalingFailed("No RustCoreService") }
+        try await rust.sendCallHangup(callId: callId, reason: CallEndReason.declined.rawValue)
+    }
+
+    /// Generate a basic SDP offer
+    private func generateSdpOffer(mediaType: CallMediaType) -> String {
+        let timestamp = Int64(Date().timeIntervalSince1970)
+        let mediaLine = mediaType == .video ? "m=video 9 UDP/TLS/RTP/SAVPF 96" : "m=audio 9 UDP/TLS/RTP/SAVPF 111"
+        return """
+        v=0
+        o=- \(timestamp) 2 IN IP4 127.0.0.1
+        s=-
+        t=0 0
+        \(mediaLine)
+        a=rtcp-mux
+        a=setup:actpass
+        a=fingerprint:sha-256 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00
+        a=mid:0
+        """
+
+    }
+
+    /// Generate a basic SDP answer
+    private func generateSdpAnswer() -> String {
+        let timestamp = Int64(Date().timeIntervalSince1970)
+        return """
+        v=0
+        o=- \(timestamp) 2 IN IP4 127.0.0.1
+        s=-
+        t=0 0
+        m=audio 9 UDP/TLS/RTP/SAVPF 111
+        a=rtcp-mux
+        a=setup:active
+        a=fingerprint:sha-256 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00
+        a=mid:0
+        """
     }
 }
 

@@ -415,6 +415,58 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         guard rc == 0 else { throw SignalError.network("send receipt failed: \(lastError(sym))") }
     }
 
+    // MARK: - M4: Call Signaling
+
+    /// Send a call offer (SDP) to start a call.
+    public func sendCallOffer(callId: String, to: String, mediaType: String, sdp: String) async throws {
+        let sym = try await initCore()
+        let rc = callId.withCString { c in
+            to.withCString { t in
+                mediaType.withCString { m in
+                    sdp.withCString { s in
+                        sym.sendCallOffer(c, t, m, s)
+                    }
+                }
+            }
+        }
+        guard rc == 0 else { throw SignalError.network("send call offer failed: \(lastError(sym))") }
+    }
+
+    /// Send a call answer (SDP) to accept a call.
+    public func sendCallAnswer(callId: String, sdp: String) async throws {
+        let sym = try await initCore()
+        let rc = callId.withCString { c in
+            sdp.withCString { s in
+                sym.sendCallAnswer(c, s)
+            }
+        }
+        guard rc == 0 else { throw SignalError.network("send call answer failed: \(lastError(sym))") }
+    }
+
+    /// Send an ICE candidate during call setup.
+    public func sendCallIceCandidate(callId: String, candidate: String, sdpMid: String, sdpMLineIndex: UInt32) async throws {
+        let sym = try await initCore()
+        let rc = callId.withCString { c in
+            candidate.withCString { cand in
+                sdpMid.withCString { mid in
+                    sym.sendCallIce(c, cand, mid, sdpMLineIndex)
+                }
+            }
+        }
+        guard rc == 0 else { throw SignalError.network("send call ice failed: \(lastError(sym))") }
+    }
+
+    /// Send a call hangup.
+    public func sendCallHangup(callId: String, reason: String) async throws {
+        let sym = try await initCore()
+        let rc = callId.withCString { c in
+            reason.withCString { r in
+                sym.sendCallHangup(c, r)
+            }
+        }
+        guard rc == 0 else { throw SignalError.network("send call hangup failed: \(lastError(sym))") }
+    }
+
     /// Profile display name for a contact uuid (nil when unavailable).
     public func profileName(uuid: String) async -> String? {
         guard let sym = try? await initCore() else { return nil }
@@ -538,6 +590,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let sendDelete: @convention(c) (UnsafePointer<CChar>, UInt64) -> Int64
         let sendReaction: @convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>, Int32) -> Int64
         let sendReceipt: @convention(c) (UnsafePointer<CChar>, UnsafePointer<UInt64>, UInt64, UnsafePointer<CChar>) -> Int32
+        let sendCallOffer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
+        let sendCallAnswer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
+        let sendCallIce: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UInt32) -> Int32
+        let sendCallHangup: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let deleteLocal: @convention(c) (UnsafePointer<CChar>, UInt64) -> Int32
         let profile: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let whoami: @convention(c) () -> UnsafeMutablePointer<CChar>?
@@ -783,6 +839,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let sd = dlsym(handle, "core_cmd_send_delete"),
               let se = dlsym(handle, "core_cmd_send_reaction"),
               let srec = dlsym(handle, "core_cmd_send_receipt"),
+              let sco = dlsym(handle, "core_cmd_send_call_offer"),
+              let sca = dlsym(handle, "core_cmd_send_call_answer"),
+              let sci = dlsym(handle, "core_cmd_send_call_ice"),
+              let sch = dlsym(handle, "core_cmd_send_call_hangup"),
               let dl = dlsym(handle, "core_cmd_delete_local"),
               let pf = dlsym(handle, "core_cmd_profile"),
               let w = dlsym(handle, "core_cmd_whoami"),
@@ -806,6 +866,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             sendDelete: unsafeBitCast(sd, to: (@convention(c) (UnsafePointer<CChar>, UInt64) -> Int64).self),
             sendReaction: unsafeBitCast(se, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UnsafePointer<CChar>, UnsafePointer<CChar>, Int32) -> Int64).self),
             sendReceipt: unsafeBitCast(srec, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<UInt64>, UInt64, UnsafePointer<CChar>) -> Int32).self),
+            sendCallOffer: unsafeBitCast(sco, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
+            sendCallAnswer: unsafeBitCast(sca, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
+            sendCallIce: unsafeBitCast(sci, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UInt32) -> Int32).self),
+            sendCallHangup: unsafeBitCast(sch, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             deleteLocal: unsafeBitCast(dl, to: (@convention(c) (UnsafePointer<CChar>, UInt64) -> Int32).self),
             profile: unsafeBitCast(pf, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             whoami: unsafeBitCast(w, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
