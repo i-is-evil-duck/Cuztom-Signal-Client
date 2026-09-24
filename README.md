@@ -38,14 +38,15 @@ has `InMemorySecretStore` (tests) and `KeychainSecretStore` (prod).
 - [x] 12 unit tests (`swift test`), Rust 1.98 toolchain installed
 - Verify: `swift build`, `swift test`
 
-### M1 — Link + 1:1 text (next)
-1. Install Rust: `brew install rustup && rustup-init`, add `aarch64-apple-darwin` target.
-   Plus `brew install protobuf` (`protoc` needed by `spqr` build script — verified blocker, see `rust-core/README.md`).
-2. Wire `rust-core/src/lib.rs`: `presage::Manager::link_secondary_device` -> real QR URI out of `link_device_qr`, `SqliteStore` at `~/Library/Application Support/CuztomSignal/signal.db`.
-3. Swift `RustCoreService: SignalService` via C header + `core_free_string`; replace `MockSignalService` in `ChatViewModel`.
-4. Persist identity in `KeychainSecretStore`; contacts sync into `MessageStore`.
-5. Tests: link round-trip against `presage-cli` test account, send/receive text to self, offline-reconnect.
-6. Verify: link a test number, send 1:1 text both directions, restart app (session persists).
+### M1 — Link + 1:1 text (in progress)
+- [x] `rust-core/`: presage `Manager` on a LocalSet worker thread, C ABI
+  (`init` / `begin_link` / `poll_link` / `is_linked`), 3 `cargo test`s green
+- [x] Swift `RustCoreService`: real `dlopen`+`dlsym` calls, string marshaling,
+  offline `isLinkedAccount()` probe; `ChatViewModel` picks Live backend when
+  the dylib is present, Mock otherwise (indicator in sidebar footer)
+- [x] 13 `swift test`s green, incl. live-dylib offline init against a temp store
+- [ ] Manual: real phone scan → QR → linked → restart persists (needs user)
+- [ ] M1b: receive loop + send + contacts/groups sync
 
 ### M2 — Groups + attachments
 1. GroupsV2 (`zkgroup`) sync: member list, title/avatar, admin flags.

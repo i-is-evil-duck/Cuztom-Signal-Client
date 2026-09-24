@@ -43,6 +43,12 @@ struct SidebarView: View {
             }
         }
         .navigationTitle("Cuztom Signal")
+        .safeAreaInset(edge: .bottom) {
+            Text("backend: \(vm.backendName)")
+                .font(.caption2).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+        }
         .onChange(of: vm.selectedId) { _, newId in
             if let newId { Task { await vm.select(newId) } }
         }

@@ -2,19 +2,20 @@
 name = "cuztom-signal-core"
 version = "0.1.0"
 edition = "2021"
-description = "Rust service core for Cuztom Signal (presage + libsignal). M1 target."
+description = "Rust service core for Cuztom Signal (presage + libsignal). M1: link + persistence."
 
 [lib]
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 # Service layer (link-device, chat websocket, groups, attachments, sqlite store).
-# Pinned to git until we vendor a stable tag in M1.
 presage = { git = "https://github.com/whisperfish/presage" }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# current_thread runtime + LocalSet worker (presage uses spawn_local, so its
+# futures are !Send and must run on one dedicated thread).
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# presage's provisioning handshake hands us a futures::oneshot::Sender<Url>.
+futures = "0.3"
+url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[build-dependencies]
-# uniffi / cbindgen wiring lands in M1 when Swift FFI is generated.

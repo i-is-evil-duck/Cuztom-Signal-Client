@@ -73,10 +73,26 @@ import Testing
         _ = try await svc.beginLinking(deviceName: "TestMac")
         Issue.record("expected unsupported")
     } catch SignalError.unsupported {
-        // expected seam behavior until M1 wires the Manager
+        // expected seam behavior when no dylib is present
     } catch {
         Issue.record("wrong error: \(error)")
     }
+}
+
+@Test func rustCoreLocalBuildInitsFreshOffline() async throws {
+    // Offline-safe: init only touches sqlite, never the network.
+    // Skips cleanly on machines where rust-core/ was never built.
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cuztom-swift-test-\(ProcessInfo.processInfo.processIdentifier)")
+    let db = dir.appendingPathComponent("signal.db").path
+    let svc = RustCoreService(dbPath: db)
+    guard svc.loadLibrary() else { return }
+    #expect(svc.isLibraryLoaded)
+    let linked = try await svc.isLinkedAccount()
+    #expect(!linked) // fresh temp store
+    let again = try await svc.isLinkedAccount()
+    #expect(!again) // init is idempotent
+    try? FileManager.default.removeItem(at: dir)
 }
 
 @Test func storeSearchDeleteAndTotals() async {

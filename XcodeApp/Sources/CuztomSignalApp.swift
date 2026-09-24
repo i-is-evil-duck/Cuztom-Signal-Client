@@ -28,10 +28,21 @@ final class ChatViewModel {
     var messages: [ChatMessage] = []
     var linkQR: LinkQR?
     var isLinked = false
+    var backendName = "…"
 
     func startLinking(deviceName: String = "CuztomMac") async {
-        let (convs, msgs) = Self.previewData()
-        let svc = MockSignalService(seedConversations: convs, seedMessages: msgs)
+        // Live backend when the rust dylib sits next to the build;
+        // otherwise the deterministic mock (Xcode previews, CI).
+        let live = RustCoreService()
+        let svc: any SignalService
+        if live.loadLibrary() {
+            svc = live
+            backendName = "Live"
+        } else {
+            let (convs, msgs) = Self.previewData()
+            svc = MockSignalService(seedConversations: convs, seedMessages: msgs)
+            backendName = "Mock"
+        }
         let controller = ChatController(service: svc)
         self.controller = controller
         await controller.link(deviceName: deviceName)
