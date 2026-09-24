@@ -95,11 +95,16 @@ struct LiveEvent: Decodable {
     // receipt
     var kind: String?
     var timestamps: [Int64]?
+    // typing
+    var started: Bool?
+    var typingSender: String?
 
     private enum CodingKeys: String, CodingKey {
         case type, message, thread, emoji, remove, sender, kind, timestamps
         case targetSts = "target_sts"
         case senderName = "sender_name"
+        case started
+        case typingSender = "typing_sender"
     }
 }
 
@@ -640,6 +645,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// Live receipt: (sender name, "read"|"delivered", message timestamps).
     public var onReceipt: ((String, String, [Int64]) -> Void)?
 
+    /// Live typing: (thread, sender name, started: Bool)
+    public var onTyping: ((String, String, Bool) -> Void)?
+
     /// "12 contacts, 3 groups, 45 msgs @ 22:01" or "never".
     public private(set) var lastRosterSummary = "never"
 
@@ -771,6 +779,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 if let thread = event.thread, let sts = event.targetSts,
                    let emoji = event.emoji, !emoji.isEmpty {
                     onReaction?(thread, sts, emoji, event.remove ?? false, event.senderName ?? "?")
+                }
+            case "typing":
+                if let thread = event.thread,
+                   let sender = event.typingSender,
+                   let started = event.started {
+                    onTyping?(thread, sender, started)
                 }
             case "receipt":
                 if let kind = event.kind, let stamps = event.timestamps {

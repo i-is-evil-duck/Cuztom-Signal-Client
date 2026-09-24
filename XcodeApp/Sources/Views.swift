@@ -164,6 +164,19 @@ struct MessageListView: View {
                     .padding(.horizontal, 12).padding(.vertical, 4)
                     .background(Color.gray.opacity(0.08))
                 }
+                // Typing indicator
+                if let id = vm.selectedId,
+                   let typing = vm.typingUsers[id],
+                   typing.1 {
+                    HStack {
+                        Text("\(typing.0) is typing…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 2)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
                 if vm.selectedId != nil {
                     if vm.historyExhausted {
                         Text("No older messages — history starts when this device was linked.")
@@ -262,6 +275,13 @@ struct MessageListView: View {
                     TextField("Message  (/help for commands)", text: $draft)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { send() }
+                        .onChange(of: draft) { _, newValue in
+                            if !newValue.isEmpty {
+                                Task { await vm.sendTyping(started: true) }
+                            } else {
+                                Task { await vm.sendTyping(started: false) }
+                            }
+                        }
                     Button(vm.sendingAttachment ? "Sending…" : "Send") { send() }
                         .keyboardShortcut(.return)
                         .disabled((draft.trimmingCharacters(in: .whitespaces).isEmpty && vm.pendingFiles.isEmpty) || vm.sendingAttachment)

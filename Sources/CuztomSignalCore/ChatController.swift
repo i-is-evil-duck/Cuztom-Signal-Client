@@ -89,6 +89,9 @@ public final class ChatController: @unchecked Sendable {
                 live.onReceipt = { [weak self] sender, kind, stamps in
                     Task { await self?.applyReceipt(kind: kind, timestamps: stamps, senderName: sender) }
                 }
+                live.onTyping = { [weak self] thread, sender, started in
+                    Task { await self?.applyTyping(thread: thread, senderName: sender, started: started) }
+                }
                 do {
                     try await live.startLiveSync()
                     Log.info("live sync started")
@@ -158,6 +161,31 @@ public final class ChatController: @unchecked Sendable {
         }
         if let touched, touched == selectedId {
             messages = await store.messages(in: touched)
+        }
+    }
+
+    /// Apply a live typing indicator to the conversation.
+    public func applyTyping(thread: String, senderName: String, started: Bool) async {
+        // Typing indicators are transient UI state; we don't persist them.
+        // The ChatViewModel handles displaying the indicator in the UI.
+        // We could emit a notification or update a typing state dictionary here.
+        Log.info("typing \(started ? "started" : "stopped") by \(senderName) in \(thread)")
+        // TODO: Update a typing state dictionary for UI display
+    }
+
+
+    /// Send a typing indicator.
+    public func sendTyping(thread: String, started: Bool) async {
+        guard let live = service as? RustCoreService else {
+            lastError = "typing indicators need the live backend"
+            Log.error("typing: no live backend")
+            return
+        }
+        do {
+            try await live.sendTyping(thread: thread, started: started)
+        } catch {
+            lastError = String(describing: error)
+            Log.error("send typing failed: (error)")
         }
     }
 

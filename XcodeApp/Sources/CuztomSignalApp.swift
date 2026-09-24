@@ -115,6 +115,9 @@ final class ChatViewModel {
     var incomingCall: ActiveCall?
     var activeCall: ActiveCall?
 
+    // Typing indicator state
+    var typingUsers: [String: (String, Bool)] = [:] // thread -> (sender, isTyping)
+
     func start() async {
         phase = .starting
         errorMessage = nil
@@ -247,6 +250,27 @@ final class ChatViewModel {
         editingMessage = nil
         editDraft = ""
     }
+
+    /// Apply a live typing indicator
+    func applyTyping(thread: String, senderName: String, started: Bool) {
+        if started {
+            typingUsers[thread] = (senderName, true)
+        } else {
+            typingUsers.removeValue(forKey: thread)
+        }
+    }
+
+
+/// Send a typing indicator
+func sendTyping(started: Bool) async {
+    guard let id = selectedId,
+          let controller else { return }
+    do {
+        try await controller.sendTyping(thread: id, started: started)
+    } catch {
+        // Ignore typing errors silently
+    }
+}
 
     // MARK: - Calls (M4)
 
