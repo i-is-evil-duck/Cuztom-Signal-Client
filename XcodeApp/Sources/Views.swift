@@ -4,9 +4,11 @@ import AVKit
 import CoreMedia
 import CoreImage.CIFilterBuiltins
 import CuztomSignalCore
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(ChatViewModel.self) private var vm
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
@@ -25,6 +27,10 @@ struct ContentView: View {
             if vm.phase == .starting {
                 await vm.start()
             }
+        }
+        .onAppear {
+            AppDelegate.reopenMainWindow = { openWindow(id: "main") }
+            DropRelay.model = vm
         }
     }
 }
@@ -177,32 +183,76 @@ struct MessageListView: View {
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(Color.accentColor.opacity(0.08))
                 }
+                if !vm.pendingFiles.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack {
+                            ForEach(vm.pendingFiles, id: \.self) { url in
+                                HStack(spacing: 4) {
+                                    Image(systemName: "doc.fill")
+                                    Text(url.lastPathComponent).font(.caption).lineLimit(1)
+                                    Button { vm.pendingFiles.removeAll { $0 == url } } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(6)
+                                .background(Color.accentColor.opacity(0.12))
+                                .cornerRadius(8)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                    }
+                    .padding(.vertical, 4)
+                }
+                if let err = vm.sendError {
+                    HStack {
+                        Text(err).font(.caption).foregroundStyle(.red).lineLimit(2)
+                        Spacer()
+                        Button { vm.sendError = nil } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 4)
+                }
                 HStack {
                     Button {
                         let panel = NSOpenPanel()
-                        panel.allowsMultipleSelection = false
+                        panel.allowsMultipleSelection = true
                         panel.canChooseFiles = true
                         panel.canChooseDirectories = false
-                        if panel.runModal() == .OK, let url = panel.url {
-                            let caption = draft
-                            draft = ""
-                            vm.replyingTo = nil
-                            Task { await vm.sendAttachment(url: url, caption: caption) }
+                        if panel.runModal() == .OK {
+                            vm.stageFiles(panel.urls)
                         }
                     } label: {
                         Image(systemName: "paperclip")
                     }
                     .buttonStyle(.plain)
-                    .help("Send a file (draft text becomes the caption)")
+                    .help("Attach files (draft text becomes the caption)")
                     .disabled(vm.sendingAttachment)
+                    Button { vm.pasteBoard() } label: {
+                        Image(systemName: "clipboard")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Paste clipboard images/files as attachments")
                     TextField("Message  (/help for commands)", text: $draft)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { send() }
                     Button(vm.sendingAttachment ? "Sending…" : "Send") { send() }
                         .keyboardShortcut(.return)
-                        .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty || vm.sendingAttachment)
+                        .disabled((draft.trimmingCharacters(in: .whitespaces).isEmpty && vm.pendingFiles.isEmpty) || vm.sendingAttachment)
                 }
                 .padding()
+                .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                    for p in providers {
+                        // NOTE: this callback is nonisolated and must not
+                        // capture the view model — relay through DropRelay.
+                        _ = p.loadObject(ofClass: URL.self) { url, _ in
+                            if let url { DropRelay.stage([url]) }
+                        }
+                    }
+                    return true
+                }
             }
         }
         .sheet(item: $vm.preview) { item in
@@ -228,11 +278,19 @@ struct MessageListView: View {
             .padding()
             .frame(minWidth: 260)
         }
+        .popover(item: $vm.emojiTarget) { msg in
+            AppleEmojiCatcherView { emoji in
+                vm.emojiTarget = nil
+                Task { await vm.react(message: msg, emoji: emoji) }
+            }
+            .padding()
+            .frame(width: 300, height: 140)
+        }
     }
 
     private func send() {
         let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty else { return }
+        guard !body.isEmpty || !vm.pendingFiles.isEmpty else { return }
         draft = ""
         Task { await vm.send(body) }
     }
@@ -281,6 +339,8 @@ struct MessageRow: View {
                             Task { await vm.react(message: msg, emoji: emoji) }
                         }
                     }
+                    Divider()
+                    Button("Emoji & Symbols…") { vm.emojiTarget = msg }
                 }
                 if msg.direction == .outgoing {
                     Menu("Delete") {
@@ -399,13 +459,14 @@ struct AttachmentPreview: View {
     }
 }
 
-/// Video player without a scrub timeline (scroll-to-seek removed by design),
-/// auto-sized to the media aspect.
+/// Video player: Play/Pause + time readout, auto-sized to the media.
+/// Deliberately NO scrub timeline (scroll-to-seek removed by design).
 struct SheetVideoPlayer: View {
     var url: URL
     @State private var player: AVPlayer?
     @State private var playing = false
     @State private var aspect: CGFloat = 16.0 / 9.0
+    @State private var total: Double = 0
 
     var body: some View {
         VStack(spacing: 8) {
@@ -418,26 +479,46 @@ struct SheetVideoPlayer: View {
                     ProgressView().frame(width: 480, height: 270)
                 }
             }
-            HStack {
+            // Media controls: transport + time, no seek bar.
+            HStack(spacing: 12) {
                 Button(playing ? "Pause" : "Play") {
                     guard let player else { return }
                     if playing { player.pause() } else { player.play() }
                     playing.toggle()
                 }
                 .keyboardShortcut(.space)
-                Text(itemDuration).font(.caption).foregroundStyle(.secondary)
+                .buttonStyle(.borderedProminent)
+                TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+                    Text("\(fmt(currentSeconds)) / \(fmt(total))")
+                        .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Restart") {
+                    player?.seek(to: .zero)
+                    player?.play()
+                    playing = true
+                }
+                .font(.caption)
             }
         }
         .task {
             let p = AVPlayer(url: url)
             player = p
             aspect = await videoAspect(url: url) ?? (16.0 / 9.0)
+            if let d = try? await p.currentItem?.asset.load(.duration), d.isValid, !d.isIndefinite {
+                total = CMTimeGetSeconds(d)
+            }
             p.play()
             playing = true
         }
         .onDisappear {
             player?.pause()
         }
+    }
+
+    private var currentSeconds: Double {
+        guard let t = player?.currentTime(), t.isValid else { return 0 }
+        return CMTimeGetSeconds(t)
     }
 
     private var frameSize: CGSize {
@@ -447,10 +528,10 @@ struct SheetVideoPlayer: View {
         return CGSize(width: h * aspect, height: h)
     }
 
-    private var itemDuration: String {
-        guard let d = player?.currentItem?.duration, d.isValid, !d.isIndefinite else { return "" }
-        let s = Int(CMTimeGetSeconds(d))
-        return String(format: "%d:%02d", s / 60, s % 60)
+    private func fmt(_ s: Double) -> String {
+        guard s.isFinite && s >= 0 else { return "0:00" }
+        let i = Int(s)
+        return String(format: "%d:%02d", i / 60, i % 60)
     }
 }
 
@@ -494,7 +575,21 @@ struct LinkDeviceView: View {
     }
 }
 
-private func qrNSImage(_ string: String) -> NSImage? {    let context = CIContext()
+/// File-drop relay: `NSItemProvider.loadObject` callbacks are nonisolated
+/// and must not capture the view model, so drops land here and hop to the
+/// main actor internally.
+enum DropRelay {
+    nonisolated(unsafe) static weak var model: ChatViewModel?
+
+    static func stage(_ urls: [URL]) {
+        Task { @MainActor in
+            model?.stageFiles(urls)
+        }
+    }
+}
+
+private func qrNSImage(_ string: String) -> NSImage? {
+    let context = CIContext()
     let filter = CIFilter.qrCodeGenerator()
     filter.message = Data(string.utf8)
     filter.correctionLevel = "M"

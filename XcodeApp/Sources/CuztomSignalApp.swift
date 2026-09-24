@@ -31,7 +31,7 @@ struct CuztomSignalApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             ContentView()
                 .environment(viewModel)
                 .frame(minWidth: 900, minHeight: 600)
@@ -46,13 +46,17 @@ struct CuztomSignalApp: App {
 }
 
 /// Reopen the main window when the dock icon is clicked after closing it.
-/// Without this the app sits running with no windows until force-quit.
+/// (Checking `NSApp.windows` doesn't work — SwiftUI destroys closed
+/// windows — so ContentView hands us the real `openWindow` action.)
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Set from the main thread only (ContentView.onAppear / dock reopen).
+    nonisolated(unsafe) static var reopenMainWindow: (() -> Void)?
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
             NSApp.activate(ignoringOtherApps: true)
-            if let window = sender.windows.first(where: { $0.canBecomeMain }) {
-                window.makeKeyAndOrderFront(nil)
+            DispatchQueue.main.async {
+                Self.reopenMainWindow?()
             }
         }
         return true
@@ -98,8 +102,13 @@ final class ChatViewModel {
     var preview: PreviewItem?
     var replyingTo: ChatMessage?
     var receiptTarget: ChatMessage?
+    var emojiTarget: ChatMessage?
     var showCallsSoon = false
     var sendingAttachment = false
+    /// Files staged via paperclip / drop / paste, sent on Send.
+    var pendingFiles: [URL] = []
+    /// Last failed-action message (send/attachment/react/delete).
+    var sendError: String?
 
     func start() async {
         phase = .starting
@@ -162,19 +171,60 @@ final class ChatViewModel {
 
     func react(message: ChatMessage, emoji: String) async {
         await controller?.react(messageId: message.id, emoji: emoji)
+        sendError = controller?.lastError
         sync()
     }
 
     func deleteMessage(_ message: ChatMessage, forEveryone: Bool) async {
         await controller?.deleteMessage(id: message.id, forEveryone: forEveryone)
+        sendError = controller?.lastError
         sync()
     }
 
     func sendAttachment(url: URL, caption: String) async {
         sendingAttachment = true
+        sendError = nil
         await controller?.sendAttachment(fileURL: url, caption: caption)
+        sendError = controller?.lastError
         sendingAttachment = false
         sync()
+    }
+
+    /// Stage dropped/pasted files (copied into Caches/pending).
+    func stageFiles(_ urls: [URL]) {
+        let dir = pendingDir()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for url in urls {
+            let dest = dir.appendingPathComponent(url.lastPathComponent)
+            try? FileManager.default.removeItem(at: dest)
+            if (try? FileManager.default.copyItem(at: url, to: dest)) != nil {
+                if !pendingFiles.contains(dest) { pendingFiles.append(dest) }
+            }
+        }
+    }
+
+    /// Paste images/files from the clipboard into the pending tray.
+    func pasteBoard() {
+        let pb = NSPasteboard.general
+        var urls: [URL] = []
+        if let objects = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            urls.append(contentsOf: objects.filter { $0.isFileURL })
+        }
+        if urls.isEmpty, let tiff = pb.data(forType: .tiff), let img = NSImage(data: tiff) {
+            let dest = pendingDir().appendingPathComponent("paste-\(Int(Date().timeIntervalSince1970)).png")
+            try? FileManager.default.createDirectory(at: pendingDir(), withIntermediateDirectories: true)
+            if let rep = img.tiffRepresentation,
+               let png = NSBitmapImageRep(data: rep)?.representation(using: .png, properties: [:]) {
+                try? png.write(to: dest)
+                urls.append(dest)
+            }
+        }
+        if !urls.isEmpty { stageFiles(urls) }
+    }
+
+    private func pendingDir() -> URL {
+        let base = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)) ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("CuztomSignal/pending")
     }
 
     func loadMore() async {

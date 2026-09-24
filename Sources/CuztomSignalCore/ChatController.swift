@@ -98,6 +98,8 @@ public final class ChatController: @unchecked Sendable {
             connection = .connected
             startWatching()
             Log.info("linked: \(conversations.count) conversations")
+            // Backfill media caches quietly (roster rows are metadata-only).
+            Task { await self.autoFetchMissing() }
             return true
         } catch {
             lastError = String(describing: error)
@@ -493,6 +495,30 @@ public final class ChatController: @unchecked Sendable {
         conversations = await store.allConversations()
         if message.conversationId == selectedId {
             messages = await store.messages(in: message.conversationId)
+        }
+    }
+
+    /// Auto-fetch missing attachments after launch (roster seeds metadata
+    /// only). Bounded: newest-first, capped count, core skips oversized.
+    /// Fire-and-forget from `finish()`; failures stay quiet in the log.
+    public func autoFetchMissing(maxFiles: Int = 20) async {
+        guard service is RustCoreService else { return }
+        var fetched = 0
+        for conv in conversations {
+            if fetched >= maxFiles { break }
+            let list = await store.messages(in: conv.id)
+            for m in list.reversed() {
+                if fetched >= maxFiles { break }
+                for idx in m.attachments.indices where m.attachments[idx].localURL == nil {
+                    if await downloadAttachment(messageId: m.id, index: idx) {
+                        fetched += 1
+                    }
+                }
+            }
+        }
+        if fetched > 0 {
+            messages = await store.messages(in: selectedId ?? "")
+            Log.info("auto-fetch: \(fetched) attachments")
         }
     }
 
