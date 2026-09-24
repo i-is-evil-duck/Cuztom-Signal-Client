@@ -40,6 +40,7 @@ has `InMemorySecretStore` (tests) and `KeychainSecretStore` (prod).
 
 ### M1 — Link + 1:1 text (next)
 1. Install Rust: `brew install rustup && rustup-init`, add `aarch64-apple-darwin` target.
+   Plus `brew install protobuf` (`protoc` needed by `spqr` build script — verified blocker, see `rust-core/README.md`).
 2. Wire `rust-core/src/lib.rs`: `presage::Manager::link_secondary_device` -> real QR URI out of `link_device_qr`, `SqliteStore` at `~/Library/Application Support/CuztomSignal/signal.db`.
 3. Swift `RustCoreService: SignalService` via C header + `core_free_string`; replace `MockSignalService` in `ChatViewModel`.
 4. Persist identity in `KeychainSecretStore`; contacts sync into `MessageStore`.
