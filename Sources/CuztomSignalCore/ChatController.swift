@@ -16,6 +16,8 @@ public final class ChatController: @unchecked Sendable {
     public private(set) var linkQR: LinkQR?
     public private(set) var lastError: String?
     public private(set) var lastSyncNote: String?
+    /// Thread id of the most recent send (send-target tracing).
+    public private(set) var lastSentThread: String?
 
     private let service: any SignalService
     private var store: MessageStore
@@ -194,6 +196,7 @@ public final class ChatController: @unchecked Sendable {
             lines.append("backend: mock")
         }
         lines.append("last sync: \(lastSyncNote ?? "none")")
+        lines.append("last sent to: \(lastSentThread ?? "none")")
         lines.append("last error: \(lastError ?? "none")")
         lines.append("log: \(Log.fileURL.path)")
         return lines.joined(separator: "\n")
@@ -218,6 +221,7 @@ public final class ChatController: @unchecked Sendable {
         guard !trimmed.isEmpty, let id = selectedId else { return }
         do {
             let msg = try await service.sendText(trimmed, to: id)
+            lastSentThread = id
             await store.saveMessage(msg)
             messages = await store.messages(in: id)
             Log.info("sent \(trimmed.count) chars to \(id)")
@@ -244,17 +248,22 @@ public final class ChatController: @unchecked Sendable {
     }
 
     /// Grow the open thread by one more history page (see `fetchMessages`).
-    public func loadMore(chunk: Int = 100) async {
-        guard let id = selectedId else { return }
+    /// Returns true when new rows arrived; false means exhausted (or failed).
+    @discardableResult
+    public func loadMore(chunk: Int = 100) async -> Bool {
+        guard let id = selectedId else { return false }
         let current = await store.messageCount(in: id)
         do {
             let merged = try await service.fetchMessages(conversationId: id, limit: current + chunk)
             for m in merged { await store.saveMessage(m) }
             messages = await store.messages(in: id)
-            Log.info("loadMore \(id): \(messages.count) messages")
+            let grew = messages.count > current
+            Log.info("loadMore \(id): \(current) -> \(messages.count)")
+            return grew
         } catch {
             lastError = String(describing: error)
             Log.error("loadMore failed: \(error)")
+            return false
         }
     }
 
@@ -268,10 +277,12 @@ public final class ChatController: @unchecked Sendable {
         guard let live = service as? RustCoreService,
               let stored = await store.message(id: messageId),
               stored.attachments.indices.contains(index) else { return false }
+        // Store-clock timestamp is the lookup key; fall back to display ts.
+        let sts = stored.storeTs ?? Int64(stored.sentAt.timeIntervalSince1970 * 1000)
         do {
             let url = try await live.fetchAttachment(
                 thread: stored.conversationId,
-                ts: Int64(stored.sentAt.timeIntervalSince1970 * 1000),
+                ts: sts,
                 index: index
             )
             await store.updateMessage(id: messageId) { $0.attachments[index].localURL = url }

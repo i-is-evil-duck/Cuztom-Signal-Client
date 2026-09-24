@@ -57,6 +57,7 @@ pub fn content_parts(
     let meta = &content.metadata;
     let sender = service_uuid(&meta.sender);
     let ts = meta.server_timestamp.timestamp_millis().max(0) as u64;
+    let store_ts = meta.client_timestamp.timestamp_millis().max(0) as u64;
     match &content.body {
         ContentBody::DataMessage(m) => {
             let body = m.body.clone().unwrap_or_default();
@@ -75,7 +76,7 @@ pub fn content_parts(
                 Thread::Group(key) => format!("group:{}", hex::encode(key)),
             };
             let pointers = m.attachments.clone();
-            Some((message_json(&thread_id, &sender, names, &body, ts, outgoing, &pointers), pointers))
+            Some((message_json(&thread_id, &sender, names, &body, ts, outgoing, &pointers, store_ts), pointers))
         }
         ContentBody::SynchronizeMessage(s) => {
             let (body, pointers) = match &s.content {
@@ -91,7 +92,7 @@ pub fn content_parts(
                 Thread::Contact(sid) => format!("contact:{}", service_uuid(sid)),
                 Thread::Group(key) => format!("group:{}", hex::encode(key)),
             };
-            Some((message_json(&thread_id, self_aci, names, &body, ts, true, &pointers), pointers))
+            Some((message_json(&thread_id, self_aci, names, &body, ts, true, &pointers, store_ts), pointers))
         }
         _ => None,
     }
@@ -114,6 +115,7 @@ fn message_json(
     ts: u64,
     outgoing: bool,
     pointers: &[AttachmentPointer],
+    store_ts: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "key": format!("{thread}/{ts}/{sender}"),
@@ -121,7 +123,11 @@ fn message_json(
         "sender": sender,
         "sender_name": display_name(names, sender),
         "body": body,
+        // ts = server clock (display/sort). sts = store clock
+        // (client_timestamp, the `ts` column) — the ONLY correct basis for
+        // paging ranges and attachment lookups.
         "ts": ts,
+        "sts": store_ts,
         "outgoing": outgoing,
         "attachments": pointers.iter().map(attachment_meta).collect::<Vec<_>>(),
     })
@@ -205,14 +211,14 @@ pub fn parse_thread(thread_id: &str) -> Result<Thread, String> {
     }
 }
 
-/// Page of messages for one thread (newest `limit` older than `before_ts`;
-/// `before_ts == u64::MAX` means latest). Metadata only — attachments fetch
-/// on demand via `fetch_attachment`.
+/// Page of messages for one thread (newest `limit` with store-clock ts
+/// below `before_sts`; `u64::MAX` = latest). Metadata only — attachments
+/// fetch on demand via `fetch_attachment`.
 pub async fn thread_page(
     store: &SqliteStore,
     thread_id: &str,
     limit: usize,
-    before_ts: u64,
+    before_sts: u64,
 ) -> Result<String, String> {
     let reg = store
         .load_registration_data()
@@ -223,7 +229,7 @@ pub async fn thread_page(
     let names = load_names(store).await;
     let thread = parse_thread(thread_id)?;
     let mut msgs: Vec<Content> = store
-        .messages(&thread, ..before_ts)
+        .messages(&thread, ..before_sts)
         .await
         .map_err(|e| format!("messages: {e}"))?
         .filter_map(|m| m.ok())
@@ -240,27 +246,33 @@ pub async fn thread_page(
         .map_err(|e| format!("encode thread: {e}"))
 }
 
-/// Download attachment `index` of the message at `ts` in `thread_id`.
+/// Download attachment `index` of the message with store-clock ts `sts`
+/// in `thread_id`.
 pub async fn fetch_attachment(
     manager: &mut StoredManager,
     thread_id: &str,
-    ts: u64,
+    sts: u64,
     index: usize,
 ) -> Result<String, String> {
     let thread = parse_thread(thread_id)?;
     let store = manager.store().clone();
     let mut msgs: Vec<Content> = store
-        .messages(&thread, ..)
+        .messages(&thread, ..=sts)
         .await
         .map_err(|e| format!("messages: {e}"))?
         .filter_map(|m| m.ok())
         .collect();
     msgs.sort_by_key(|m| m.metadata.server_timestamp);
-    let target = msgs.iter().find(|m| {
-        let t = m.metadata.server_timestamp.timestamp_millis().max(0) as u64;
-        t == ts
-    });
-    let content = target.ok_or_else(|| "message not found".to_string())?;
+    // The store range is over the client (store-clock) timestamp; match the
+    // newest row at or below the requested mark.
+    let content = msgs
+        .iter()
+        .rev()
+        .find(|m| {
+            let t = m.metadata.client_timestamp.timestamp_millis().max(0) as u64;
+            t <= sts
+        })
+        .ok_or_else(|| "message not found".to_string())?;
     let pointers: Vec<AttachmentPointer> = match &content.body {
         ContentBody::DataMessage(m) => m.attachments.clone(),
         ContentBody::SynchronizeMessage(s) => match &s.content {
@@ -274,7 +286,7 @@ pub async fn fetch_attachment(
         _ => Vec::new(),
     };
     let ptr = pointers.get(index).ok_or_else(|| "no such attachment".to_string())?;
-    download_attachment(manager, ptr, thread_id, ts, index)
+    download_attachment(manager, ptr, thread_id, sts, index)
         .await?
         .ok_or_else(|| "attachment too large to auto-fetch".to_string())
 }

@@ -33,6 +33,7 @@ public struct PluginCommand: Sendable {
 /// run anywhere; the host wires these to the live controller.
 public struct PluginContext: Sendable {
     public var conversations: @Sendable () async -> [Conversation]
+    public var selectedThread: @Sendable () async -> String?
     public var recentMessages: @Sendable (String, Int) async -> [ChatMessage]
     public var diagnostics: @Sendable () async -> String
     public var account: @Sendable () async -> String
@@ -41,6 +42,7 @@ public struct PluginContext: Sendable {
 
     public init(
         conversations: @Sendable @escaping () async -> [Conversation],
+        selectedThread: @Sendable @escaping () async -> String?,
         recentMessages: @Sendable @escaping (String, Int) async -> [ChatMessage],
         diagnostics: @Sendable @escaping () async -> String,
         account: @Sendable @escaping () async -> String,
@@ -48,6 +50,7 @@ public struct PluginContext: Sendable {
         requestSync: @Sendable @escaping () async -> Bool
     ) {
         self.conversations = conversations
+        self.selectedThread = selectedThread
         self.recentMessages = recentMessages
         self.diagnostics = diagnostics
         self.account = account

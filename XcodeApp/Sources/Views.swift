@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import AVKit
 import CoreImage.CIFilterBuiltins
 import CuztomSignalCore
 
@@ -76,7 +77,9 @@ struct SidebarView: View {
                 } icon: {
                     Image(systemName: conv.peer.isGroup ? "person.3.fill" : "person.circle.fill")
                 }
-                .tag(conv.id)
+                // Tag type must match the Optional selection or taps silently
+                // do nothing (this once pinned sends to the first thread).
+                .tag(conv.id as String?)
                 .badge(conv.unreadCount > 0 ? conv.unreadCount : 0)
             }
         }
@@ -99,21 +102,37 @@ struct MessageListView: View {
     @State private var loadingMore = false
 
     var body: some View {
+        @Bindable var vm = vm
         VStack(spacing: 0) {
             if !vm.isLinked {
                 LinkDeviceView()
             } else {
+                // Send-target header: always shows exactly where Send goes.
+                if let id = vm.selectedId {
+                    let title = vm.conversations.first(where: { $0.id == id })?.title ?? id
+                    Text("To: \(title)")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12).padding(.vertical, 4)
+                        .background(Color.gray.opacity(0.08))
+                }
                 if vm.selectedId != nil {
-                    Button(loadingMore ? "Loading…" : "Load older messages") {
-                        loadingMore = true
-                        Task {
-                            await vm.loadMore()
-                            loadingMore = false
+                    if vm.historyExhausted {
+                        Text("No older messages — history starts when this device was linked.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .padding(.top, 8)
+                    } else {
+                        Button(loadingMore ? "Loading…" : "Load older messages") {
+                            loadingMore = true
+                            Task {
+                                await vm.loadMore()
+                                loadingMore = false
+                            }
                         }
+                        .font(.caption)
+                        .padding(.top, 8)
+                        .disabled(loadingMore)
                     }
-                    .font(.caption)
-                    .padding(.top, 8)
-                    .disabled(loadingMore)
                 }
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
@@ -134,6 +153,9 @@ struct MessageListView: View {
                 }
                 .padding()
             }
+        }
+        .sheet(item: $vm.preview) { item in
+            AttachmentPreview(item: item)
         }
     }
 
@@ -183,6 +205,19 @@ struct AttachmentRow: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(maxHeight: 240)
                     .cornerRadius(6)
+                    .onTapGesture {
+                        vm.preview = PreviewItem(url: url, mime: att.mimeType, filename: att.filename)
+                    }
+            } else if att.mimeType.hasPrefix("video/"), let url = att.localURL {
+                VStack(alignment: .leading, spacing: 4) {
+                    VideoPlayer(player: AVPlayer(url: url))
+                        .frame(height: 240)
+                        .cornerRadius(6)
+                    Button("Expand") {
+                        vm.preview = PreviewItem(url: url, mime: att.mimeType, filename: att.filename)
+                    }
+                    .font(.caption)
+                }
             } else {
                 HStack(spacing: 8) {
                     Image(systemName: icon)
@@ -221,6 +256,39 @@ struct AttachmentRow: View {
         let f = ByteCountFormatter()
         f.countStyle = .file
         return f.string(fromByteCount: Int64(att.byteCount))
+    }
+}
+
+struct AttachmentPreview: View {
+    @Environment(\.dismiss) private var dismiss
+    var item: PreviewItem
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text(item.filename).font(.headline).lineLimit(1)
+            Group {
+                if item.mime.hasPrefix("image/"), let img = NSImage(contentsOf: item.url) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                } else if item.mime.hasPrefix("video/") {
+                    VideoPlayer(player: AVPlayer(url: item.url))
+                } else {
+                    Image(systemName: "doc").font(.system(size: 64))
+                    Text(item.mime).foregroundStyle(.secondary)
+                }
+            }
+            .frame(minWidth: 500, minHeight: 400)
+            HStack {
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([item.url])
+                }
+                Spacer()
+                Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding()
+        .frame(minWidth: 600, minHeight: 520)
     }
 }
 

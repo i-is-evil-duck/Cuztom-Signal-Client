@@ -17,6 +17,7 @@ public struct InfoPlugin: ChatPlugin {
             PluginCommand(name: "sync", description: "request contact sync from phone"),
             PluginCommand(name: "thread", description: "dump a thread", usage: "<conversation-id> [limit]"),
             PluginCommand(name: "log", description: "log file location"),
+            PluginCommand(name: "whereami", description: "open thread + last send target"),
         ]
     }
 
@@ -38,6 +39,11 @@ public struct InfoPlugin: ChatPlugin {
             return await dumpThread(args, ctx: ctx)
         case "log":
             return "log: \(Log.fileURL.path)"
+        case "whereami":
+            let open = await ctx.selectedThread() ?? "none"
+            let diag = await ctx.diagnostics()
+            let last = diag.split(separator: "\n").first(where: { $0.hasPrefix("last sent to:") }) ?? "last sent to: ?"
+            return "open thread: \(open)\n\(last)"
         default:
             return nil
         }

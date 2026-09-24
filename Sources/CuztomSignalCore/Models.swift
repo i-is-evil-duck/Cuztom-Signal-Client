@@ -50,6 +50,9 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
     public var status: MessageStatus
     public var sentAt: Date
     public var attachments: [AttachmentMeta]
+    /// Store-clock timestamp (SQLite `ts` column basis) for paging/lookup.
+    /// Nil for mock/local messages, which page trivially.
+    public var storeTs: Int64?
 
     public init(
         id: UUID = UUID(),
@@ -59,7 +62,8 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
         direction: MessageDirection,
         status: MessageStatus = .queued,
         sentAt: Date = Date(),
-        attachments: [AttachmentMeta] = []
+        attachments: [AttachmentMeta] = [],
+        storeTs: Int64? = nil
     ) {
         self.id = id
         self.conversationId = conversationId
@@ -69,6 +73,7 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
         self.status = status
         self.sentAt = sentAt
         self.attachments = attachments
+        self.storeTs = storeTs
     }
 }
 

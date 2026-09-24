@@ -26,11 +26,12 @@ public struct RosterPayload: Decodable, Sendable {
         public var senderName: String
         public var body: String
         public var ts: Int64
+        public var sts: Int64
         public var outgoing: Bool
         public var attachments: [WireAttachment]
 
         private enum CodingKeys: String, CodingKey {
-            case key, thread, sender, body, ts, outgoing, attachments
+            case key, thread, sender, body, ts, sts, outgoing, attachments
             case senderName = "sender_name"
         }
 
@@ -44,6 +45,7 @@ public struct RosterPayload: Decodable, Sendable {
             self.senderName = senderName
             self.body = body
             self.ts = ts
+            self.sts = ts
             self.outgoing = outgoing
             self.attachments = attachments
         }
@@ -56,6 +58,8 @@ public struct RosterPayload: Decodable, Sendable {
             senderName = try c.decode(String.self, forKey: .senderName)
             body = try c.decode(String.self, forKey: .body)
             ts = try c.decode(Int64.self, forKey: .ts)
+            // Older snapshots predate sts; fall back to display ts.
+            sts = try c.decodeIfPresent(Int64.self, forKey: .sts) ?? ts
             outgoing = try c.decode(Bool.self, forKey: .outgoing)
             attachments = try c.decodeIfPresent([WireAttachment].self, forKey: .attachments) ?? []
         }
@@ -222,14 +226,22 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     public func fetchMessages(conversationId: String, limit: Int) async throws -> [ChatMessage] {
         guard linked || isLinkedNow() else { throw SignalError.notLinked }
         // Merge the seed roster with older pages until `limit` is satisfied.
-        // History only goes back to link time — Signal never syncs older
+        // `sts` (store clock) is the ONLY correct paging basis — the SQLite
+        // range runs over the client timestamp, not the server one.
+        // History only goes back to link time: Signal never syncs older
         // messages to a new linked device (protocol limitation, not a bug).
         var cached = threadCache(conversationId)
         if cached.count < limit {
-            let before: UInt64 = cached.first.map { UInt64(bitPattern: $0.ts) } ?? UInt64.max
-            if let page = try? await threadPage(conversationId, limit: limit, before: before) {
+            let oldest = cached.map(\.sts).min() ?? Int64.max
+            let before: UInt64 = oldest <= 0 ? 0 : UInt64(bitPattern: oldest)
+            do {
+                let page = try await threadPage(conversationId, limit: limit, before: before)
+                Log.info("thread page \(conversationId): \(page.count) rows before \(before)")
                 for m in page { messageCache[m.key] = m }
                 cached = threadCache(conversationId)
+            } catch {
+                Log.error("thread page failed: \(error)")
+                throw error
             }
         }
         return Array(cached.suffix(limit)).map { chatMessage($0) }
@@ -258,6 +270,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     /// On-demand attachment download for roster-seeded (metadata-only) rows.
+    /// `ts` is the store-clock timestamp (see `ChatMessage.storeTs`).
     public func fetchAttachment(thread: String, ts: Int64, index: Int) async throws -> URL {
         let sym = try await initCore()
         var ptr: UnsafeMutablePointer<CChar>? = nil
@@ -461,7 +474,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             direction: m.outgoing ? .outgoing : .incoming,
             status: m.outgoing ? .sent : .delivered,
             sentAt: Date(timeIntervalSince1970: Double(m.ts) / 1000),
-            attachments: metas
+            attachments: metas,
+            storeTs: m.sts
         )
     }
 

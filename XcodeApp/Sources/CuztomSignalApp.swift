@@ -1,8 +1,10 @@
 import SwiftUI
+import AppKit
 import CuztomSignalCore
 
 @main
 struct CuztomSignalApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @State private var viewModel = ChatViewModel()
 
     var body: some Scene {
@@ -18,6 +20,28 @@ struct CuztomSignalApp: App {
                 .environment(viewModel)
         }
     }
+}
+
+/// Reopen the main window when the dock icon is clicked after closing it.
+/// Without this the app sits running with no windows until force-quit.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            NSApp.activate(ignoringOtherApps: true)
+            if let window = sender.windows.first(where: { $0.canBecomeMain }) {
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+        return true
+    }
+}
+
+/// Expanded attachment viewer item (image / playable video / file info).
+struct PreviewItem: Identifiable, Equatable {
+    let id = UUID()
+    var url: URL
+    var mime: String
+    var filename: String
 }
 
 enum LinkPhase: Equatable {
@@ -47,6 +71,8 @@ final class ChatViewModel {
     var syncNote = "none"
     var accountLine = "—"
     var diagnosticsText = ""
+    var historyExhausted = false
+    var preview: PreviewItem?
 
     func start() async {
         phase = .starting
@@ -85,6 +111,7 @@ final class ChatViewModel {
     }
 
     func select(_ id: String) async {
+        historyExhausted = false
         await controller?.select(id)
         sync()
     }
@@ -101,7 +128,10 @@ final class ChatViewModel {
     }
 
     func loadMore() async {
-        await controller?.loadMore()
+        guard let controller else { return }
+        historyExhausted = false
+        let grew = await controller.loadMore()
+        if !grew { historyExhausted = true }
         sync()
     }
 
@@ -118,6 +148,7 @@ final class ChatViewModel {
         let live = liveService
         return PluginContext(
             conversations: { await c?.conversations ?? [] },
+            selectedThread: { await c?.selectedId },
             recentMessages: { id, n in await c?.messages(in: id, limit: n) ?? [] },
             diagnostics: { await c?.diagnostics() ?? "not started" },
             account: {

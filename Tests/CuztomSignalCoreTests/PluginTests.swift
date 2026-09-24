@@ -12,6 +12,7 @@ private func testCtx(
 ) -> PluginContext {
     PluginContext(
         conversations: { convs },
+        selectedThread: { "c1" },
         recentMessages: { _, _ in msgs },
         diagnostics: { diag },
         account: { account },
@@ -68,6 +69,16 @@ private func testCtx(
     #expect(text.contains("/thread"))
 }
 
+@Test func whereamiShowsOpenThread() async {
+    let host = await PluginHost(plugins: [InfoPlugin()])
+    let result = await host.handleInput("/whereami", ctx: testCtx(diag: "last sent to: contact:x"))
+    guard case .reply(let text) = result else {
+        Issue.record("expected reply for /whereami"); return
+    }
+    #expect(text.contains("open thread: c1"))
+    #expect(text.contains("last sent to: contact:x"))
+}
+
 @Test func threadCommandDumpsMessages() async {
     let host = await PluginHost(plugins: [InfoPlugin()])
     let msg = ChatMessage(conversationId: "c1", author: SignalAddress(phone: "+1"),
@@ -94,6 +105,44 @@ private func testCtx(
     await controller.select("c1")
     let reloaded = await controller.messages
     #expect(reloaded.isEmpty)
+}
+
+@Test func sendOrCommandRoutesSlashToEphemeral() async {
+    let conv = Conversation(id: "c1", title: "Peer", peer: SignalAddress(phone: "+1"))
+    let svc = MockSignalService(seedConversations: [conv])
+    let controller = await ChatController(service: svc)
+    await controller.link()
+    await controller.select("c1")
+    let host = await PluginHost(plugins: [InfoPlugin()])
+    let ctx = PluginContext(
+        conversations: { await controller.conversations },
+        selectedThread: { await controller.selectedId },
+        recentMessages: { id, n in await controller.messages(in: id, limit: n) },
+        diagnostics: { "d" },
+        account: { "a" },
+        rosterSummary: { "r" },
+        requestSync: { true }
+    )
+    await controller.sendOrCommand("/info", plugins: host, ctx: ctx)
+    let shown = await controller.messages
+    #expect(shown.count == 1)
+    #expect(shown[0].body.contains("CuztomSignal"))
+    // Plain text still sends through the service (ephemeral replays drop on
+    // the store reload, by design — they are never persisted).
+    await controller.sendOrCommand("hello", plugins: host, ctx: ctx)
+    let after = await controller.messages
+    #expect(after.count == 1)
+    #expect(after.last?.direction == .outgoing)
+}
+
+@Test func loadMoreWithMockReportsExhausted() async {
+    let conv = Conversation(id: "c1", title: "Peer", peer: SignalAddress(phone: "+1"))
+    let svc = MockSignalService(seedConversations: [conv])
+    let controller = await ChatController(service: svc)
+    await controller.link()
+    await controller.select("c1")
+    // Mock seed never grows: loadMore finds nothing new.
+    #expect(!(await controller.loadMore(chunk: 10)))
 }
 
 @Test func pluginRegisterReplacesSameId() async {
