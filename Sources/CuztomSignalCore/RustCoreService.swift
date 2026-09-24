@@ -657,7 +657,17 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             case "message":
                 if let msg = event.message {
                     messageCache[msg.key] = msg
-                    incomingContinuation.yield(chatMessage(msg))
+                    let cm = chatMessage(msg)
+                    // Persist any attachment paths that came from the live download
+                    // so they survive across restarts and render immediately.
+                    for (idx, att) in msg.attachments.enumerated() {
+                        if let path = att.path, !path.isEmpty {
+                            let cacheKey = "\(msg.key)/\(idx)"
+                            rememberPath(key: cacheKey, path: path)
+                            localPaths["\(msg.thread)/\(msg.ts)"] = path
+                        }
+                    }
+                    incomingContinuation.yield(cm)
                 }
             case "reaction":
                 if let thread = event.thread, let sts = event.targetSts,

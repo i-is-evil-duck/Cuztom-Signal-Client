@@ -245,6 +245,7 @@ public final class ChatController: @unchecked Sendable {
             lastSentThread = id
             await store.saveMessage(msg)
             messages = await store.messages(in: id)
+            conversations = await store.allConversations()
             Log.info("sent attachment \(sent.name) to \(id)")
             return true
         } catch {
@@ -278,6 +279,7 @@ public final class ChatController: @unchecked Sendable {
             lastSentThread = id
             await store.saveMessage(msg)
             messages = await store.messages(in: id)
+            conversations = await store.allConversations()
             Log.info("sent reply to \(id)")
         } catch {
             lastError = String(describing: error)
@@ -425,6 +427,7 @@ public final class ChatController: @unchecked Sendable {
             lastSentThread = id
             await store.saveMessage(msg)
             messages = await store.messages(in: id)
+            conversations = await store.allConversations()
             Log.info("sent \(trimmed.count) chars to \(id)")
         } catch {
             lastError = String(describing: error)
