@@ -66,10 +66,14 @@ enum Command {
         body: String,
         reply: oneshot::Sender<Result<u64, String>>,
     },
+    Logout {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Control plane into the running sync loop (which owns `&mut Manager`).
 enum LoopCtrl {
+    Shutdown,
     RequestContacts {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
@@ -204,6 +208,10 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                         }
                         Command::Send { thread, body, reply } => {
                             let result = cmd_send(&mut state, &thread, &body).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::Logout { reply } => {
+                            let result = cmd_logout(&mut state).await;
                             let _ = reply.send(result);
                         }
                     }
@@ -397,6 +405,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                         tokio::select! {
                             biased;
                             ctrl = ctrl_rx.recv() => match ctrl {
+                                Some(LoopCtrl::Shutdown) => break,
                                 Some(LoopCtrl::RequestContacts { reply }) => {
                                     let r = manager.request_contacts().await
                                         .map_err(|e| format!("request contacts: {e}"));
@@ -440,8 +449,35 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
     Ok(())
 }
 
-async fn cmd_send(state: &mut WorkerState, thread: &str, body: &str) -> Result<u64, String> {
-    // Auto-start the loop: sends are routed through it.
+/// Log out: stop the sync loop, wipe registration/keys, return to Ready
+/// (fresh QR on next `begin_link`). Messages/contacts/groups stay on disk.
+async fn cmd_logout(state: &mut WorkerState) -> Result<(), String> {
+    let db_path = match state {
+        WorkerState::Linked(linked) => {
+            if let Some(ctrl) = linked.ctrl.take() {
+                let _ = ctrl.send(LoopCtrl::Shutdown);
+            }
+            linked.manager.take();
+            linked.events.take();
+            linked.db_path.clone()
+        }
+        _ => return Err("not linked".to_string()),
+    };
+    let mut store = SqliteStore::open(&db_path, OnNewIdentity::Trust)
+        .await
+        .map_err(|e| format!("open store: {e}"))?;
+    {
+        use presage::store::Store;
+        store
+            .clear_registration()
+            .await
+            .map_err(|e| format!("clear: {e}"))?;
+    }
+    *state = WorkerState::Ready { store, db_path };
+    Ok(())
+}
+
+async fn cmd_send(state: &mut WorkerState, thread: &str, body: &str) -> Result<u64, String> {    // Auto-start the loop: sends are routed through it.
     cmd_start_sync(state).await?;
     match state {
         WorkerState::Linked(linked) => {
@@ -620,8 +656,7 @@ pub extern "C" fn core_cmd_roster() -> *mut c_char {
 /// Send a text to "contact:<uuid>" / "group:<hex>". Returns sent timestamp
 /// (ms), or -1 on error (see `core_last_error`).
 #[no_mangle]
-pub extern "C" fn core_cmd_send(thread: *const c_char, body: *const c_char) -> i64 {
-    let (t, b) = match (c_str_arg(thread, "thread"), c_str_arg(body, "body")) {
+pub extern "C" fn core_cmd_send(thread: *const c_char, body: *const c_char) -> i64 {    let (t, b) = match (c_str_arg(thread, "thread"), c_str_arg(body, "body")) {
         (Ok(t), Ok(b)) if !b.is_empty() => (t, b),
         _ => {
             set_last_error("thread/body: null, invalid, or empty body".to_string());
@@ -630,6 +665,18 @@ pub extern "C" fn core_cmd_send(thread: *const c_char, body: *const c_char) -> i
     };
     match roundtrip(|reply| Command::Send { thread: t, body: b, reply }) {
         Ok(Ok(ts)) => ts as i64,
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
+/// Log out (wipe session, back to QR). 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_logout() -> i32 {
+    match roundtrip(|reply| Command::Logout { reply }) {
+        Ok(Ok(())) => 0,
         Ok(Err(e)) | Err(e) => {
             set_last_error(e);
             -1
@@ -701,6 +748,8 @@ mod tests {
         assert!(core_cmd_roster().is_null());
         assert!(core_cmd_whoami().is_null());
         assert!(!core_last_error().is_null());
+        // Logout with no session is an error, not a crash.
+        assert_eq!(core_cmd_logout(), -1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

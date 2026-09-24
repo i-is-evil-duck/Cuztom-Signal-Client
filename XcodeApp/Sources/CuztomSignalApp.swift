@@ -12,6 +12,11 @@ struct CuztomSignalApp: App {
                 .frame(minWidth: 900, minHeight: 600)
         }
         .windowStyle(.titleBar)
+
+        Settings {
+            SettingsView()
+                .environment(viewModel)
+        }
     }
 }
 
@@ -38,6 +43,10 @@ final class ChatViewModel {
     var isLinked = false
     var backendName = "…"
     var errorMessage: String?
+    var connectionText = "starting"
+    var syncNote = "none"
+    var accountLine = "—"
+    var diagnosticsText = ""
 
     func start() async {
         phase = .starting
@@ -54,6 +63,7 @@ final class ChatViewModel {
         backendName = "Live"
         let controller = ChatController(service: live)
         self.controller = controller
+        self.liveService = live
         guard await controller.begin() else {
             fail(controller)
             return
@@ -84,6 +94,39 @@ final class ChatViewModel {
         sync()
     }
 
+    func refreshNow() async {
+        await controller?.refreshNow()
+        sync()
+    }
+
+    /// Ask the phone to re-send contacts/groups, then refresh.
+    func requestSync() async {
+        guard let c = controller, let live = liveService else { return }
+        syncNote = "sync requested…"
+        do {
+            try await live.requestContactSync()
+            syncNote = "request sent, waiting for phone…"
+            Log.info("manual contact sync requested")
+        } catch {
+            syncNote = "request failed"
+            Log.error("manual sync failed: \(error)")
+        }
+        await c.refreshNow()
+        sync()
+    }
+
+    func logout() async {
+        guard let c = controller else { return }
+        _ = await c.logout()
+        liveService = nil
+        sync()
+        // Back to a fresh QR.
+        phase = .starting
+        await start()
+    }
+
+    private var liveService: RustCoreService?
+
     private func succeed(_ controller: ChatController) {
         sync()
         phase = .linked
@@ -105,5 +148,15 @@ final class ChatViewModel {
         messages = controller.messages
         linkQR = controller.linkQR
         isLinked = controller.isLinked
+        syncNote = controller.lastSyncNote ?? "none"
+        errorMessage = phase == .failed ? errorMessage : controller.lastError
+        Task {
+            connectionText = String(describing: controller.connection)
+            diagnosticsText = await controller.diagnostics()
+            if let live = liveService,
+               let me = try? await live.whoami() {
+                accountLine = "\(me.number) · \(String(me.aci.prefix(8)))"
+            }
+        }
     }
 }

@@ -52,8 +52,14 @@ has `InMemorySecretStore` (tests) and `KeychainSecretStore` (prod).
   `cargo test` incl. roster/whoami rejection on fresh stores
 - [x] UI phase gate (`starting → linking → linked | failed`): real QR from
   the `sgnl://` URL; failures show Retry + Continue-with-demo
-- [x] Release dylib (~13 MB) bundled next to the binary → Live backend
-- [ ] Manual: launch → contacts/groups appear → send/receive live (needs user)
+- [x] Settings pane (app menu → Settings…): session/account, Log out
+  (wipes keys, back to QR), Refresh now, Request contact sync, live
+  diagnostics + log path (`~/Library/Logs/CuztomSignal/app.log`)
+- [x] Resume linked sessions (`alreadyLinked` skips QR); demo removed —
+  Live backend or an honest error
+- [x] Release dylib (~18 MB) bundled next to the binary → Live backend
+- [ ] Debug: sidebar empty on a live session — diagnostics + manual sync
+  added to narrow it down (see Settings)
 
 ### M2 — Groups + attachments
 1. GroupsV2 (`zkgroup`) sync: member list, title/avatar, admin flags.

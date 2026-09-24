@@ -242,6 +242,47 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         return sym.isLinked() == 1
     }
 
+    /// Offline identity (aci + number) from the local store. No network.
+    public struct WhoAmI: Decodable, Sendable {
+        public var aci: String
+        public var number: String
+    }
+
+    public func whoami() async throws -> WhoAmI {
+        let sym = try await initCore()
+        guard let ptr = sym.whoami() else {
+            throw SignalError.network("whoami failed: \(lastError(sym))")
+        }
+        defer { sym.freeString(ptr) }
+        guard let data = String(cString: ptr).data(using: .utf8) else {
+            throw SignalError.storage("whoami is not UTF-8")
+        }
+        return try JSONDecoder().decode(WhoAmI.self, from: data)
+    }
+
+    /// Ask the phone to (re-)send the contact/group sync.
+    public func requestContactSync() async throws {
+        let sym = try await initCore()
+        guard sym.requestContacts() == 0 else {
+            throw SignalError.network("request sync failed: \(lastError(sym))")
+        }
+    }
+
+    /// Wipe the session (keys + registration). Next `beginLinking` shows a
+    /// fresh QR. Local history cache is dropped with it.
+    public func logout() async throws {
+        let sym = try await initCore()
+        guard sym.logout() == 0 else {
+            throw SignalError.network("logout failed: \(lastError(sym))")
+        }
+        pumpTask?.cancel()
+        pumpTask = nil
+        linked = false
+        messageCache = [:]
+        uuidCache = [:]
+        lastRosterSummary = "never"
+    }
+
     // MARK: - private FFI
 
     private struct Symbols {
@@ -254,9 +295,18 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let requestContacts: @convention(c) () -> Int32
         let startSync: @convention(c) () -> Int32
         let pollEvent: @convention(c) () -> UnsafeMutablePointer<CChar>?
+        let whoami: @convention(c) () -> UnsafeMutablePointer<CChar>?
+        let logout: @convention(c) () -> Int32
         let lastError: @convention(c) () -> UnsafePointer<CChar>?
         let freeString: @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
     }
+
+    /// Non-message sync traffic ("queue_empty", "contacts_synced",
+    /// "sync_error:…"). Fires on an internal task — hop threads as needed.
+    public var onSyncEvent: ((String) -> Void)?
+
+    /// "12 contacts, 3 groups, 45 msgs @ 22:01" or "never".
+    public private(set) var lastRosterSummary = "never"
 
     /// Fetch + cache the roster snapshot; returns decoded conversations.
     @discardableResult
@@ -264,6 +314,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         for m in payload.messages {
             messageCache[m.key] = m
         }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "HH:mm:ss"
+        lastRosterSummary = "\(payload.contacts.count) contacts, \(payload.groups.count) groups, \(payload.messages.count) msgs @ \(fmt.string(from: Date()))"
         var byThread: [String: [RosterPayload.Message]] = [:]
         for m in messageCache.values {
             byThread[m.thread, default: []].append(m)
@@ -339,11 +392,13 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             defer { sym.freeString(ptr) }
             let text = String(cString: ptr)
             guard let data = text.data(using: .utf8),
-                  let event = try? JSONDecoder().decode(LiveEvent.self, from: data),
-                  event.type == "message",
-                  let msg = event.message else { continue }
-            messageCache[msg.key] = msg
-            incomingContinuation.yield(chatMessage(msg))
+                  let event = try? JSONDecoder().decode(LiveEvent.self, from: data) else { continue }
+            if event.type == "message", let msg = event.message {
+                messageCache[msg.key] = msg
+                incomingContinuation.yield(chatMessage(msg))
+            } else {
+                onSyncEvent?(event.type)
+            }
         }
     }
 
@@ -401,6 +456,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let q = dlsym(handle, "core_cmd_request_contacts"),
               let y = dlsym(handle, "core_cmd_start_sync"),
               let v = dlsym(handle, "core_cmd_poll_event"),
+              let w = dlsym(handle, "core_cmd_whoami"),
+              let o = dlsym(handle, "core_cmd_logout"),
               let e = dlsym(handle, "core_last_error"),
               let f = dlsym(handle, "core_free_string") else { return nil }
         return Symbols(
@@ -413,6 +470,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             requestContacts: unsafeBitCast(q, to: (@convention(c) () -> Int32).self),
             startSync: unsafeBitCast(y, to: (@convention(c) () -> Int32).self),
             pollEvent: unsafeBitCast(v, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
+            whoami: unsafeBitCast(w, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
+            logout: unsafeBitCast(o, to: (@convention(c) () -> Int32).self),
             lastError: unsafeBitCast(e, to: (@convention(c) () -> UnsafePointer<CChar>?).self),
             freeString: unsafeBitCast(f, to: (@convention(c) (UnsafeMutablePointer<CChar>?) -> Void).self)
         )

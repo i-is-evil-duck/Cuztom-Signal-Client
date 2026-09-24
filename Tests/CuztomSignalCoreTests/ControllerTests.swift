@@ -89,12 +89,28 @@ import Testing
     #expect(await controller.conversations.count == 1)
 }
 
-@Test func controllerBeginFailure() async {
+@Test func controllerLogoutResetsState() async throws {
+    let conv = Conversation(id: "c1", title: "Peer", peer: SignalAddress(phone: "+1"))
+    let svc = MockSignalService(seedConversations: [conv])
+    let controller = await ChatController(service: svc)
+    await controller.link(deviceName: "TestMac")
+    #expect(await controller.isLinked)
+    await controller.select("c1")
+    #expect(await controller.logout())
+    #expect(!(await controller.isLinked))
+    #expect(await controller.conversations.isEmpty)
+    #expect(await controller.selectedId == nil)
+    let diag = await controller.diagnostics()
+    #expect(diag.contains("mock"))
+    #expect(diag.contains("conversations: 0"))
+}
+
+@Test func controllerRefreshNowReportsFailure() async {
     struct Broken: SignalService, Sendable {
         var connectionState: AsyncStream<ConnectionState> { AsyncStream { _ in } }
         func beginLinking(deviceName: String) async throws -> LinkQR { throw SignalError.network("offline") }
         func waitForLink() async throws {}
-        func fetchConversations() async throws -> [Conversation] { [] }
+        func fetchConversations() async throws -> [Conversation] { throw SignalError.network("offline") }
         func fetchMessages(conversationId: String, limit: Int) async throws -> [ChatMessage] { [] }
         func sendText(_ body: String, to conversationId: String) async throws -> ChatMessage {
             throw SignalError.notLinked
@@ -102,11 +118,9 @@ import Testing
         func incomingMessages() -> AsyncStream<ChatMessage> { AsyncStream { _ in } }
     }
     let controller = await ChatController(service: Broken())
-    #expect(!(await controller.begin()))
+    #expect(!(await controller.refreshNow()))
     let err = await controller.lastError
     #expect(err != nil)
-    let conn = await controller.connection
-    #expect(conn == .offline)
 }
 
 @Test func rustCoreWithoutLibraryThrowsUnsupported() async {
