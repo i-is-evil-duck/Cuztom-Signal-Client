@@ -14,13 +14,14 @@ Stack: **SwiftUI (Swift 6) + Rust core (`presage` + `libsignal`) + RingRTC (call
 ## Code flow
 
 ```
-SwiftUI Views (Sources/CuztomSignalAppUI)
-  -> ChatViewModel (@Observable, @MainActor)
-    -> SignalService protocol (Sources/CuztomSignalCore/SignalService.swift)
-      -> M0: MockSignalService (in-memory, deterministic)
-      -> M1+: RustCoreService (FFI -> rust-core/ presage Manager)
-                -> libsignal (crypto) + chat.signal.org (websocket)
-                -> MessageStore (actor) + SecretStore (Keychain)
+SwiftUI Views (XcodeApp/Sources, full Xcode only)
+  -> ChatViewModel (thin @Observable wrapper)
+    -> ChatController (Sources/CuztomSignalCore, UI-agnostic, unit-tested)
+      -> SignalService protocol (Sources/CuztomSignalCore/SignalService.swift)
+        -> M0: MockSignalService (in-memory, deterministic)
+        -> M1+: RustCoreService (dlopen -> rust-core/ presage Manager)
+                  -> libsignal (crypto) + chat.signal.org (websocket)
+                  -> MessageStore (actor, idempotent save) + SecretStore (Keychain)
 ```
 
 Boundaries are protocol-shaped so M1 swaps the backend without touching UI:
@@ -29,11 +30,12 @@ has `InMemorySecretStore` (tests) and `KeychainSecretStore` (prod).
 
 ## Step-by-step plan
 
-### M0 — Scaffold + mock chat (DONE, this commit)
-- [x] SwiftPM layout: `CuztomSignalCore` (models/store/service/mock/keychain) + `CuztomSignalAppUI` (split view)
-- [x] `MessageStore` actor, `MockSignalService`, `InMemorySecretStore`
-- [x] 7 unit tests (`swift test`)
-- [x] `rust-core/` stub documenting the presage FFI surface
+### M0 — Scaffold + mock chat (DONE)
+- [x] SwiftPM `CuztomSignalCore` (models/store/service/mock/keychain) + `XcodeApp` SwiftUI split view
+- [x] `ChatController` (UI-agnostic coordinator: link -> sync -> select -> send -> receive)
+- [x] `RustCoreService` seam (dlopen FFI, fails loudly until Manager lands)
+- [x] `MessageStore` extras (idempotent save, search, delete, totals)
+- [x] 12 unit tests (`swift test`), Rust 1.98 toolchain installed
 - Verify: `swift build`, `swift test`
 
 ### M1 — Link + 1:1 text (next)
@@ -68,12 +70,14 @@ Notarized DMG, Sparkle updater, crash reports, menu-bar badge, notifications, la
 
 | Layer | Where | Run |
 |---|---|---|
-| Core unit (models, store, mock link/send, secrets) | `Tests/CuztomSignalCoreTests` | `swift test` |
-| UI smoke (link -> select thread -> send) | `CuztomSignalAppUI` previews + manual | open in Xcode, run |
+| Core unit (models, store, controller flow, mock link/send, secrets, rust seam) | `Tests/CuztomSignalCoreTests` | `swift test` |
+| UI smoke (link -> select thread -> send) | `XcodeApp` previews + manual | open in Xcode, run |
 | Rust core (M1+: link, sync, round-trip) | `rust-core/` | `cargo test` (needs rustup) |
 | Integration (M1+: two test devices) | manual + `presage-cli` | `cargo run -p presage-cli -- link-device`, `receive` |
 
-Current status: `swift test` passes 7/7 on CLT (no Xcode, no Rust required for M0).
+Current status: `swift test` passes 12/12 on CLT (no Xcode required for Core).
+Rust 1.98 via rustup; `cargo fetch` validating `presage` git deps. Xcode
+still downloading — `XcodeApp/` compiles only under full Xcode (SwiftUI macros).
 
 ## Commands
 
@@ -93,11 +97,12 @@ swift test
 
 ```
 Package.swift                    SwiftPM (Core + Tests; builds on CLT)
-Sources/CuztomSignalCore/        Models, SignalService protocol, MessageStore actor,
-                                 SecretStore (memory + Keychain), MockSignalService
-XcodeApp/Sources/                @main App, ChatViewModel, split-view UI (full Xcode only;
-                                 SwiftUI macros don't load under CLT — see below)
-Tests/CuztomSignalCoreTests/     7 tests (swift-testing)
+Sources/CuztomSignalCore/        Models, SignalService protocol, ChatController,
+                                 MessageStore actor, SecretStore (memory + Keychain),
+                                 MockSignalService, RustCoreService (dlopen seam)
+XcodeApp/Sources/                @main App, ChatViewModel (thin wrapper), split-view UI
+                                 (full Xcode only; SwiftUI macros don't load under CLT)
+Tests/CuztomSignalCoreTests/     12 tests (swift-testing): CoreTests + ControllerTests
 rust-core/                       Cargo crate stub -> presage Manager + C ABI (M1)
 ```
 

@@ -15,54 +15,49 @@ struct CuztomSignalApp: App {
     }
 }
 
+/// Thin @Observable wrapper over `ChatController` (which owns all logic and
+/// is unit-tested under CLT). Property names are the exact surface
+/// `Views.swift` binds to; M1 swaps the injected service to `RustCoreService`.
 @Observable
 @MainActor
 final class ChatViewModel {
-    var store = MessageStore()
-    var service: (any SignalService)?
+    private var controller: ChatController?
+
     var conversations: [Conversation] = []
     var selectedId: String?
     var messages: [ChatMessage] = []
     var linkQR: LinkQR?
     var isLinked = false
 
-    init(service: (any SignalService)? = nil) {
-        self.service = service
-    }
-
     func startLinking(deviceName: String = "CuztomMac") async {
-        let svc = MockSignalService(seedConversations: Self.previewData().0,
-                                    seedMessages: Self.previewData().1)
-        self.service = svc
-        do {
-            linkQR = try await svc.beginLinking(deviceName: deviceName)
-            try await svc.waitForLink()
-            isLinked = true
-            conversations = try await svc.fetchConversations()
-            for c in conversations { await store.upsertConversation(c) }
-        } catch {
-            print("link failed: \(error)")
+        let (convs, msgs) = Self.previewData()
+        let svc = MockSignalService(seedConversations: convs, seedMessages: msgs)
+        let controller = ChatController(service: svc)
+        self.controller = controller
+        await controller.link(deviceName: deviceName)
+        sync()
+        if let first = conversations.first {
+            await select(first.id)
         }
     }
 
     func select(_ id: String) async {
-        selectedId = id
-        await store.markRead(conversationId: id)
-        messages = await store.messages(in: id)
-        if let idx = conversations.firstIndex(where: { $0.id == id }) {
-            conversations[idx].unreadCount = 0
-        }
+        await controller?.select(id)
+        sync()
     }
 
     func send(_ body: String) async {
-        guard let id = selectedId, let svc = service else { return }
-        do {
-            let msg = try await svc.sendText(body, to: id)
-            await store.saveMessage(msg)
-            messages = await store.messages(in: id)
-        } catch {
-            print("send failed: \(error)")
-        }
+        await controller?.send(body)
+        sync()
+    }
+
+    private func sync() {
+        guard let controller else { return }
+        conversations = controller.conversations
+        selectedId = controller.selectedId
+        messages = controller.messages
+        linkQR = controller.linkQR
+        isLinked = controller.isLinked
     }
 
     static func previewData() -> ([Conversation], [String: [ChatMessage]]) {

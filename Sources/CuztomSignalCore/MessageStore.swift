@@ -25,7 +25,12 @@ public actor MessageStore {
     }
 
     public func saveMessage(_ message: ChatMessage) {
-        messages[message.conversationId, default: []].append(message)
+        // Idempotent: re-syncing a thread replaces existing rows by id.
+        if let idx = messages[message.conversationId]?.firstIndex(where: { $0.id == message.id }) {
+            messages[message.conversationId]?[idx] = message
+        } else {
+            messages[message.conversationId, default: []].append(message)
+        }
         if var conv = conversations[message.conversationId] {
             conv.lastMessagePreview = String(message.body.prefix(120))
             conv.lastActiveAt = max(conv.lastActiveAt, message.sentAt)
@@ -50,5 +55,30 @@ public actor MessageStore {
 
     public func messageCount(in conversationId: String) -> Int {
         messages[conversationId]?.count ?? 0
+    }
+
+    public func totalMessageCount() -> Int {
+        messages.values.reduce(0) { $0 + $1.count }
+    }
+
+    public func searchConversations(query: String) -> [Conversation] {
+        let q = query.lowercased()
+        guard !q.isEmpty else { return allConversationsSync() }
+        return conversations.values
+            .filter {
+                $0.title.lowercased().contains(q)
+                    || ($0.peer.phone?.lowercased().contains(q) ?? false)
+                    || ($0.peer.groupId?.lowercased().contains(q) ?? false)
+            }
+            .sorted { $0.lastActiveAt > $1.lastActiveAt }
+    }
+
+    public func deleteConversation(id: String) {
+        conversations.removeValue(forKey: id)
+        messages.removeValue(forKey: id)
+    }
+
+    private func allConversationsSync() -> [Conversation] {
+        conversations.values.sorted { $0.lastActiveAt > $1.lastActiveAt }
     }
 }
