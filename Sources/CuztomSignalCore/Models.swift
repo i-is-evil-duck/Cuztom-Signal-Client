@@ -113,3 +113,95 @@ public struct Conversation: Identifiable, Sendable, Codable {
         self.unreadCount = unreadCount
     }
 }
+
+// MARK: - Call Models (M4)
+
+/// Media type for a call
+public enum CallMediaType: String, Sendable, Codable {
+    case voice
+    case video
+}
+
+/// Direction of a call
+public enum CallDirection: String, Sendable, Codable {
+    case incoming
+    case outgoing
+}
+
+/// Current state of a call
+public enum CallState: String, Sendable, Codable {
+    case idle
+    case dialing      // Outgoing: connecting
+    case ringing      // Incoming: phone ringing
+    case connecting   // Both: WebRTC connecting (ICE/DTLS)
+    case active       // Connected, media flowing
+    case ending       // Locally initiated hangup
+    case ended        // Call finished
+}
+
+/// Reason a call ended
+public enum CallEndReason: String, Sendable, Codable {
+    case localHangup
+    case remoteHangup
+    case missed
+    case failed
+    case declined
+    case timeout
+    case noAnswer
+}
+
+/// Call metadata for UI and history
+public struct CallRecord: Identifiable, Sendable, Codable {
+    public var id: UUID
+    public var conversationId: String
+    public var direction: CallDirection
+    public var mediaType: CallMediaType
+    public var state: CallState
+    public var startTime: Date?
+    public var connectTime: Date?
+    public var endTime: Date?
+    public var endReason: CallEndReason?
+    public var remotePeer: SignalAddress
+
+    public init(
+        id: UUID = UUID(),
+        conversationId: String,
+        direction: CallDirection,
+        mediaType: CallMediaType,
+        state: CallState = .idle,
+        startTime: Date? = nil,
+        connectTime: Date? = nil,
+        endTime: Date? = nil,
+        endReason: CallEndReason? = nil,
+        remotePeer: SignalAddress
+    ) {
+        self.id = id
+        self.conversationId = conversationId
+        self.direction = direction
+        self.mediaType = mediaType
+        self.state = state
+        self.startTime = startTime
+        self.connectTime = connectTime
+        self.endTime = endTime
+        self.endReason = endReason
+        self.remotePeer = remotePeer
+    }
+
+    public var duration: TimeInterval? {
+        guard let start = connectTime, let end = endTime else { return nil }
+        return end.timeIntervalSince(start)
+    }
+}
+
+/// Active call session (for in-progress calls)
+public struct ActiveCall: Sendable {
+    public var callRecord: CallRecord
+    public var localVideoEnabled: Bool = true
+    public var remoteVideoEnabled: Bool = false
+    public var muted: Bool = false
+    public var speakerOn: Bool = false
+
+    public init(callRecord: CallRecord) {
+        self.callRecord = callRecord
+    }
+}

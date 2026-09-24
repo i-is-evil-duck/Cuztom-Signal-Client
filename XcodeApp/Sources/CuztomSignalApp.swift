@@ -85,6 +85,7 @@ enum LinkPhase: Equatable {
 @MainActor
 final class ChatViewModel {
     private var controller: ChatController?
+    private let callController = CallController.shared
 
     var phase = LinkPhase.starting
     var conversations: [Conversation] = []
@@ -109,6 +110,10 @@ final class ChatViewModel {
     var pendingFiles: [URL] = []
     /// Last failed-action message (send/attachment/react/delete).
     var sendError: String?
+
+    // Call state
+    var incomingCall: ActiveCall?
+    var activeCall: ActiveCall?
 
     func start() async {
         phase = .starting
@@ -147,6 +152,8 @@ final class ChatViewModel {
             fail(controller)
             return
         }
+        // Configure call controller with signal transport
+        callController.configure(with: live, transport: live)
         succeed(controller)
     }
 
@@ -207,6 +214,74 @@ final class ChatViewModel {
         await controller?.deleteMessage(id: message.id, forEveryone: forEveryone)
         sendError = controller?.lastError
         sync()
+    }
+
+    // MARK: - Calls (M4)
+
+    /// Start an outgoing voice call
+    func startVoiceCall() async {
+        guard let id = selectedId,
+              let conv = conversations.first(where: { $0.id == id }),
+              !conv.peer.isGroup else { return }
+        do {
+            let call = try await callController.startCall(to: id, mediaType: .voice, peer: conv.peer)
+            activeCall = call
+        } catch {
+            sendError = "Call failed: \(error.localizedDescription)"
+            sync()
+        }
+    }
+
+    /// Start an outgoing video call
+    func startVideoCall() async {
+        guard let id = selectedId,
+              let conv = conversations.first(where: { $0.id == id }),
+              !conv.peer.isGroup else { return }
+        do {
+            let call = try await callController.startCall(to: id, mediaType: .video, peer: conv.peer)
+            activeCall = call
+        } catch {
+            sendError = "Call failed: \(error.localizedDescription)"
+            sync()
+        }
+    }
+
+    /// Answer incoming call
+    func answerCall() async {
+        guard let call = incomingCall else { return }
+        do {
+            try await callController.answerCall(call)
+            activeCall = call
+            incomingCall = nil
+        } catch {
+            sendError = "Answer failed: \(error.localizedDescription)"
+            sync()
+        }
+    }
+
+    /// Decline incoming call
+    func declineCall() async {
+        guard let call = incomingCall else { return }
+        do {
+            try await callController.declineCall(call)
+            incomingCall = nil
+        } catch {
+            sendError = "Decline failed: \(error.localizedDescription)"
+            sync()
+        }
+    }
+
+    /// End active call
+    func endCall() async {
+        guard let call = activeCall ?? incomingCall else { return }
+        do {
+            try await callController.endCall(call)
+            activeCall = nil
+            incomingCall = nil
+        } catch {
+            sendError = "End call failed: \(error.localizedDescription)"
+            sync()
+        }
     }
 
     func sendAttachment(url: URL, caption: String) async {

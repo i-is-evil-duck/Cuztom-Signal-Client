@@ -17,7 +17,27 @@ struct ContentView: View {
                 NavigationSplitView {
                     SidebarView()
                 } detail: {
-                    MessageListView()
+                    ZStack {
+                        MessageListView()
+                        // Incoming call overlay
+                        if let call = vm.incomingCall {
+                            IncomingCallView(
+                                call: call,
+                                onAnswer: { Task { await vm.answerCall() } },
+                                onDecline: { Task { await vm.declineCall() } }
+                            )
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                            .zIndex(100)
+                        }
+                        // Active call overlay
+                        if let call = vm.activeCall {
+                            ActiveCallView(call: call)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                                .zIndex(99)
+                        }
+                    }
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: vm.incomingCall != nil)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: vm.activeCall != nil)
                 }
             default:
                 StatusView()
@@ -118,28 +138,31 @@ struct MessageListView: View {
                 // Send-target header: always shows exactly where Send goes.
                 if let id = vm.selectedId {
                     let title = vm.conversations.first(where: { $0.id == id })?.title ?? id
+                    let isGroup = vm.conversations.first(where: { $0.id == id })?.peer.isGroup ?? false
                     HStack {
                         Text("To: \(title)")
                             .font(.caption).foregroundStyle(.secondary)
                         Spacer()
-                        Button { vm.showCallsSoon = true } label: {
-                            Image(systemName: "phone")
+                        if !isGroup {
+                            // Voice call button
+                            Button { Task { await vm.startVoiceCall() } } label: {
+                                Image(systemName: "phone.fill")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Voice call")
+                            .disabled(vm.activeCall != nil || vm.incomingCall != nil)
+
+                            // Video call button
+                            Button { Task { await vm.startVideoCall() } } label: {
+                                Image(systemName: "video.fill")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Video call")
+                            .disabled(vm.activeCall != nil || vm.incomingCall != nil)
                         }
-                        .buttonStyle(.plain)
-                        .help("Voice call (M4)")
-                        Button { vm.showCallsSoon = true } label: {
-                            Image(systemName: "video")
-                        }
-                        .buttonStyle(.plain)
-                        .help("Video call (M4)")
                     }
                     .padding(.horizontal, 12).padding(.vertical, 4)
                     .background(Color.gray.opacity(0.08))
-                    .alert("Calls aren't here yet", isPresented: $vm.showCallsSoon) {
-                        Button("OK", role: .cancel) {}
-                    } message: {
-                        Text("Voice/video calls land in M4 (RingRTC). Everything else in this build is live.")
-                    }
                 }
                 if vm.selectedId != nil {
                     if vm.historyExhausted {

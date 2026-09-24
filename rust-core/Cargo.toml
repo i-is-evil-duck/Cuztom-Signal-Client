@@ -2,7 +2,7 @@
 name = "cuztom-signal-core"
 version = "0.1.0"
 edition = "2021"
-description = "Rust service core for Cuztom Signal (presage + libsignal). M1: link + persistence."
+description = "Rust service core for Cuztom Signal (presage + libsignal + ringrtc). M1: link + persistence, M4: calls."
 
 [lib]
 # rlib for in-workspace examples/tests; staticlib/cdylib for Swift.
@@ -12,6 +12,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Service layer (link-device, chat websocket, groups, attachments, sqlite store).
 presage = { git = "https://github.com/whisperfish/presage" }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage" }
+# WebRTC for voice/video calls (Signal's ringrtc)
+ringrtc = { git = "https://github.com/signalapp/ringrtc" }
 # current_thread runtime + LocalSet worker (presage uses spawn_local, so its
 # futures are !Send and must run on one dedicated thread).
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }

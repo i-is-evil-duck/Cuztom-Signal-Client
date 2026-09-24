@@ -827,3 +827,21 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         #endif
     }
 }
+
+// MARK: - CallSignalTransport (M4 stub)
+
+extension RustCoreService: CallSignalTransport {
+    public func sendCallSignal(_ message: CallSignalMessage) async throws {
+        // TODO: M4 - Implement call signaling via RingRTC/websocket
+        // For now, log and no-op
+        Log.info("Call signal send: \(message.type.rawValue) callId=\(message.callId)")
+    }
+
+    public var incomingCallSignals: AsyncStream<CallSignalMessage> {
+        AsyncStream { continuation in
+            // TODO: M4 - Connect to websocket for incoming call signals
+            // For now, empty stream
+            continuation.finish()
+        }
+    }
+}
