@@ -446,6 +446,23 @@ public final class ChatController: @unchecked Sendable {
         return true
     }
 
+    /// Send read receipts for all unread messages in a conversation.
+    public func sendReadReceipts(for conversationId: String) async throws {
+        guard let live = service as? RustCoreService else {
+            throw SignalError.unsupported("read receipts need the live backend")
+        }
+        // Get unread messages in this conversation
+        let messages = await store.messages(in: conversationId)
+        let unreadMessages = messages.filter { 
+            $0.direction == .incoming && !$0.readBy.contains(selfAci ?? "") 
+        }
+        // Extract timestamps
+        let timestamps = unreadMessages.compactMap { $0.storeTs }
+        if !timestamps.isEmpty {
+            try await live.sendReceipt(thread: conversationId, timestamps: timestamps, kind: "read")
+        }
+    }
+
     public func diagnostics() async -> String {
         let msgCount = await store.totalMessageCount()
         var lines = [

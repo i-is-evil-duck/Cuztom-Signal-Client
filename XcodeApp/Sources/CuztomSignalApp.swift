@@ -111,6 +111,10 @@ final class ChatViewModel {
     /// Last failed-action message (send/attachment/react/delete).
     var sendError: String?
 
+    // Read receipts settings
+    var sendReadReceipts = true
+    var sendDeliveryReceipts = true
+
     // Call state
     var incomingCall: ActiveCall?
     var activeCall: ActiveCall?
@@ -167,6 +171,12 @@ final class ChatViewModel {
     func select(_ id: String) async {
         historyExhausted = false
         await controller?.select(id)
+        // Auto-send read receipts when opening a conversation
+        if sendReadReceipts {
+            Task {
+                try? await controller?.sendReadReceipts(for: id)
+            }
+        }
         sync()
     }
 

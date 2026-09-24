@@ -29,6 +29,14 @@ struct SettingsView: View {
                     LabeledContent("Last error") { Text(err).font(.caption).monospaced() }
                 }
             }
+            Section("Read Receipts") {
+                Toggle("Send Read Receipts", isOn: $vm.sendReadReceipts)
+                    .disabled(!vm.isLinked)
+                Toggle("Send Delivery Receipts", isOn: $vm.sendDeliveryReceipts)
+                    .disabled(!vm.isLinked)
+                Text("When enabled, read/delivery receipts are automatically sent when you view messages.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("Diagnostics") {
                 Text(vm.diagnosticsText.isEmpty ? "—" : vm.diagnosticsText)
                     .font(.caption).monospaced()
