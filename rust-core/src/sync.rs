@@ -697,3 +697,55 @@ pub async fn send_receipt(
 
     Ok(())
 }
+
+/// M4: Call signaling stubs - to be implemented with RingRTC integration
+/// These are called from the sync loop when call signaling commands arrive
+
+/// Send a call offer (SDP) to the remote peer via Signal's websocket.
+pub async fn send_call_offer_inner(
+    _manager: &mut StoredManager,
+    call_id: &str,
+    _to: &str,
+    media_type: &str,
+    sdp: &str,
+) -> Result<(), String> {
+    eprintln!("[core] call offer: call_id={} media_type={} sdp_len={}", call_id, media_type, sdp.len());
+    // TODO: M4 - Use RingRTC to generate proper offer and send via Signal's call signaling
+    // For now, just log and return success
+    Ok(())
+}
+
+/// Send a call answer (SDP) to the remote peer via Signal's websocket.
+pub async fn send_call_answer_inner(
+    _manager: &mut StoredManager,
+    call_id: &str,
+    sdp: &str,
+) -> Result<(), String> {
+    eprintln!("[core] call answer: call_id={} sdp_len={}", call_id, sdp.len());
+    // TODO: M4 - Use RingRTC to generate proper answer and send via Signal's call signaling
+    Ok(())
+}
+
+/// Send an ICE candidate to the remote peer via Signal's websocket.
+pub async fn send_call_ice_inner(
+    _manager: &mut StoredManager,
+    call_id: &str,
+    candidate: &str,
+    sdp_mid: &str,
+    sdp_m_line_index: u32,
+) -> Result<(), String> {
+    eprintln!("[core] call ice: call_id={} candidate={} mid={} m_line={}", call_id, candidate, sdp_mid, sdp_m_line_index);
+    // TODO: M4 - Send ICE candidate via Signal's call signaling
+    Ok(())
+}
+
+/// Send a call hangup to the remote peer via Signal's websocket.
+pub async fn send_call_hangup_inner(
+    _manager: &mut StoredManager,
+    call_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    eprintln!("[core] call hangup: call_id={} reason={}", call_id, reason);
+    // TODO: M4 - Send hangup via Signal's call signaling
+    Ok(())
+}

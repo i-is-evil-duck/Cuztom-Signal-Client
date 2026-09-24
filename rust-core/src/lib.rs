@@ -30,6 +30,9 @@ use tokio::sync::{mpsc as tmpsc, oneshot};
 
 mod sync;
 use sync::StoredManager;
+use sync::{
+    send_call_offer_inner, send_call_answer_inner, send_call_ice_inner, send_call_hangup_inner,
+};
 
 enum Command {
     Init {
@@ -120,6 +123,31 @@ enum Command {
         kind: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    // M4: Call signaling commands
+    SendCallOffer {
+        call_id: String,
+        to: String,
+        media_type: String,
+        sdp: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SendCallAnswer {
+        call_id: String,
+        sdp: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SendCallIceCandidate {
+        call_id: String,
+        candidate: String,
+        sdp_mid: String,
+        sdp_m_line_index: u32,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SendCallHangup {
+        call_id: String,
+        reason: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -167,6 +195,31 @@ enum LoopCtrl {
         thread: String,
         timestamps: Vec<u64>,
         kind: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    // M4: Call signaling
+    SendCallOffer {
+        call_id: String,
+        to: String,
+        media_type: String,
+        sdp: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    SendCallAnswer {
+        call_id: String,
+        sdp: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    SendCallIceCandidate {
+        call_id: String,
+        candidate: String,
+        sdp_mid: String,
+        sdp_m_line_index: u32,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    SendCallHangup {
+        call_id: String,
+        reason: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     FetchAttachment {
@@ -345,6 +398,23 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                         }
                         Command::SendReceipt { thread, timestamps, kind, reply } => {
                             let result = cmd_send_receipt(&mut state, &thread, timestamps, &kind).await;
+                            let _ = reply.send(result);
+                        }
+                        // M4: Call signaling
+                        Command::SendCallOffer { call_id, to, media_type, sdp, reply } => {
+                            let result = cmd_send_call_offer(&mut state, &call_id, &to, &media_type, &sdp).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::SendCallAnswer { call_id, sdp, reply } => {
+                            let result = cmd_send_call_answer(&mut state, &call_id, &sdp).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::SendCallIceCandidate { call_id, candidate, sdp_mid, sdp_m_line_index, reply } => {
+                            let result = cmd_send_call_ice(&mut state, &call_id, &candidate, &sdp_mid, sdp_m_line_index).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::SendCallHangup { call_id, reason, reply } => {
+                            let result = cmd_send_call_hangup(&mut state, &call_id, &reason).await;
                             let _ = reply.send(result);
                         }
                         Command::Logout { reply } => {
@@ -585,6 +655,23 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(LoopCtrl::SendReceipt { thread, timestamps, kind, reply }) => {
                                     let r = sync::send_receipt(&mut manager, &thread, &timestamps, &kind).await;
+                                    let _ = reply.send(r);
+                                }
+                                // M4: Call signaling
+                                Some(LoopCtrl::SendCallOffer { call_id, to, media_type, sdp, reply }) => {
+                                    let r = send_call_offer_inner(&mut manager, &call_id, &to, &media_type, &sdp).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::SendCallAnswer { call_id, sdp, reply }) => {
+                                    let r = send_call_answer_inner(&mut manager, &call_id, &sdp).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::SendCallIceCandidate { call_id, candidate, sdp_mid, sdp_m_line_index, reply }) => {
+                                    let r = send_call_ice_inner(&mut manager, &call_id, &candidate, &sdp_mid, sdp_m_line_index).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::SendCallHangup { call_id, reason, reply }) => {
+                                    let r = send_call_hangup_inner(&mut manager, &call_id, &reason).await;
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::FetchAttachment { thread_id, ts, index, reply }) => {
@@ -960,6 +1047,106 @@ async fn cmd_send_receipt(
                 thread: thread.to_string(),
                 timestamps,
                 kind: kind.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Send a call offer (SDP) via the sync loop.
+async fn cmd_send_call_offer(
+    state: &mut WorkerState,
+    call_id: &str,
+    to: &str,
+    media_type: &str,
+    sdp: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendCallOffer {
+                call_id: call_id.to_string(),
+                to: to.to_string(),
+                media_type: media_type.to_string(),
+                sdp: sdp.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Send a call answer (SDP) via the sync loop.
+async fn cmd_send_call_answer(
+    state: &mut WorkerState,
+    call_id: &str,
+    sdp: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendCallAnswer {
+                call_id: call_id.to_string(),
+                sdp: sdp.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Send a call ICE candidate via the sync loop.
+async fn cmd_send_call_ice(
+    state: &mut WorkerState,
+    call_id: &str,
+    candidate: &str,
+    sdp_mid: &str,
+    sdp_m_line_index: u32,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendCallIceCandidate {
+                call_id: call_id.to_string(),
+                candidate: candidate.to_string(),
+                sdp_mid: sdp_mid.to_string(),
+                sdp_m_line_index,
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Send a call hangup via the sync loop.
+async fn cmd_send_call_hangup(
+    state: &mut WorkerState,
+    call_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendCallHangup {
+                call_id: call_id.to_string(),
+                reason: reason.to_string(),
                 reply: tx,
             })
             .map_err(|_| "sync loop is gone".to_string())?;
@@ -1376,6 +1563,102 @@ pub extern "C" fn core_cmd_send_receipt(
             set_last_error(e);
             -1
         }
+    }
+}
+
+/// Send a call offer (SDP). 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_call_offer(
+    call_id: *const c_char,
+    to: *const c_char,
+    media_type: *const c_char,
+    sdp: *const c_char,
+) -> i32 {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let t = match c_str_arg(to, "to") {
+        Ok(t) => t,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let mt = match c_str_arg(media_type, "media_type") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let s = match c_str_arg(sdp, "sdp") {
+        Ok(s) => s,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::SendCallOffer { call_id: cid, to: t, media_type: mt, sdp: s, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Send a call answer (SDP). 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_call_answer(
+    call_id: *const c_char,
+    sdp: *const c_char,
+) -> i32 {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let s = match c_str_arg(sdp, "sdp") {
+        Ok(s) => s,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::SendCallAnswer { call_id: cid, sdp: s, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Send an ICE candidate. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_call_ice(
+    call_id: *const c_char,
+    candidate: *const c_char,
+    sdp_mid: *const c_char,
+    sdp_m_line_index: u32,
+) -> i32 {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let cand = match c_str_arg(candidate, "candidate") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let mid = match c_str_arg(sdp_mid, "sdp_mid") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::SendCallIceCandidate { call_id: cid, candidate: cand, sdp_mid: mid, sdp_m_line_index, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Send a call hangup. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_call_hangup(
+    call_id: *const c_char,
+    reason: *const c_char,
+) -> i32 {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let r = match c_str_arg(reason, "reason") {
+        Ok(r) => r,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::SendCallHangup { call_id: cid, reason: r, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
     }
 }
 
