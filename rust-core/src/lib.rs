@@ -34,6 +34,8 @@ use sync::{
     send_call_offer_inner, send_call_answer_inner, send_call_ice_inner, send_call_hangup_inner,
 };
 
+mod groups;
+
 enum Command {
     Init {
         db_path: String,
@@ -123,6 +125,53 @@ enum Command {
         kind: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    // M2: Group management commands
+    GetGroupInfo {
+        master_key_hex: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    UpdateGroupTitle {
+        master_key_hex: String,
+        title: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    UpdateGroupAvatar {
+        master_key_hex: String,
+        avatar_data: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    AddGroupMembers {
+        master_key_hex: String,
+        member_acis: Vec<String>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    RemoveGroupMembers {
+        master_key_hex: String,
+        member_acis: Vec<String>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    PromoteGroupMember {
+        master_key_hex: String,
+        member_aci: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    DemoteGroupMember {
+        master_key_hex: String,
+        member_aci: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    GetGroupInviteLink {
+        master_key_hex: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    RevokeGroupInviteLink {
+        master_key_hex: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    LeaveGroup {
+        master_key_hex: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     // M4: Call signaling commands
     SendCallOffer {
         call_id: String,
@@ -195,6 +244,53 @@ enum LoopCtrl {
         thread: String,
         timestamps: Vec<u64>,
         kind: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    // M2: Group management
+    GetGroupInfo {
+        master_key_hex: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    UpdateGroupTitle {
+        master_key_hex: String,
+        title: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    UpdateGroupAvatar {
+        master_key_hex: String,
+        avatar_data: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    AddGroupMembers {
+        master_key_hex: String,
+        member_acis: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    RemoveGroupMembers {
+        master_key_hex: String,
+        member_acis: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    PromoteGroupMember {
+        master_key_hex: String,
+        member_aci: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    DemoteGroupMember {
+        master_key_hex: String,
+        member_aci: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    GetGroupInviteLink {
+        master_key_hex: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    RevokeGroupInviteLink {
+        master_key_hex: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    LeaveGroup {
+        master_key_hex: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     // M4: Call signaling
@@ -398,6 +494,47 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                         }
                         Command::SendReceipt { thread, timestamps, kind, reply } => {
                             let result = cmd_send_receipt(&mut state, &thread, timestamps, &kind).await;
+                            let _ = reply.send(result);
+                        }
+                        // M2: Group management
+                        Command::GetGroupInfo { master_key_hex, reply } => {
+                            let result = cmd_get_group_info(&mut state, &master_key_hex).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::UpdateGroupTitle { master_key_hex, title, reply } => {
+                            let result = cmd_update_group_title(&mut state, &master_key_hex, &title).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::UpdateGroupAvatar { master_key_hex, avatar_data, reply } => {
+                            let result = cmd_update_group_avatar(&mut state, &master_key_hex, &avatar_data).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::AddGroupMembers { master_key_hex, member_acis, reply } => {
+                            let result = cmd_add_group_members(&mut state, &master_key_hex, &member_acis).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::RemoveGroupMembers { master_key_hex, member_acis, reply } => {
+                            let result = cmd_remove_group_members(&mut state, &master_key_hex, &member_acis).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::PromoteGroupMember { master_key_hex, member_aci, reply } => {
+                            let result = cmd_promote_group_member(&mut state, &master_key_hex, &member_aci).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::DemoteGroupMember { master_key_hex, member_aci, reply } => {
+                            let result = cmd_demote_group_member(&mut state, &master_key_hex, &member_aci).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::GetGroupInviteLink { master_key_hex, reply } => {
+                            let result = cmd_get_group_invite_link(&mut state, &master_key_hex).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::RevokeGroupInviteLink { master_key_hex, reply } => {
+                            let result = cmd_revoke_group_invite_link(&mut state, &master_key_hex).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::LeaveGroup { master_key_hex, reply } => {
+                            let result = cmd_leave_group(&mut state, &master_key_hex).await;
                             let _ = reply.send(result);
                         }
                         // M4: Call signaling
@@ -655,6 +792,47 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(LoopCtrl::SendReceipt { thread, timestamps, kind, reply }) => {
                                     let r = sync::send_receipt(&mut manager, &thread, &timestamps, &kind).await;
+                                    let _ = reply.send(r);
+                                }
+                                // M2: Group management
+                                Some(LoopCtrl::GetGroupInfo { master_key_hex, reply }) => {
+                                    let r = groups::get_group_info(&mut manager, &master_key_hex).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::UpdateGroupTitle { master_key_hex, title, reply }) => {
+                                    let r = groups::update_group_title(&mut manager, &master_key_hex, &title).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::UpdateGroupAvatar { master_key_hex, avatar_data, reply }) => {
+                                    let r = groups::update_group_avatar(&mut manager, &master_key_hex, &avatar_data).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::AddGroupMembers { master_key_hex, member_acis, reply }) => {
+                                    let r = groups::add_group_members(&mut manager, &master_key_hex, &member_acis).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::RemoveGroupMembers { master_key_hex, member_acis, reply }) => {
+                                    let r = groups::remove_group_members(&mut manager, &master_key_hex, &member_acis).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::PromoteGroupMember { master_key_hex, member_aci, reply }) => {
+                                    let r = groups::promote_group_member(&mut manager, &master_key_hex, &member_aci).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::DemoteGroupMember { master_key_hex, member_aci, reply }) => {
+                                    let r = groups::demote_group_member(&mut manager, &master_key_hex, &member_aci).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::GetGroupInviteLink { master_key_hex, reply }) => {
+                                    let r = groups::get_group_invite_link(&mut manager, &master_key_hex).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::RevokeGroupInviteLink { master_key_hex, reply }) => {
+                                    let r = groups::revoke_group_invite_link(&mut manager, &master_key_hex).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::LeaveGroup { master_key_hex, reply }) => {
+                                    let r = groups::leave_group(&mut manager, &master_key_hex).await;
                                     let _ = reply.send(r);
                                 }
                                 // M4: Call signaling
@@ -1051,6 +1229,163 @@ async fn cmd_send_receipt(
             })
             .map_err(|_| "sync loop is gone".to_string())?;
             rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// M2: Group management handlers
+/// Get group info by master key hex
+async fn cmd_get_group_info(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+) -> Result<String, String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::get_group_info(manager, master_key_hex).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Update group title
+async fn cmd_update_group_title(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+    title: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::update_group_title(manager, master_key_hex, title).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Update group avatar
+async fn cmd_update_group_avatar(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+    avatar_data: &[u8],
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::update_group_avatar(manager, master_key_hex, avatar_data).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Add members to group
+async fn cmd_add_group_members(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+    member_acis: &[String],
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::add_group_members(manager, master_key_hex, member_acis).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Remove members from group
+async fn cmd_remove_group_members(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+    member_acis: &[String],
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::remove_group_members(manager, master_key_hex, member_acis).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Promote member to admin
+async fn cmd_promote_group_member(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+    member_aci: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::promote_group_member(manager, master_key_hex, member_aci).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Demote member from admin
+async fn cmd_demote_group_member(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+    member_aci: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::demote_group_member(manager, master_key_hex, member_aci).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Get group invite link
+async fn cmd_get_group_invite_link(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+) -> Result<String, String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::get_group_invite_link(manager, master_key_hex).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Revoke group invite link
+async fn cmd_revoke_group_invite_link(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::revoke_group_invite_link(manager, master_key_hex).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Leave group
+async fn cmd_leave_group(
+    state: &mut WorkerState,
+    master_key_hex: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let manager = linked.manager.as_mut().ok_or_else(|| "manager not available".to_string())?;
+            groups::leave_group(manager, master_key_hex).await
         }
         _ => Err("not linked".to_string()),
     }
@@ -1563,6 +1898,209 @@ pub extern "C" fn core_cmd_send_receipt(
             set_last_error(e);
             -1
         }
+    }
+}
+
+/// M2: Group management FFI
+/// Get group info by master key hex. Returns JSON string or null.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_get_info(
+    master_key_hex: *const c_char,
+) -> *mut c_char {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+    match roundtrip(|reply| Command::GetGroupInfo { master_key_hex: mk, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Update group title. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_update_title(
+    master_key_hex: *const c_char,
+    title: *const c_char,
+) -> i32 {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let t = match c_str_arg(title, "title") {
+        Ok(t) => t,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::UpdateGroupTitle { master_key_hex: mk, title: t, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Update group avatar. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_update_avatar(
+    master_key_hex: *const c_char,
+    avatar_data: *const u8,
+    avatar_len: usize,
+) -> i32 {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let avatar = if avatar_data.is_null() || avatar_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(avatar_data, avatar_len).to_vec() }
+    };
+    match roundtrip(|reply| Command::UpdateGroupAvatar { master_key_hex: mk, avatar_data: avatar, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Add members to group. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_add_members(
+    master_key_hex: *const c_char,
+    member_acis_ptr: *const *const c_char,
+    member_acis_len: usize,
+) -> i32 {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let mut member_acis = Vec::with_capacity(member_acis_len);
+    if member_acis_ptr.is_null() || member_acis_len == 0 {
+        set_last_error("member_acis: null or empty".to_string());
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(member_acis_ptr, member_acis_len) };
+    for ptr in slice {
+        let aci = match c_str_arg(*ptr, "member_aci") {
+            Ok(a) => a,
+            Err(e) => { set_last_error(e); return -1; }
+        };
+        member_acis.push(aci);
+    }
+    match roundtrip(|reply| Command::AddGroupMembers { master_key_hex: mk, member_acis, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Remove members from group. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_remove_members(
+    master_key_hex: *const c_char,
+    member_acis_ptr: *const *const c_char,
+    member_acis_len: usize,
+) -> i32 {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let mut member_acis = Vec::with_capacity(member_acis_len);
+    if member_acis_ptr.is_null() || member_acis_len == 0 {
+        set_last_error("member_acis: null or empty".to_string());
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(member_acis_ptr, member_acis_len) };
+    for ptr in slice {
+        let aci = match c_str_arg(*ptr, "member_aci") {
+            Ok(a) => a,
+            Err(e) => { set_last_error(e); return -1; }
+        };
+        member_acis.push(aci);
+    }
+    match roundtrip(|reply| Command::RemoveGroupMembers { master_key_hex: mk, member_acis, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Promote member to admin. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_promote_member(
+    master_key_hex: *const c_char,
+    member_aci: *const c_char,
+) -> i32 {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let aci = match c_str_arg(member_aci, "member_aci") {
+        Ok(a) => a,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::PromoteGroupMember { master_key_hex: mk, member_aci: aci, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Demote member from admin. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_demote_member(
+    master_key_hex: *const c_char,
+    member_aci: *const c_char,
+) -> i32 {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let aci = match c_str_arg(member_aci, "member_aci") {
+        Ok(a) => a,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::DemoteGroupMember { master_key_hex: mk, member_aci: aci, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Get group invite link. Returns JSON string or null.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_get_invite_link(
+    master_key_hex: *const c_char,
+) -> *mut c_char {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+    match roundtrip(|reply| Command::GetGroupInviteLink { master_key_hex: mk, reply }) {
+        Ok(Ok(link)) => ok_string(link),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Revoke group invite link. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_revoke_invite_link(
+    master_key_hex: *const c_char,
+) -> i32 {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::RevokeGroupInviteLink { master_key_hex: mk, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Leave group. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_leave(
+    master_key_hex: *const c_char,
+) -> i32 {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::LeaveGroup { master_key_hex: mk, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
     }
 }
 

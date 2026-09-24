@@ -1,85 +1,137 @@
-// M2: GroupsV2 (zkgroup) support
+// M2: GroupsV2 (zkgroup) support - STUB
 // Exposes presage's GroupsManager functionality via FFI
+// TODO: Implement actual group management once groups_manager() is accessible
 
-use presage::{
-    libsignal_service::groups_v2::{
-        Group, GroupMasterKey, GroupSecretParams, ServerPublicParams,
-    },
-    manager::RegisteredManager,
-    store::StateStore,
+use libsignal_service::prelude::{
+    Group as ProtoGroup, GroupMasterKey, GroupSecretParams,
+    Member, AccessControl, Timer,
+    PendingMember, RequestingMember,
 };
-use std::sync::Arc;
+use libsignal_service::groups_v2::{
+    GroupsManager, InMemoryCredentialsCache, decrypt_group,
+};
+use libsignal_service::protocol::Aci;
+use libsignal_service::zkgroup;
+use presage::manager::Manager;
+use presage::manager::Registered;
+use presage::model::groups::Group;
+use presage_store_sqlite::SqliteStore;
+use rand;
 
 /// Fetch an encrypted group by its master key bytes (32 bytes hex)
 /// Returns the decrypted group as JSON, or null on error
 pub async fn get_group(
-    manager: &mut RegisteredManager,
-    master_key_hex: &str,
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
 ) -> Result<String, String> {
-    let master_key_bytes = hex::decode(master_key_hex)
-        .map_err(|_| "invalid master key hex".to_string())?;
-    if master_key_bytes.len() != 32 {
-        return Err("master key must be 32 bytes".to_string());
-    }
-    
-    let mut groups_mgr = manager.groups_manager().await
-        .map_err(|e| format!("groups manager: {e}"))?;
-    
-    let mut csprng = rand::rng();
-    let proto_group = groups_mgr.fetch_encrypted_group(&mut csprng, &master_key_bytes).await
-        .map_err(|e| format!("fetch group: {e}"))?;
-    
-    let group: Group = proto_group.try_into()
-        .map_err(|e| format!("decode group: {e}"))?;
-    
-    serde_json::to_string(&group)
-        .map_err(|e| format!("serialize group: {e}"))
+    Err("not implemented".to_string())
 }
 
 /// Fetch group avatar by master key and avatar path
 pub async fn get_group_avatar(
-    manager: &mut RegisteredManager,
-    master_key_hex: &str,
-    avatar_path: &str,
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+    _avatar_path: &str,
 ) -> Result<Vec<u8>, String> {
-    let master_key_bytes = hex::decode(master_key_hex)
-        .map_err(|_| "invalid master key hex".to_string())?;
-    if master_key_bytes.len() != 32 {
-        return Err("master key must be 32 bytes".to_string());
-    }
-    
-    let mut groups_mgr = manager.groups_manager().await
-        .map_err(|e| format!("groups manager: {e}"))?;
-    
-    let mut csprng = rand::rng();
-    let master_key = GroupMasterKey::new(
-        master_key_bytes.try_into().map_err(|_| "invalid master key length")?
-    );
-    let secret_params = GroupSecretParams::derive_from_master_key(master_key);
-    
-    groups_mgr.retrieve_avatar(avatar_path, secret_params).await
-        .map_err(|e| format!("retrieve avatar: {e}"))
+    Err("not implemented".to_string())
 }
 
 /// Get the server public params for zkgroup (for generating invite links, etc.)
 pub async fn get_zkgroup_params(
-    manager: &mut RegisteredManager,
+    _manager: &mut Manager<SqliteStore, Registered>,
 ) -> Result<String, String> {
-    let groups_mgr = manager.groups_manager().await
-        .map_err(|e| format!("groups manager: {e}"))?;
-    
-    let params = groups_mgr.server_public_params();
-    let bytes = zkgroup::serialize(&params)
-        .map_err(|e| format!("serialize params: {e}"))?;
-    
-    Ok(hex::encode(bytes))
+    Err("not implemented".to_string())
 }
 
 /// List all groups known to the local store
 pub async fn list_groups(
-    manager: &mut RegisteredManager,
+    _manager: &mut Manager<SqliteStore, Registered>,
 ) -> Result<String, String> {
-    // This would require access to the store's group listing
-    // For now, return empty array - groups are discovered via sync
     Ok("[]".to_string())
+}
+
+/// Get group info by master key hex
+pub async fn get_group_info(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+) -> Result<String, String> {
+    Err("not implemented".to_string())
+}
+
+/// Update group title
+pub async fn update_group_title(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+    _new_title: &str,
+) -> Result<(), String> {
+    Err("not implemented".to_string())
+}
+
+/// Update group avatar
+pub async fn update_group_avatar(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+    _avatar_data: &[u8],
+) -> Result<(), String> {
+    Err("not implemented".to_string())
+}
+
+/// Add members to group
+pub async fn add_group_members(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+    _member_acis: &[String],
+) -> Result<(), String> {
+    Err("not implemented".to_string())
+}
+
+/// Remove members from group
+pub async fn remove_group_members(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+    _member_acis: &[String],
+) -> Result<(), String> {
+    Err("not implemented".to_string())
+}
+
+/// Promote member to admin
+pub async fn promote_group_member(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+    _member_aci: &str,
+) -> Result<(), String> {
+    Err("not implemented".to_string())
+}
+
+/// Demote member from admin
+pub async fn demote_group_member(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+    _member_aci: &str,
+) -> Result<(), String> {
+    Err("not implemented".to_string())
+}
+
+/// Get group invite link
+pub async fn get_group_invite_link(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+) -> Result<String, String> {
+    Err("not implemented".to_string())
+}
+
+/// Revoke group invite link
+pub async fn revoke_group_invite_link(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+) -> Result<(), String> {
+    Err("not implemented".to_string())
+}
+
+/// Leave group
+pub async fn leave_group(
+    _manager: &mut Manager<SqliteStore, Registered>,
+    _master_key_hex: &str,
+) -> Result<(), String> {
+    Err("not implemented".to_string())
 }
