@@ -6,11 +6,17 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "CuztomSignalCore", targets: ["CuztomSignalCore"]),
+        .executable(name: "CuztomSignal", targets: ["CuztomSignalApp"]),
     ],
     targets: [
         .target(
             name: "CuztomSignalCore",
             path: "Sources/CuztomSignalCore"
+        ),
+        .executableTarget(
+            name: "CuztomSignalApp",
+            dependencies: ["CuztomSignalCore"],
+            path: "XcodeApp/Sources"
         ),
         .testTarget(
             name: "CuztomSignalCoreTests",
