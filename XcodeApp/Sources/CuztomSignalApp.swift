@@ -7,6 +7,29 @@ struct CuztomSignalApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @State private var viewModel = ChatViewModel()
 
+    init() {
+        // Capture stdout/stderr (incl. Rust panics) into the diagnostics log.
+        // Without this, native crashes vanish with the process.
+        if ProcessInfo.processInfo.environment["RUST_BACKTRACE"] == nil {
+            setenv("RUST_BACKTRACE", "1", 1)
+        }
+        redirectStreamsToLog()
+    }
+
+    /// Duplicate C-level stdout/stderr into the log file (Rust `eprintln!`
+    /// and panic messages land here). Swift `Log` writes the same file.
+    private func redirectStreamsToLog() {
+        let url = Log.fileURL
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+        }
+        url.path.withCString { path in
+            _ = freopen(path, "a+", stdout)
+            _ = freopen(path, "a+", stderr)
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()

@@ -192,6 +192,7 @@ pub async fn download_attachment(
         .get_attachment(ptr)
         .await
         .map_err(|e| format!("download: {e}"))?;
+    eprintln!("[core] attachment downloaded bytes={} -> {}", bytes.len(), dest.display());
     std::fs::write(&dest, &bytes).map_err(|e| format!("cache write: {e}"))?;
     Ok(Some(dest.to_string_lossy().into_owned()))
 }
@@ -402,6 +403,7 @@ pub async fn whoami(store: &SqliteStore) -> Result<String, String> {
 /// Send a text to "contact:<uuid>" or "group:<hex>". Returns sent timestamp.
 pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> Result<u64, String> {
     use presage::libsignal_service::content::DataMessage;
+    eprintln!("[core] send start thread={thread} body_len={}", body.len());
     let ts = now_millis();
     let msg = DataMessage {
         body: Some(body.to_string()),
@@ -409,8 +411,9 @@ pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> R
         ..Default::default()
     };
     let content_body: ContentBody = msg.into();
-    if let Some(hexkey) = thread.strip_prefix("group:") {
+    let result = if let Some(hexkey) = thread.strip_prefix("group:") {
         let bytes = hex::decode(hexkey).map_err(|_| "bad group id".to_string())?;
+        eprintln!("[core] send group key_len={}", bytes.len());
         manager
             .send_message_to_group(&bytes, content_body, ts)
             .await
@@ -419,6 +422,7 @@ pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> R
     } else if let Some(uuid) = thread.strip_prefix("contact:") {
         // Our wire ids are bare uuids; tolerate a "PNI:" prefix defensively.
         let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
+        eprintln!("[core] send contact id={bare}");
         let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
         manager
             .send_message(ServiceId::Aci(Aci::from(parsed)), content_body, ts)
@@ -427,7 +431,12 @@ pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> R
             .map_err(|e| format!("send: {e}"))
     } else {
         Err("bad thread id".to_string())
+    };
+    match &result {
+        Ok(sent_ts) => eprintln!("[core] send ok ts={sent_ts}"),
+        Err(e) => eprintln!("[core] send failed: {e}"),
     }
+    result
 }
 
 pub fn received_event(r: &Received, self_aci: &str, names: &HashMap<String, String>) -> Option<String> {
