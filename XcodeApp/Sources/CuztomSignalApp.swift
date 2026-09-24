@@ -216,6 +216,38 @@ final class ChatViewModel {
         sync()
     }
 
+    /// Edit an outgoing message
+    var editingMessage: ChatMessage?
+    var editDraft = ""
+
+    func editMessage(_ message: ChatMessage) async {
+        guard message.direction == .outgoing,
+              let id = selectedId else { return }
+        // Present edit sheet with current body
+        editingMessage = message
+        editDraft = message.body
+    }
+
+    /// Confirm edit and send to Signal
+    func confirmEdit() async {
+        guard let msg = editingMessage,
+              let id = selectedId else { return }
+        do {
+            try await controller?.sendMessageEdit(thread: id, targetTs: msg.storeTs ?? 0, newBody: editDraft)
+            editingMessage = nil
+            editDraft = ""
+        } catch {
+            sendError = "Edit failed: \(error.localizedDescription)"
+        }
+        sync()
+    }
+
+    /// Cancel edit
+    func cancelEdit() {
+        editingMessage = nil
+        editDraft = ""
+    }
+
     // MARK: - Calls (M4)
 
     /// Start an outgoing voice call

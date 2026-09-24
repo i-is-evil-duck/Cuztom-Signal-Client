@@ -294,6 +294,36 @@ public final class ChatController: @unchecked Sendable {
         }
     }
 
+    /// Edit an outgoing message (replaces content). Returns sent timestamp.
+    public func sendMessageEdit(thread: String, targetTs: Int64, newBody: String) async -> Int64 {
+        guard let live = service as? RustCoreService else {
+            lastError = "message edits need the live backend"
+            Log.error("message edit: no live backend")
+            return -1
+        }
+        do {
+            let ts = try await live.sendMessageEdit(thread: thread, targetTs: targetTs, newBody: newBody)
+            // Update local message store
+            // Find the message by storeTs and update its body
+            let messagesInThread = await store.messages(in: thread)
+            if let idx = messagesInThread.firstIndex(where: { $0.storeTs == targetTs }) {
+                await store.updateMessage(id: messagesInThread[idx].id) { m in
+                    m.body = newBody
+                }
+            }
+            if thread == selectedId {
+                messages = await store.messages(in: thread)
+            }
+            conversations = await store.allConversations()
+            Log.info("edited message in \(thread)")
+            return ts
+        } catch {
+            lastError = String(describing: error)
+            Log.error("message edit failed: \(error)")
+            return -1
+        }
+    }
+
     /// Fill in profile display names for contacts whose synced row is blank
     /// (typically added by phone number). Keeps existing titles otherwise.
     public func enrichNames() async {

@@ -317,6 +317,9 @@ struct MessageListView: View {
             .padding()
             .frame(width: 300, height: 140)
         }
+        .sheet(item: $vm.editingMessage) { msg in
+            EditMessageSheet(message: msg, draft: $vm.editDraft, onConfirm: { Task { await vm.confirmEdit() } }, onCancel: { vm.cancelEdit() })
+        }
     }
 
     private func send() {
@@ -419,6 +422,10 @@ struct MessageRow: View {
                         Button("Delete for everyone", role: .destructive) {
                             Task { await vm.deleteMessage(msg, forEveryone: true) }
                         }
+                    }
+                    Divider()
+                    Button("Edit") {
+                        Task { await vm.editMessage(msg) }
                     }
                 }
             }
@@ -654,6 +661,37 @@ enum DropRelay {
         Task { @MainActor in
             model?.stageFiles(urls)
         }
+    }
+}
+
+struct EditMessageSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    var message: ChatMessage
+    @Binding var draft: String
+    var onConfirm: () -> Void
+    var onCancel: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Edit Message")
+                .font(.headline)
+            TextEditor(text: $draft)
+                .font(.body)
+                .frame(minHeight: 100)
+                .padding(8)
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(8)
+            HStack {
+                Spacer()
+                Button("Cancel") { onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { onConfirm() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding()
+        .frame(width: 400, height: 250)
     }
 }
 
