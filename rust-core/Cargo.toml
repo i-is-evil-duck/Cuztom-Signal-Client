@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 presage = { git = "https://github.com/whisperfish/presage" }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage" }
 # WebRTC for voice/video calls (Signal's ringrtc)
-ringrtc = { git = "https://github.com/signalapp/ringrtc" }
+ringrtc = { git = "https://github.com/signalapp/ringrtc", features = ["sim"] }
 # current_thread runtime + LocalSet worker (presage uses spawn_local, so its
 # futures are !Send and must run on one dedicated thread).
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
