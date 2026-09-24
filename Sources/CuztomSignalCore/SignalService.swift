@@ -2,6 +2,7 @@ import Foundation
 
 public enum SignalError: Error, Sendable {
     case notLinked
+    case alreadyLinked
     case network(String)
     case crypto(String)
     case storage(String)

@@ -42,44 +42,36 @@ final class ChatViewModel {
     func start() async {
         phase = .starting
         errorMessage = nil
+        // Live backend only — the demo is gone. Without the rust dylib
+        // there is nothing to connect to, so fail loudly with Retry.
         let live = RustCoreService()
-        if live.loadLibrary() {
-            backendName = "Live"
-            let controller = ChatController(service: live)
-            self.controller = controller
-            guard await controller.begin() else {
-                fail(controller)
-                return
-            }
+        guard live.loadLibrary() else {
+            backendName = "missing"
+            errorMessage = "rust core not found — rebuild: cd rust-core && cargo build --release"
+            phase = .failed
+            return
+        }
+        backendName = "Live"
+        let controller = ChatController(service: live)
+        self.controller = controller
+        guard await controller.begin() else {
+            fail(controller)
+            return
+        }
+        if controller.linkQR != nil {
+            // Fresh link: paint the QR while the phone scan completes.
             phase = .linking
             sync()
-            guard await controller.finish() else {
-                fail(controller)
-                return
-            }
-            succeed(controller)
-        } else {
-            await startDemo()
         }
+        guard await controller.finish() else {
+            fail(controller)
+            return
+        }
+        succeed(controller)
     }
 
     func retry() async {
         await start()
-    }
-
-    func startDemo() async {
-        phase = .starting
-        errorMessage = nil
-        let (convs, msgs) = Self.previewData()
-        let controller = ChatController(service: MockSignalService(seedConversations: convs, seedMessages: msgs))
-        self.controller = controller
-        backendName = "Mock"
-        await controller.link()
-        sync()
-        phase = .linked
-        if let first = conversations.first {
-            await select(first.id)
-        }
     }
 
     func select(_ id: String) async {
@@ -113,16 +105,5 @@ final class ChatViewModel {
         messages = controller.messages
         linkQR = controller.linkQR
         isLinked = controller.isLinked
-    }
-
-    static func previewData() -> ([Conversation], [String: [ChatMessage]]) {
-        let a = Conversation(id: "c1", title: "Alice", peer: SignalAddress(phone: "+1001"),
-                             lastMessagePreview: "hey!", unreadCount: 1)
-        let g = Conversation(id: "group.abc", title: "Reels (bridge testers)",
-                             peer: SignalAddress(groupId: "group.abc"),
-                             lastMessagePreview: "sent a reel", unreadCount: 0)
-        let m = ChatMessage(conversationId: "c1", author: SignalAddress(phone: "+1001"),
-                            body: "hey! this is a mock thread", direction: .incoming, status: .delivered)
-        return ([a, g], ["c1": [m]])
     }
 }

@@ -66,6 +66,29 @@ import Testing
     #expect(await controller.conversations.count == 1)
 }
 
+@Test func controllerResumesExistingSession() async {
+    struct AlreadyLive: SignalService, Sendable {
+        var connectionState: AsyncStream<ConnectionState> { AsyncStream { _ in } }
+        func beginLinking(deviceName: String) async throws -> LinkQR { throw SignalError.alreadyLinked }
+        func waitForLink() async throws {}
+        func fetchConversations() async throws -> [Conversation] {
+            [Conversation(id: "c1", title: "Peer", peer: SignalAddress(phone: "+1"))]
+        }
+        func fetchMessages(conversationId: String, limit: Int) async throws -> [ChatMessage] { [] }
+        func sendText(_ body: String, to conversationId: String) async throws -> ChatMessage {
+            throw SignalError.notLinked
+        }
+        func incomingMessages() -> AsyncStream<ChatMessage> { AsyncStream { _ in } }
+    }
+    let controller = await ChatController(service: AlreadyLive())
+    #expect(await controller.begin()) // no QR needed
+    let qr = await controller.linkQR
+    #expect(qr == nil)
+    #expect(await controller.finish())
+    #expect(await controller.isLinked)
+    #expect(await controller.conversations.count == 1)
+}
+
 @Test func controllerBeginFailure() async {
     struct Broken: SignalService, Sendable {
         var connectionState: AsyncStream<ConnectionState> { AsyncStream { _ in } }

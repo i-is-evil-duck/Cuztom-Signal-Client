@@ -44,14 +44,16 @@ has `InMemorySecretStore` (tests) and `KeychainSecretStore` (prod).
 - [x] Swift `RustCoreService`: real `dlopen`+`dlsym` calls, string marshaling,
   offline `isLinkedAccount()` probe; `ChatViewModel` picks Live backend when
   the dylib is present, Mock otherwise (indicator in sidebar footer)
-- [x] 13 `swift test`s green, incl. live-dylib offline init against a temp store
-- [x] UI phase gate (`starting → linking → linked | failed`): no more QR
-  flash; real QR rendered from the `sgnl://` URL; Live failures show
-  Retry + Continue-with-demo instead of silently dropping to mock
-- [x] Release dylib builds (12 MB); bundled next to the binary so the app
-  boots the Live backend
-- [ ] Manual: real phone scan → QR → linked → restart persists (needs user)
-- [ ] M1b: receive loop + send + contacts/groups sync
+- [x] M1b roster/sync: `roster` (contacts+groups+recent msgs from sqlite),
+  `whoami`, `request_contacts`, background `receive_messages` loop with
+  control channel, `poll_event` queue, `send` (1:1 + groups); Swift decodes
+  to `Conversation`/`ChatMessage` with stable ids, live pump into the store
+- [x] 17+ `swift test`s (roster fixture mapping, stable ids, event decode),
+  `cargo test` incl. roster/whoami rejection on fresh stores
+- [x] UI phase gate (`starting → linking → linked | failed`): real QR from
+  the `sgnl://` URL; failures show Retry + Continue-with-demo
+- [x] Release dylib (~13 MB) bundled next to the binary → Live backend
+- [ ] Manual: launch → contacts/groups appear → send/receive live (needs user)
 
 ### M2 — Groups + attachments
 1. GroupsV2 (`zkgroup`) sync: member list, title/avatar, admin flags.

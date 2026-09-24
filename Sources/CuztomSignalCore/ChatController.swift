@@ -19,6 +19,7 @@ public final class ChatController {
     private let service: any SignalService
     private let store: MessageStore
     private var observerTask: Task<Void, Never>?
+    private var watchTask: Task<Void, Never>?
 
     public init(service: any SignalService, store: MessageStore = MessageStore()) {
         self.service = service
@@ -36,11 +37,17 @@ public final class ChatController {
     }
 
     /// Step 1: fetch the provisioning QR. Returns false on error.
+    /// An existing session (`alreadyLinked`) resumes without a QR.
     public func begin(deviceName: String = "CuztomMac") async -> Bool {
         lastError = nil
         do {
             linkQR = try await service.beginLinking(deviceName: deviceName)
             connection = .linking
+            observeConnection()
+            return true
+        } catch SignalError.alreadyLinked {
+            linkQR = nil
+            connection = .syncing
             observeConnection()
             return true
         } catch {
@@ -56,13 +63,34 @@ public final class ChatController {
         do {
             try await service.waitForLink()
             connection = .syncing
+            // Live backend: pull contact sync + start the receive loop.
+            // Non-fatal: the roster still loads from the local store.
+            if let live = service as? RustCoreService {
+                do {
+                    try await live.startLiveSync()
+                } catch {
+                    lastError = String(describing: error)
+                }
+            }
             try await refresh()
             connection = .connected
+            startWatching()
             return true
         } catch {
             lastError = String(describing: error)
             connection = .offline
             return false
+        }
+    }
+
+    /// Stream live inbound messages into the store for the session lifetime.
+    public func startWatching() {
+        watchTask?.cancel()
+        watchTask = Task { [weak self] in
+            guard let stream = self?.service.incomingMessages() else { return }
+            for await message in stream {
+                await self?.receive(message)
+            }
         }
     }
 

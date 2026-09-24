@@ -41,16 +41,13 @@ struct StatusView: View {
         case .failed:
             VStack(spacing: 12) {
                 Image(systemName: "exclamationmark.triangle").font(.system(size: 48))
-                Text("Couldn't link").font(.title2)
+                Text("Couldn't connect").font(.title2)
                 if let err = vm.errorMessage {
                     Text(err).font(.caption).monospaced().foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
-                HStack {
-                    Button("Retry") { Task { await vm.retry() } }
-                        .keyboardShortcut(.defaultAction)
-                    Button("Continue with demo") { Task { await vm.startDemo() } }
-                }
+                Button("Retry") { Task { await vm.retry() } }
+                    .keyboardShortcut(.defaultAction)
             }
             .padding(40)
         case .linked:

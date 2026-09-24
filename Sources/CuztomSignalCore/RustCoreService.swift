@@ -4,6 +4,51 @@ import Foundation
 import Darwin
 #endif
 
+/// Decoded roster snapshot from `core_cmd_roster` (see rust-core/src/sync.rs).
+public struct RosterPayload: Decodable, Sendable {
+    public struct SelfInfo: Decodable, Sendable {
+        public var aci: String
+        public var number: String
+    }
+    public struct Contact: Decodable, Sendable {
+        public var id: String
+        public var name: String
+        public var phone: String
+    }
+    public struct Group: Decodable, Sendable {
+        public var id: String
+        public var title: String
+    }
+    public struct Message: Decodable, Sendable {
+        public var key: String
+        public var thread: String
+        public var sender: String
+        public var senderName: String
+        public var body: String
+        public var ts: Int64
+        public var outgoing: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case key, thread, sender, body, ts, outgoing
+            case senderName = "sender_name"
+        }
+    }
+    public var thisDevice: SelfInfo
+    public var contacts: [Contact]
+    public var groups: [Group]
+    public var messages: [Message]
+
+    private enum CodingKeys: String, CodingKey {
+        case contacts, groups, messages
+        case thisDevice = "self"
+    }
+}
+
+struct LiveEvent: Decodable {
+    var type: String
+    var message: RosterPayload.Message?
+}
+
 /// M1: `SignalService` backed by `rust-core/` (`presage` Manager) over C FFI.
 ///
 /// Expected C ABI (see `rust-core/src/lib.rs`):
@@ -11,12 +56,14 @@ import Darwin
 ///   `core_cmd_begin_link(name) -> *mut c_char` (free with `core_free_string`)
 ///   `core_cmd_poll_link() -> i32`     1 linked, 0 pending, -1 failed
 ///   `core_cmd_is_linked() -> i32`     1 / 0
+///   `core_cmd_roster() -> *mut c_char` (JSON snapshot, free with `core_free_string`)
+///   `core_cmd_send(thread, body) -> i64` (sent ts, -1 on error)
+///   `core_cmd_start_sync() -> i32` / `core_cmd_poll_event() -> *mut c_char`
 ///   `core_last_error() -> *const c_char`
 ///   `core_free_string(*mut c_char)`
 ///
 /// The library is loaded lazily with `dlopen` so the Swift package still
-/// builds/tests on machines without Rust. Conversation/message sync lands in
-/// M1b; until then an established link reports an empty roster.
+/// builds/tests on machines without Rust.
 public final class RustCoreService: SignalService, @unchecked Sendable {
     private let stateContinuation: AsyncStream<ConnectionState>.Continuation
     public let connectionState: AsyncStream<ConnectionState>
@@ -30,6 +77,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private let dbPath: String
     private var didInit = false
     private var linked = false
+    /// Last roster snapshot, keyed by stable wire key (dedupe across refresh).
+    private var messageCache: [String: RosterPayload.Message] = [:]
+    private var uuidCache: [String: UUID] = [:]
+    private var pumpTask: Task<Void, Never>?
 
     public init(libraryPath: String? = nil, dbPath: String? = nil) {
         self.libraryPath = libraryPath
@@ -48,6 +99,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     deinit {
+        pumpTask?.cancel()
         if let handle = libraryHandle {
             #if canImport(Darwin)
             dlclose(handle)
@@ -96,6 +148,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     public func beginLinking(deviceName: String) async throws -> LinkQR {
         let sym = try await initCore()
+        // Resume path: a session from a previous launch is already live —
+        // the caller treats `alreadyLinked` as "skip the QR, just sync".
+        if sym.isLinked() == 1 {
+            linked = true
+            throw SignalError.alreadyLinked
+        }
         stateContinuation.yield(.linking)
         let url: String = try callString(sym.beginLink, deviceName, what: "begin_link")
         linked = false
@@ -123,22 +181,58 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     public func fetchConversations() async throws -> [Conversation] {
         guard linked || isLinkedNow() else { throw SignalError.notLinked }
-        // M1b implements roster sync; empty (not throw) keeps link flow alive.
-        return []
+        let payload = try JSONDecoder().decode(RosterPayload.self, from: try await rosterData())
+        return applyRoster(payload)
     }
 
     public func fetchMessages(conversationId: String, limit: Int) async throws -> [ChatMessage] {
         guard linked || isLinkedNow() else { throw SignalError.notLinked }
-        return []
+        let cached = messageCache.values.filter { $0.thread == conversationId }
+            .sorted { $0.ts < $1.ts }
+        return Array(cached.suffix(limit)).map { chatMessage($0) }
     }
 
     public func sendText(_ body: String, to conversationId: String) async throws -> ChatMessage {
         guard linked || isLinkedNow() else { throw SignalError.notLinked }
-        throw SignalError.unsupported("send path lands in M1b (receive loop + send)")
+        let sym = try await initCore()
+        var ts: Int64 = -1
+        conversationId.withCString { t in
+            body.withCString { b in
+                ts = sym.send(t, b)
+            }
+        }
+        guard ts >= 0 else { throw SignalError.network("send failed: \(lastError(sym))") }
+        let msg = RosterPayload.Message(
+            key: "\(conversationId)/\(ts)/self",
+            thread: conversationId, sender: "self", senderName: "You",
+            body: body, ts: ts, outgoing: true
+        )
+        return chatMessage(msg)
     }
 
     public func incomingMessages() -> AsyncStream<ChatMessage> {
         incoming
+    }
+
+    /// After link: ask the phone for contact sync, start the receive loop,
+    /// and pump events into `incomingMessages()`. Throws only if the loop
+    /// itself won't start; a failed contact-sync request is non-fatal.
+    public func startLiveSync() async throws {
+        let sym = try await initCore()
+        if sym.requestContacts() != 0 {
+            // Non-fatal: contacts may already be synced from a previous run.
+            stateContinuation.yield(.syncing)
+        }
+        guard sym.startSync() == 0 else {
+            throw SignalError.network("start sync failed: \(lastError(sym))")
+        }
+        pumpTask?.cancel()
+        pumpTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.drainEvents()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
     }
 
     /// Offline-safe: opens (or creates) the store and reports whether a
@@ -155,8 +249,102 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let beginLink: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let pollLink: @convention(c) () -> Int32
         let isLinked: @convention(c) () -> Int32
+        let roster: @convention(c) () -> UnsafeMutablePointer<CChar>?
+        let send: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int64
+        let requestContacts: @convention(c) () -> Int32
+        let startSync: @convention(c) () -> Int32
+        let pollEvent: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let lastError: @convention(c) () -> UnsafePointer<CChar>?
         let freeString: @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
+    }
+
+    /// Fetch + cache the roster snapshot; returns decoded conversations.
+    @discardableResult
+    public func applyRoster(_ payload: RosterPayload) -> [Conversation] {
+        for m in payload.messages {
+            messageCache[m.key] = m
+        }
+        var byThread: [String: [RosterPayload.Message]] = [:]
+        for m in messageCache.values {
+            byThread[m.thread, default: []].append(m)
+        }
+        var convs: [Conversation] = []
+        for c in payload.contacts {
+            let id = "contact:\(c.id)"
+            let title = c.name.isEmpty ? (c.phone.isEmpty ? String(c.id.prefix(8)) : c.phone) : c.name
+            let recent = (byThread[id] ?? []).sorted { $0.ts < $1.ts }
+            convs.append(Conversation(
+                id: id,
+                title: title,
+                peer: SignalAddress(uuidString: c.id, phone: c.phone.isEmpty ? nil : c.phone),
+                lastMessagePreview: recent.last.map { String($0.body.prefix(120)) },
+                lastActiveAt: recent.last.map { Date(timeIntervalSince1970: Double($0.ts) / 1000) } ?? Date.distantPast,
+                unreadCount: 0
+            ))
+        }
+        for g in payload.groups {
+            let id = "group:\(g.id)"
+            let recent = (byThread[id] ?? []).sorted { $0.ts < $1.ts }
+            convs.append(Conversation(
+                id: id,
+                title: g.title.isEmpty ? "Unnamed group" : g.title,
+                peer: SignalAddress(groupId: "group.\(g.id)"),
+                lastMessagePreview: recent.last.map { String($0.body.prefix(120)) },
+                lastActiveAt: recent.last.map { Date(timeIntervalSince1970: Double($0.ts) / 1000) } ?? Date.distantPast,
+                unreadCount: 0
+            ))
+        }
+        return convs.sorted { $0.lastActiveAt > $1.lastActiveAt }
+    }
+
+    public func chatMessage(_ m: RosterPayload.Message) -> ChatMessage {
+        let id: UUID
+        if let existing = uuidCache[m.key] {
+            id = existing
+        } else {
+            let fresh = UUID()
+            uuidCache[m.key] = fresh
+            id = fresh
+        }
+        let isGroup = m.thread.hasPrefix("group:")
+        return ChatMessage(
+            id: id,
+            conversationId: m.thread,
+            author: SignalAddress(
+                uuidString: m.outgoing ? nil : m.sender,
+                groupId: isGroup ? m.thread : nil
+            ),
+            body: m.body.isEmpty ? "[attachment]" : m.body,
+            direction: m.outgoing ? .outgoing : .incoming,
+            status: m.outgoing ? .sent : .delivered,
+            sentAt: Date(timeIntervalSince1970: Double(m.ts) / 1000)
+        )
+    }
+
+    private func rosterData() async throws -> Data {
+        let sym = try await initCore()
+        guard let ptr = sym.roster() else {
+            throw SignalError.network("roster failed: \(lastError(sym))")
+        }
+        defer { sym.freeString(ptr) }
+        guard let data = String(cString: ptr).data(using: .utf8) else {
+            throw SignalError.storage("roster is not UTF-8")
+        }
+        return data
+    }
+
+    private func drainEvents() {
+        guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else { return }
+        while let ptr = sym.pollEvent() {
+            defer { sym.freeString(ptr) }
+            let text = String(cString: ptr)
+            guard let data = text.data(using: .utf8),
+                  let event = try? JSONDecoder().decode(LiveEvent.self, from: data),
+                  event.type == "message",
+                  let msg = event.message else { continue }
+            messageCache[msg.key] = msg
+            incomingContinuation.yield(chatMessage(msg))
+        }
     }
 
     private func initCore() async throws -> Symbols {
@@ -208,6 +396,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let b = dlsym(handle, "core_cmd_begin_link"),
               let p = dlsym(handle, "core_cmd_poll_link"),
               let l = dlsym(handle, "core_cmd_is_linked"),
+              let r = dlsym(handle, "core_cmd_roster"),
+              let s = dlsym(handle, "core_cmd_send"),
+              let q = dlsym(handle, "core_cmd_request_contacts"),
+              let y = dlsym(handle, "core_cmd_start_sync"),
+              let v = dlsym(handle, "core_cmd_poll_event"),
               let e = dlsym(handle, "core_last_error"),
               let f = dlsym(handle, "core_free_string") else { return nil }
         return Symbols(
@@ -215,6 +408,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             beginLink: unsafeBitCast(b, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             pollLink: unsafeBitCast(p, to: (@convention(c) () -> Int32).self),
             isLinked: unsafeBitCast(l, to: (@convention(c) () -> Int32).self),
+            roster: unsafeBitCast(r, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
+            send: unsafeBitCast(s, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int64).self),
+            requestContacts: unsafeBitCast(q, to: (@convention(c) () -> Int32).self),
+            startSync: unsafeBitCast(y, to: (@convention(c) () -> Int32).self),
+            pollEvent: unsafeBitCast(v, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             lastError: unsafeBitCast(e, to: (@convention(c) () -> UnsafePointer<CChar>?).self),
             freeString: unsafeBitCast(f, to: (@convention(c) (UnsafeMutablePointer<CChar>?) -> Void).self)
         )
