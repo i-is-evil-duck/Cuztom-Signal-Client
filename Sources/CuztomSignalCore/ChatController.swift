@@ -8,7 +8,7 @@ import Foundation
 /// M1 swaps the injected service from `MockSignalService` to `RustCoreService`
 /// with no changes to this class.
 @MainActor
-public final class ChatController {
+public final class ChatController: @unchecked Sendable {
     public private(set) var connection: ConnectionState = .unlinked
     public private(set) var conversations: [Conversation] = []
     public private(set) var selectedId: String?
@@ -137,6 +137,20 @@ public final class ChatController {
         }
     }
 
+    /// Ask the phone to re-send contacts/groups (live backend only).
+    public func requestSync() async -> Bool {
+        guard let live = service as? RustCoreService else { return false }
+        do {
+            try await live.requestContactSync()
+            Log.info("contact sync requested")
+            return true
+        } catch {
+            lastError = String(describing: error)
+            Log.error("contact sync failed: \(error)")
+            return false
+        }
+    }
+
     /// Log out of Signal (wipes keys/session) and reset local state.
     /// Next `link()` shows a fresh QR.
     public func logout() async -> Bool {
@@ -213,12 +227,90 @@ public final class ChatController {
         }
     }
 
+    /// Send text, or run a `/command` through `plugins` (reply is ephemeral).
+    public func sendOrCommand(_ body: String, plugins: PluginHost, ctx: PluginContext) async {
+        if body.hasPrefix("/") {
+            switch await plugins.handleInput(body, ctx: ctx) {
+            case .sendOriginal:
+                break
+            case .reply(let text):
+                await injectEphemeral(text)
+                return
+            case .silent:
+                return
+            }
+        }
+        await send(body)
+    }
+
+    /// Grow the open thread by one more history page (see `fetchMessages`).
+    public func loadMore(chunk: Int = 100) async {
+        guard let id = selectedId else { return }
+        let current = await store.messageCount(in: id)
+        do {
+            let merged = try await service.fetchMessages(conversationId: id, limit: current + chunk)
+            for m in merged { await store.saveMessage(m) }
+            messages = await store.messages(in: id)
+            Log.info("loadMore \(id): \(messages.count) messages")
+        } catch {
+            lastError = String(describing: error)
+            Log.error("loadMore failed: \(error)")
+        }
+    }
+
+    public func messages(in id: String, limit: Int = 200) async -> [ChatMessage] {
+        await store.messages(in: id, limit: limit)
+    }
+
+    /// On-demand attachment download for metadata-only rows.
+    @discardableResult
+    public func downloadAttachment(messageId: UUID, index: Int) async -> Bool {
+        guard let live = service as? RustCoreService,
+              let stored = await store.message(id: messageId),
+              stored.attachments.indices.contains(index) else { return false }
+        do {
+            let url = try await live.fetchAttachment(
+                thread: stored.conversationId,
+                ts: Int64(stored.sentAt.timeIntervalSince1970 * 1000),
+                index: index
+            )
+            await store.updateMessage(id: messageId) { $0.attachments[index].localURL = url }
+            if stored.conversationId == selectedId {
+                messages = await store.messages(in: stored.conversationId)
+            }
+            Log.info("attachment saved: \(url.lastPathComponent)")
+            return true
+        } catch {
+            lastError = String(describing: error)
+            Log.error("attachment fetch failed: \(error)")
+            return false
+        }
+    }
+
     /// Append an inbound message (websocket callback target in M1).
     public func receive(_ message: ChatMessage) async {
         await store.saveMessage(message)
         conversations = await store.allConversations()
         if message.conversationId == selectedId {
             messages = await store.messages(in: message.conversationId)
+        }
+    }
+
+    /// Ephemeral local message (plugin replies). Shown in the open thread
+    /// only — never persisted, never sent.
+    public func injectEphemeral(_ body: String, threadId: String? = nil) async {
+        let target = threadId ?? selectedId
+        guard let target else { return }
+        let msg = ChatMessage(
+            conversationId: target,
+            author: SignalAddress(uuidString: "plugin"),
+            body: body,
+            direction: .incoming,
+            status: .read,
+            sentAt: Date()
+        )
+        if target == selectedId {
+            messages.append(msg)
         }
     }
 

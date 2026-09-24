@@ -90,8 +90,45 @@ final class ChatViewModel {
     }
 
     func send(_ body: String) async {
-        await controller?.send(body)
+        guard let controller else { return }
+        if body.hasPrefix("/") {
+            await controller.sendOrCommand(body, plugins: plugins, ctx: pluginCtx())
+            sync()
+            return
+        }
+        await controller.send(body)
         sync()
+    }
+
+    func loadMore() async {
+        await controller?.loadMore()
+        sync()
+    }
+
+    func downloadAttachment(messageId: UUID, index: Int) async {
+        await controller?.downloadAttachment(messageId: messageId, index: index)
+        sync()
+    }
+
+    private let plugins = PluginHost(plugins: [InfoPlugin()])
+
+    private func pluginCtx() -> PluginContext {
+        // `controller`/`liveService` are Sendable; safe to capture.
+        let c = controller
+        let live = liveService
+        return PluginContext(
+            conversations: { await c?.conversations ?? [] },
+            recentMessages: { id, n in await c?.messages(in: id, limit: n) ?? [] },
+            diagnostics: { await c?.diagnostics() ?? "not started" },
+            account: {
+                if let me = try? await live?.whoami() {
+                    return "\(me.number) · \(String(me.aci.prefix(8)))"
+                }
+                return "unknown"
+            },
+            rosterSummary: { live?.lastRosterSummary ?? "no live backend" },
+            requestSync: { await c?.requestSync() ?? false }
+        )
     }
 
     func refreshNow() async {
@@ -101,15 +138,14 @@ final class ChatViewModel {
 
     /// Ask the phone to re-send contacts/groups, then refresh.
     func requestSync() async {
-        guard let c = controller, let live = liveService else { return }
+        guard let c = controller else { return }
         syncNote = "sync requested…"
-        do {
-            try await live.requestContactSync()
+        if await c.requestSync() {
             syncNote = "request sent, waiting for phone…"
             Log.info("manual contact sync requested")
-        } catch {
+        } else {
             syncNote = "request failed"
-            Log.error("manual sync failed: \(error)")
+            Log.error("manual sync failed")
         }
         await c.refreshNow()
         sync()

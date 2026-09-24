@@ -55,3 +55,35 @@ private let rosterFixture = """
     #expect(event.type == "message")
     #expect(event.message?.body == "hi")
 }
+
+@Test func attachmentMetadataMaps() throws {
+    let json = """
+    {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],
+     "messages":[{
+      "key":"k","thread":"contact:x","sender":"x","sender_name":"X",
+      "body":"","ts":9,"outgoing":false,
+      "attachments":[
+        {"name":"photo.jpg","mime":"image/jpeg","size":123,"path":"/tmp/photo.jpg"},
+        {"name":"big.mov","mime":"video/quicktime","size":999,"path":null}]}]}
+    """
+    let svc = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
+    let payload = try JSONDecoder().decode(RosterPayload.self, from: Data(json.utf8))
+    let msg = svc.chatMessage(payload.messages[0])
+    #expect(msg.attachments.count == 2)
+    #expect(msg.attachments[0].localURL?.path == "/tmp/photo.jpg")
+    #expect(msg.attachments[1].localURL == nil)
+    #expect(msg.body == "[attachment]")
+}
+
+@Test func storeUpdatesMessageInPlace() async {
+    let store = MessageStore()
+    let msg = ChatMessage(conversationId: "c1", author: SignalAddress(phone: "+1"),
+                          body: "hi", direction: .incoming)
+    await store.saveMessage(msg)
+    let found = await store.message(id: msg.id)
+    #expect(found?.body == "hi")
+    let ok = await store.updateMessage(id: msg.id) { $0.body = "edited" }
+    #expect(ok)
+    #expect(await store.message(id: msg.id)?.body == "edited")
+    #expect(!(await store.updateMessage(id: UUID()) { $0.body = "x" }))
+}

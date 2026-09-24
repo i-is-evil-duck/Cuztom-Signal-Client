@@ -57,6 +57,29 @@ public actor MessageStore {
         messages[conversationId]?.count ?? 0
     }
 
+    public func message(id: UUID) -> ChatMessage? {
+        for list in messages.values {
+            if let found = list.first(where: { $0.id == id }) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    /// Replace a message in place (attachment progress, status updates).
+    /// Returns false when the id is unknown.
+    @discardableResult
+    public func updateMessage(id: UUID, transform: @Sendable (inout ChatMessage) -> Void) -> Bool {
+        for (thread, var list) in messages {
+            if let idx = list.firstIndex(where: { $0.id == id }) {
+                transform(&list[idx])
+                messages[thread] = list
+                return true
+            }
+        }
+        return false
+    }
+
     public func totalMessageCount() -> Int {
         messages.values.reduce(0) { $0 + $1.count }
     }

@@ -27,11 +27,45 @@ public struct RosterPayload: Decodable, Sendable {
         public var body: String
         public var ts: Int64
         public var outgoing: Bool
+        public var attachments: [WireAttachment]
 
         private enum CodingKeys: String, CodingKey {
-            case key, thread, sender, body, ts, outgoing
+            case key, thread, sender, body, ts, outgoing, attachments
             case senderName = "sender_name"
         }
+
+        public init(
+            key: String, thread: String, sender: String, senderName: String,
+            body: String, ts: Int64, outgoing: Bool, attachments: [WireAttachment] = []
+        ) {
+            self.key = key
+            self.thread = thread
+            self.sender = sender
+            self.senderName = senderName
+            self.body = body
+            self.ts = ts
+            self.outgoing = outgoing
+            self.attachments = attachments
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            key = try c.decode(String.self, forKey: .key)
+            thread = try c.decode(String.self, forKey: .thread)
+            sender = try c.decode(String.self, forKey: .sender)
+            senderName = try c.decode(String.self, forKey: .senderName)
+            body = try c.decode(String.self, forKey: .body)
+            ts = try c.decode(Int64.self, forKey: .ts)
+            outgoing = try c.decode(Bool.self, forKey: .outgoing)
+            attachments = try c.decodeIfPresent([WireAttachment].self, forKey: .attachments) ?? []
+        }
+    }
+
+    public struct WireAttachment: Decodable, Sendable {
+        public var name: String
+        public var mime: String
+        public var size: Int
+        public var path: String?
     }
     public var thisDevice: SelfInfo
     public var contacts: [Contact]
@@ -187,9 +221,54 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     public func fetchMessages(conversationId: String, limit: Int) async throws -> [ChatMessage] {
         guard linked || isLinkedNow() else { throw SignalError.notLinked }
-        let cached = messageCache.values.filter { $0.thread == conversationId }
-            .sorted { $0.ts < $1.ts }
+        // Merge the seed roster with older pages until `limit` is satisfied.
+        // History only goes back to link time — Signal never syncs older
+        // messages to a new linked device (protocol limitation, not a bug).
+        var cached = threadCache(conversationId)
+        if cached.count < limit {
+            let before: UInt64 = cached.first.map { UInt64(bitPattern: $0.ts) } ?? UInt64.max
+            if let page = try? await threadPage(conversationId, limit: limit, before: before) {
+                for m in page { messageCache[m.key] = m }
+                cached = threadCache(conversationId)
+            }
+        }
         return Array(cached.suffix(limit)).map { chatMessage($0) }
+    }
+
+    private func threadCache(_ conversationId: String) -> [RosterPayload.Message] {
+        messageCache.values.filter { $0.thread == conversationId }.sorted { $0.ts < $1.ts }
+    }
+
+    private struct ThreadPage: Decodable {
+        var messages: [RosterPayload.Message]
+    }
+
+    private func threadPage(_ thread: String, limit: Int, before: UInt64) async throws -> [RosterPayload.Message] {
+        let sym = try await initCore()
+        var ptr: UnsafeMutablePointer<CChar>? = nil
+        thread.withCString { t in
+            ptr = sym.threadPage(t, UInt64(limit), before)
+        }
+        guard let ptr else { throw SignalError.network("thread page failed: \(lastError(sym))") }
+        defer { sym.freeString(ptr) }
+        guard let data = String(cString: ptr).data(using: .utf8) else {
+            throw SignalError.storage("thread page is not UTF-8")
+        }
+        return try JSONDecoder().decode(ThreadPage.self, from: data).messages
+    }
+
+    /// On-demand attachment download for roster-seeded (metadata-only) rows.
+    public func fetchAttachment(thread: String, ts: Int64, index: Int) async throws -> URL {
+        let sym = try await initCore()
+        var ptr: UnsafeMutablePointer<CChar>? = nil
+        thread.withCString { t in
+            ptr = sym.fetchAttachment(t, UInt64(bitPattern: ts), UInt64(index))
+        }
+        guard let ptr else {
+            throw SignalError.network("attachment fetch failed: \(lastError(sym))")
+        }
+        defer { sym.freeString(ptr) }
+        return URL(fileURLWithPath: String(cString: ptr))
     }
 
     public func sendText(_ body: String, to conversationId: String) async throws -> ChatMessage {
@@ -295,6 +374,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let requestContacts: @convention(c) () -> Int32
         let startSync: @convention(c) () -> Int32
         let pollEvent: @convention(c) () -> UnsafeMutablePointer<CChar>?
+        let threadPage: @convention(c) (UnsafePointer<CChar>, UInt64, UInt64) -> UnsafeMutablePointer<CChar>?
+        let fetchAttachment: @convention(c) (UnsafePointer<CChar>, UInt64, UInt64) -> UnsafeMutablePointer<CChar>?
         let whoami: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let logout: @convention(c) () -> Int32
         let lastError: @convention(c) () -> UnsafePointer<CChar>?
@@ -360,6 +441,15 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             id = fresh
         }
         let isGroup = m.thread.hasPrefix("group:")
+        var metas: [AttachmentMeta] = []
+        for a in m.attachments {
+            metas.append(AttachmentMeta(
+                filename: a.name,
+                mimeType: a.mime,
+                byteCount: a.size,
+                localURL: a.path.map { URL(fileURLWithPath: $0) }
+            ))
+        }
         return ChatMessage(
             id: id,
             conversationId: m.thread,
@@ -367,10 +457,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 uuidString: m.outgoing ? nil : m.sender,
                 groupId: isGroup ? m.thread : nil
             ),
-            body: m.body.isEmpty ? "[attachment]" : m.body,
+            body: m.body.isEmpty ? (metas.isEmpty ? "" : "[attachment]") : m.body,
             direction: m.outgoing ? .outgoing : .incoming,
             status: m.outgoing ? .sent : .delivered,
-            sentAt: Date(timeIntervalSince1970: Double(m.ts) / 1000)
+            sentAt: Date(timeIntervalSince1970: Double(m.ts) / 1000),
+            attachments: metas
         )
     }
 
@@ -456,6 +547,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let q = dlsym(handle, "core_cmd_request_contacts"),
               let y = dlsym(handle, "core_cmd_start_sync"),
               let v = dlsym(handle, "core_cmd_poll_event"),
+              let t = dlsym(handle, "core_cmd_thread"),
+              let a = dlsym(handle, "core_cmd_fetch_attachment"),
               let w = dlsym(handle, "core_cmd_whoami"),
               let o = dlsym(handle, "core_cmd_logout"),
               let e = dlsym(handle, "core_last_error"),
@@ -470,6 +563,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             requestContacts: unsafeBitCast(q, to: (@convention(c) () -> Int32).self),
             startSync: unsafeBitCast(y, to: (@convention(c) () -> Int32).self),
             pollEvent: unsafeBitCast(v, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
+            threadPage: unsafeBitCast(t, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UInt64) -> UnsafeMutablePointer<CChar>?).self),
+            fetchAttachment: unsafeBitCast(a, to: (@convention(c) (UnsafePointer<CChar>, UInt64, UInt64) -> UnsafeMutablePointer<CChar>?).self),
             whoami: unsafeBitCast(w, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             logout: unsafeBitCast(o, to: (@convention(c) () -> Int32).self),
             lastError: unsafeBitCast(e, to: (@convention(c) () -> UnsafePointer<CChar>?).self),

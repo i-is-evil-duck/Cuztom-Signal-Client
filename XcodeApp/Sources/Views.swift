@@ -1,5 +1,7 @@
 import SwiftUI
+import AppKit
 import CoreImage.CIFilterBuiltins
+import CuztomSignalCore
 
 struct ContentView: View {
     @Environment(ChatViewModel.self) private var vm
@@ -94,30 +96,36 @@ struct SidebarView: View {
 struct MessageListView: View {
     @Environment(ChatViewModel.self) private var vm
     @State private var draft = ""
+    @State private var loadingMore = false
 
     var body: some View {
         VStack(spacing: 0) {
             if !vm.isLinked {
                 LinkDeviceView()
             } else {
+                if vm.selectedId != nil {
+                    Button(loadingMore ? "Loading…" : "Load older messages") {
+                        loadingMore = true
+                        Task {
+                            await vm.loadMore()
+                            loadingMore = false
+                        }
+                    }
+                    .font(.caption)
+                    .padding(.top, 8)
+                    .disabled(loadingMore)
+                }
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(vm.messages, id: \.id) { msg in
-                            HStack {
-                                if msg.direction == .outgoing { Spacer() }
-                                Text(msg.body)
-                                    .padding(8)
-                                    .background(msg.direction == .outgoing ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.15))
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                if msg.direction == .incoming { Spacer() }
-                            }
+                            MessageRow(msg: msg)
                         }
                     }
                     .padding()
                 }
                 Divider()
                 HStack {
-                    TextField("Message", text: $draft)
+                    TextField("Message  (/help for commands)", text: $draft)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { send() }
                     Button("Send") { send() }
@@ -134,6 +142,85 @@ struct MessageListView: View {
         guard !body.isEmpty else { return }
         draft = ""
         Task { await vm.send(body) }
+    }
+}
+
+struct MessageRow: View {
+    @Environment(ChatViewModel.self) private var vm
+    var msg: ChatMessage
+
+    var body: some View {
+        HStack {
+            if msg.direction == .outgoing { Spacer() }
+            VStack(alignment: .leading, spacing: 4) {
+                if !msg.body.isEmpty {
+                    Text(msg.body)
+                }
+                ForEach(Array(msg.attachments.enumerated()), id: \.offset) { idx, att in
+                    AttachmentRow(msg: msg, index: idx, att: att)
+                }
+            }
+            .padding(8)
+            .background(msg.direction == .outgoing ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.15))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            if msg.direction == .incoming { Spacer() }
+        }
+    }
+}
+
+struct AttachmentRow: View {
+    @Environment(ChatViewModel.self) private var vm
+    var msg: ChatMessage
+    var index: Int
+    var att: AttachmentMeta
+
+    var body: some View {
+        Group {
+            if att.mimeType.hasPrefix("image/"), let url = att.localURL,
+               let img = NSImage(contentsOf: url) {
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxHeight: 240)
+                    .cornerRadius(6)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: icon)
+                    VStack(alignment: .leading) {
+                        Text(att.filename).font(.subheadline).lineLimit(1)
+                        Text("\(att.mimeType) · \(sizeString)").font(.caption).foregroundStyle(.secondary)
+                    }
+                    if att.localURL != nil {
+                        Button("Reveal") {
+                            if let url = att.localURL {
+                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                            }
+                        }
+                        .font(.caption)
+                    } else {
+                        Button("Download") {
+                            Task { await vm.downloadAttachment(messageId: msg.id, index: index) }
+                        }
+                        .font(.caption)
+                    }
+                }
+                .padding(6)
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(6)
+            }
+        }
+    }
+
+    private var icon: String {
+        if att.mimeType.hasPrefix("video/") { return "film" }
+        if att.mimeType.hasPrefix("audio/") { return "waveform" }
+        return "doc"
+    }
+
+    private var sizeString: String {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f.string(fromByteCount: Int64(att.byteCount))
     }
 }
 

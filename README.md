@@ -81,32 +81,70 @@ has `InMemorySecretStore` (tests) and `KeychainSecretStore` (prod).
 ### M5 — Ship
 Notarized DMG, Sparkle updater, crash reports, menu-bar badge, notifications, launch-at-login (websocket keepalive), docs.
 
-## Tests
+## Backlog — still to implement + test
 
-| Layer | Where | Run |
+Honest status as of the M1b sync build. Checked = done, open = not yet.
+
+### History
+- [x] Roster seed: last 100 messages/thread from the local store
+- [x] `Load older messages` paging (`core_cmd_thread`, merged by stable key)
+- [ ] Known limit: **Signal never syncs pre-link history** to a new linked
+  device (protocol, not a bug). History accumulates from link time forward.
+- [ ] Test: page a 500-message thread end-to-end, verify no dupes/gaps
+
+### Attachments
+- [x] Metadata in every message (`name/mime/size`); auto-download ≤25 MB on
+  arrival into `~/Library/Caches/CuztomSignal`
+- [x] Inline image rendering; file chips with Download/Reveal
+- [x] On-demand fetch for roster-seeded rows (`core_cmd_fetch_attachment`)
+- [ ] Send path for attachments (camera/file picker → CDN upload) — M2
+- [ ] Test: 20 MB video round-trip; oversized file stays metadata-only;
+  reveal-in-Finder from a downloaded row
+
+### Plugins
+- [x] `PluginHost` + `ChatPlugin` protocol (`/help`, unknown-command reply)
+- [x] Built-in `InfoPlugin`: `/info /account /roster /diag /sync
+  /thread <id> [n] /log` — read-only except `/sync`
+- [x] Slash routing in the message field; replies are ephemeral (never stored/sent)
+- [ ] `onMessage` hooks used by a real plugin (e.g. keyword notifier)
+- [ ] Test: host with two plugins, command collision → first registered wins
+
+### Correctness / polish backlog
+- [ ] Reactions, replies, edits, disappearing timers, read receipts (M3)
+- [ ] Calls via RingRTC (M4 — biggest milestone, separate module)
+- [ ] Keychain-backed sqlite passphrase (currently unencrypted at rest)
+- [ ] Notarized DMG + Sparkle updates (M5)
+- [ ] Group admin ops (title/avatar/member add/remove)
+- [ ] Message search across threads
+- [ ] Notifications + badge + launch-at-login
+- [ ] `onMessage` plugin fan-out wired into the receive path
+
+### Test matrix
+| Layer | Command | Status |
 |---|---|---|
-| Core unit (models, store, controller flow, mock link/send, secrets, rust seam) | `Tests/CuztomSignalCoreTests` | `swift test` |
-| UI smoke (link -> select thread -> send) | `XcodeApp` previews + manual | open in Xcode, run |
-| Rust core (M1+: link, sync, round-trip) | `rust-core/` | `cargo test` (needs rustup) |
-| Integration (M1+: two test devices) | manual + `presage-cli` | `cargo run -p presage-cli -- link-device`, `receive` |
-
-Current status: `swift test` passes 12/12 on CLT (no Xcode required for Core).
-Rust 1.98 via rustup; `cargo fetch` validating `presage` git deps. Xcode
-still downloading — `XcodeApp/` compiles only under full Xcode (SwiftUI macros).
+| Swift unit (Core) | `swift test` | 28 tests, green with fresh dylib |
+| Rust unit (FFI) | `cargo test` (in `rust-core/`) | 3 tests, green |
+| Live link + resume | manual, real phone | done (user-verified) |
+| Roster + live receive | manual | done (6 convs, `queue_empty`) |
+| 500-msg paging | manual | TODO |
+| Attachment round-trip | manual | TODO |
+| Logout → fresh QR | manual | TODO (Settings → Log out) |
 
 ## Commands
 
 ```bash
-swift build
-swift test
-# M1+ (after installing Rust):
-# cd rust-core && cargo build && ./build-xcframework.sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+swift build --product CuztomSignal
+swift test            # Core unit tests (28)
+cd rust-core && cargo test   # FFI unit tests (3)
 ```
 
-> Note: `XcodeApp/` (SwiftUI) requires full Xcode — Command Line Tools alone
-> can't expand SwiftUI macros (`StateMacro` plugin missing), so it is kept
-> out of `Package.swift` until you open it in Xcode. `swift build/test`
-> covers `CuztomSignalCore` only.
+> Full Xcode is required (SwiftUI + swift-testing macros don't expand under
+> CLT alone). The runnable app is the `CuztomSignal` executable; the
+> double-clickable `CuztomSignal.app` bundle is assembled by copying the
+> binary + `rust-core/target/release/libcuztom_signal_core.dylib` into
+> `CuztomSignal.app/Contents/MacOS/` and ad-hoc signing (bundle is
+> gitignored, rebuilt locally).
 
 ## Repo layout
 

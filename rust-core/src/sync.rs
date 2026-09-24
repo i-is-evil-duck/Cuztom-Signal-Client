@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use presage::libsignal_service::content::{Content, ContentBody};
+use presage::libsignal_service::content::{AttachmentPointer, Content, ContentBody};
 use presage::libsignal_service::proto::sync_message::Content as SyncContent;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::manager::Registered;
@@ -46,13 +46,14 @@ fn display_name(names: &HashMap<String, String>, uuid: &str) -> String {
     uuid.chars().take(8).collect()
 }
 
-/// Convert one decrypted `Content` into a wire message. Returns `None` for
-/// non-chat traffic (receipts, typing, calls… — M3/M4 territory).
-pub fn content_event(
+/// Convert one decrypted `Content` into a wire message plus its raw
+/// attachment pointers (downloaded separately by the caller).
+/// Returns `None` for non-chat traffic (receipts, typing, calls…).
+pub fn content_parts(
     content: &Content,
     self_aci: &str,
     names: &HashMap<String, String>,
-) -> Option<serde_json::Value> {
+) -> Option<(serde_json::Value, Vec<AttachmentPointer>)> {
     let meta = &content.metadata;
     let sender = service_uuid(&meta.sender);
     let ts = meta.server_timestamp.timestamp_millis().max(0) as u64;
@@ -73,15 +74,15 @@ pub fn content_event(
                 }
                 Thread::Group(key) => format!("group:{}", hex::encode(key)),
             };
-            Some(message_json(&thread_id, &sender, names, &body, ts, outgoing))
+            let pointers = m.attachments.clone();
+            Some((message_json(&thread_id, &sender, names, &body, ts, outgoing, &pointers), pointers))
         }
         ContentBody::SynchronizeMessage(s) => {
-            let body = match &s.content {
-                Some(SyncContent::Sent(sent)) => sent
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.body.clone())
-                    .unwrap_or_default(),
+            let (body, pointers) = match &s.content {
+                Some(SyncContent::Sent(sent)) => (
+                    sent.message.as_ref().and_then(|m| m.body.clone()).unwrap_or_default(),
+                    sent.message.as_ref().map(|m| m.attachments.clone()).unwrap_or_default(),
+                ),
                 _ => return None,
             };
             // Canonical thread derivation (sync-sent, group, 1:1).
@@ -90,10 +91,19 @@ pub fn content_event(
                 Thread::Contact(sid) => format!("contact:{}", service_uuid(sid)),
                 Thread::Group(key) => format!("group:{}", hex::encode(key)),
             };
-            Some(message_json(&thread_id, self_aci, names, &body, ts, true))
+            Some((message_json(&thread_id, self_aci, names, &body, ts, true, &pointers), pointers))
         }
         _ => None,
     }
+}
+
+/// Backwards-compatible single-value form (roster snapshots: metadata only).
+pub fn content_event(
+    content: &Content,
+    self_aci: &str,
+    names: &HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    content_parts(content, self_aci, names).map(|(v, _)| v)
 }
 
 fn message_json(
@@ -103,6 +113,7 @@ fn message_json(
     body: &str,
     ts: u64,
     outgoing: bool,
+    pointers: &[AttachmentPointer],
 ) -> serde_json::Value {
     serde_json::json!({
         "key": format!("{thread}/{ts}/{sender}"),
@@ -112,7 +123,160 @@ fn message_json(
         "body": body,
         "ts": ts,
         "outgoing": outgoing,
+        "attachments": pointers.iter().map(attachment_meta).collect::<Vec<_>>(),
     })
+}
+
+/// Metadata-only attachment descriptor (`path` filled after download).
+fn attachment_meta(p: &AttachmentPointer) -> serde_json::Value {
+    serde_json::json!({
+        "name": p.file_name.clone().unwrap_or_else(|| "attachment".to_string()),
+        "mime": p.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+        "size": p.size.unwrap_or(0),
+        "path": null,
+    })
+}
+
+/// Max auto-download per attachment (25 MB); larger stay metadata-only.
+pub const MAX_AUTO_DOWNLOAD_BYTES: u32 = 25_000_000;
+
+fn caches_dir() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join("Library/Caches/CuztomSignal"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("CuztomSignal"))
+}
+
+fn attachment_path(thread_id: &str, ts: u64, index: usize, name: &str) -> std::path::PathBuf {
+    let safe_thread: String = thread_id
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let safe_name: String = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment")
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    caches_dir().join(format!("{safe_thread}-{ts}-{index}-{safe_name}"))
+}
+
+/// Download one attachment through the live manager, store under Caches,
+/// return the absolute path. Skips oversized bodies.
+pub async fn download_attachment(
+    manager: &mut StoredManager,
+    ptr: &AttachmentPointer,
+    thread_id: &str,
+    ts: u64,
+    index: usize,
+) -> Result<Option<String>, String> {
+    let size = ptr.size.unwrap_or(0);
+    if size > MAX_AUTO_DOWNLOAD_BYTES {
+        return Ok(None);
+    }
+    let name = ptr.file_name.clone().unwrap_or_else(|| "attachment".to_string());
+    let dest = attachment_path(thread_id, ts, index, &name);
+    if dest.exists() {
+        return Ok(Some(dest.to_string_lossy().into_owned()));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cache dir: {e}"))?;
+    }
+    let bytes = manager
+        .get_attachment(ptr)
+        .await
+        .map_err(|e| format!("download: {e}"))?;
+    std::fs::write(&dest, &bytes).map_err(|e| format!("cache write: {e}"))?;
+    Ok(Some(dest.to_string_lossy().into_owned()))
+}
+
+/// Parse a wire thread id back into a store `Thread`.
+pub fn parse_thread(thread_id: &str) -> Result<Thread, String> {
+    if let Some(hexkey) = thread_id.strip_prefix("group:") {
+        let bytes = hex::decode(hexkey).map_err(|_| "bad group id".to_string())?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| "bad group id".to_string())?;
+        Ok(Thread::Group(arr))
+    } else if let Some(uuid) = thread_id.strip_prefix("contact:") {
+        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
+        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
+        Ok(Thread::Contact(ServiceId::Aci(Aci::from(parsed))))
+    } else {
+        Err("bad thread id".to_string())
+    }
+}
+
+/// Page of messages for one thread (newest `limit` older than `before_ts`;
+/// `before_ts == u64::MAX` means latest). Metadata only — attachments fetch
+/// on demand via `fetch_attachment`.
+pub async fn thread_page(
+    store: &SqliteStore,
+    thread_id: &str,
+    limit: usize,
+    before_ts: u64,
+) -> Result<String, String> {
+    let reg = store
+        .load_registration_data()
+        .await
+        .map_err(|e| format!("registration: {e}"))?
+        .ok_or_else(|| "not linked".to_string())?;
+    let self_aci = reg.service_ids.aci.to_string();
+    let names = load_names(store).await;
+    let thread = parse_thread(thread_id)?;
+    let mut msgs: Vec<Content> = store
+        .messages(&thread, ..before_ts)
+        .await
+        .map_err(|e| format!("messages: {e}"))?
+        .filter_map(|m| m.ok())
+        .collect();
+    msgs.sort_by_key(|m| m.metadata.server_timestamp);
+    let page: Vec<serde_json::Value> = msgs
+        .iter()
+        .rev()
+        .take(limit)
+        .rev()
+        .filter_map(|m| content_event(m, &self_aci, &names))
+        .collect();
+    serde_json::to_string(&serde_json::json!({ "messages": page }))
+        .map_err(|e| format!("encode thread: {e}"))
+}
+
+/// Download attachment `index` of the message at `ts` in `thread_id`.
+pub async fn fetch_attachment(
+    manager: &mut StoredManager,
+    thread_id: &str,
+    ts: u64,
+    index: usize,
+) -> Result<String, String> {
+    let thread = parse_thread(thread_id)?;
+    let store = manager.store().clone();
+    let mut msgs: Vec<Content> = store
+        .messages(&thread, ..)
+        .await
+        .map_err(|e| format!("messages: {e}"))?
+        .filter_map(|m| m.ok())
+        .collect();
+    msgs.sort_by_key(|m| m.metadata.server_timestamp);
+    let target = msgs.iter().find(|m| {
+        let t = m.metadata.server_timestamp.timestamp_millis().max(0) as u64;
+        t == ts
+    });
+    let content = target.ok_or_else(|| "message not found".to_string())?;
+    let pointers: Vec<AttachmentPointer> = match &content.body {
+        ContentBody::DataMessage(m) => m.attachments.clone(),
+        ContentBody::SynchronizeMessage(s) => match &s.content {
+            Some(SyncContent::Sent(sent)) => sent
+                .message
+                .as_ref()
+                .map(|m| m.attachments.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let ptr = pointers.get(index).ok_or_else(|| "no such attachment".to_string())?;
+    download_attachment(manager, ptr, thread_id, ts, index)
+        .await?
+        .ok_or_else(|| "attachment too large to auto-fetch".to_string())
 }
 
 /// uuid-string -> display name for every synced contact.
@@ -173,6 +337,8 @@ pub async fn build_roster(store: &SqliteStore) -> Result<String, String> {
             Thread::Contact(sid) => format!("contact:{}", service_uuid(sid)),
             Thread::Group(key) => format!("group:{}", hex::encode(key)),
         };
+        // Seed window per thread (older history pages via `thread_page`).
+        const SEED_WINDOW: usize = 100;
         let mut thread_msgs: Vec<Content> = store
             .messages(&thread, ..)
             .await
@@ -180,7 +346,7 @@ pub async fn build_roster(store: &SqliteStore) -> Result<String, String> {
             .filter_map(|m| m.ok())
             .collect();
         thread_msgs.sort_by_key(|m| m.metadata.server_timestamp);
-        for m in thread_msgs.iter().rev().take(50).rev() {
+        for m in thread_msgs.iter().rev().take(SEED_WINDOW).rev() {
             if let Some(ev) = content_event(m, &self_aci, &names) {
                 // content_event derives the thread from the envelope; it must
                 // agree with the queried thread or the row is misfiled.

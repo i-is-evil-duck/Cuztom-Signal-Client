@@ -66,6 +66,18 @@ enum Command {
         body: String,
         reply: oneshot::Sender<Result<u64, String>>,
     },
+    ThreadPage {
+        thread_id: String,
+        limit: usize,
+        before_ts: u64,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    FetchAttachment {
+        thread_id: String,
+        ts: u64,
+        index: usize,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -81,6 +93,12 @@ enum LoopCtrl {
         thread: String,
         body: String,
         reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
+    FetchAttachment {
+        thread_id: String,
+        ts: u64,
+        index: usize,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
 }
 
@@ -208,6 +226,14 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                         }
                         Command::Send { thread, body, reply } => {
                             let result = cmd_send(&mut state, &thread, &body).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::ThreadPage { thread_id, limit, before_ts, reply } => {
+                            let result = cmd_thread_page(&state, &thread_id, limit, before_ts).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::FetchAttachment { thread_id, ts, index, reply } => {
+                            let result = cmd_fetch_attachment(&mut state, &thread_id, ts, index).await;
                             let _ = reply.send(result);
                         }
                         Command::Logout { reply } => {
@@ -415,9 +441,49 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                     let r = sync::do_send(&mut manager, &thread, &body).await;
                                     let _ = reply.send(r);
                                 }
+                                Some(LoopCtrl::FetchAttachment { thread_id, ts, index, reply }) => {
+                                    let r = sync::fetch_attachment(&mut manager, &thread_id, ts, index).await;
+                                    let _ = reply.send(r);
+                                }
                                 None => break,
                             },
                             next = stream.next() => match next {
+                                Some(Received::Content(c)) => {
+                                    if let Some((mut v, pointers)) =
+                                        sync::content_parts(&c, &self_aci, &names)
+                                    {
+                                        // Eagerly fetch small attachments so
+                                        // the UI can render them inline.
+                                        let thread = v.get("thread")
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+                                        for (i, ptr) in pointers.iter().enumerate() {
+                                            match sync::download_attachment(
+                                                &mut manager, ptr, &thread, ts, i,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some(path)) => {
+                                                    v["attachments"][i]["path"] =
+                                                        serde_json::Value::String(path);
+                                                }
+                                                Ok(None) => {}
+                                                Err(e) => {
+                                                    let _ = event_tx.send(format!(
+                                                        r#"{{"type":"attachment_error","error":{}}}"#,
+                                                        serde_json::json!(e)
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        let _ = event_tx.send(
+                                            serde_json::json!({"type": "message", "message": v})
+                                                .to_string(),
+                                        );
+                                    }
+                                }
                                 Some(received) => {
                                     if matches!(received, Received::Contacts) {
                                         names = sync::load_names(&store).await;
@@ -466,18 +532,16 @@ async fn cmd_logout(state: &mut WorkerState) -> Result<(), String> {
     let mut store = SqliteStore::open(&db_path, OnNewIdentity::Trust)
         .await
         .map_err(|e| format!("open store: {e}"))?;
-    {
-        use presage::store::Store;
-        store
-            .clear_registration()
-            .await
-            .map_err(|e| format!("clear: {e}"))?;
-    }
+    store
+        .clear_registration()
+        .await
+        .map_err(|e| format!("clear: {e}"))?;
     *state = WorkerState::Ready { store, db_path };
     Ok(())
 }
 
-async fn cmd_send(state: &mut WorkerState, thread: &str, body: &str) -> Result<u64, String> {    // Auto-start the loop: sends are routed through it.
+async fn cmd_send(state: &mut WorkerState, thread: &str, body: &str) -> Result<u64, String> {
+    // Auto-start the loop: sends are routed through it.
     cmd_start_sync(state).await?;
     match state {
         WorkerState::Linked(linked) => {
@@ -485,6 +549,47 @@ async fn cmd_send(state: &mut WorkerState, thread: &str, body: &str) -> Result<u
             let (tx, rx) = tokio::sync::oneshot::channel();
             ctrl.send(LoopCtrl::Send { thread: thread.to_string(), body: body.to_string(), reply: tx })
                 .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// Older history page for one thread (see `sync::thread_page`).
+async fn cmd_thread_page(
+    state: &WorkerState,
+    thread_id: &str,
+    limit: usize,
+    before_ts: u64,
+) -> Result<String, String> {
+    match state {
+        WorkerState::Linked(linked) => {
+            let store = linked.open_store().await?;
+            sync::thread_page(&store, thread_id, limit, before_ts).await
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+/// On-demand attachment fetch (metadata-only roster rows).
+async fn cmd_fetch_attachment(
+    state: &mut WorkerState,
+    thread_id: &str,
+    ts: u64,
+    index: usize,
+) -> Result<String, String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::FetchAttachment {
+                thread_id: thread_id.to_string(),
+                ts,
+                index,
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
             rx.await.map_err(|_| "sync loop dropped reply".to_string())?
         }
         _ => Err("not linked".to_string()),
@@ -680,6 +785,47 @@ pub extern "C" fn core_cmd_logout() -> i32 {
         Ok(Err(e)) | Err(e) => {
             set_last_error(e);
             -1
+        }
+    }
+}
+
+/// Older history page: newest `limit` messages in `thread` before
+/// `before_ts` (`u64::MAX` = latest). JSON `{"messages":[…]}`, or null.
+#[no_mangle]
+pub extern "C" fn core_cmd_thread(thread: *const c_char, limit: u64, before_ts: u64) -> *mut c_char {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+    let limit = (limit.max(1).min(500)) as usize;
+    match roundtrip(|reply| Command::ThreadPage { thread_id: t, limit, before_ts, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Download attachment `index` of the message at `ts` (ms) in `thread`.
+/// Returns the local file path, or null (see `core_last_error`).
+#[no_mangle]
+pub extern "C" fn core_cmd_fetch_attachment(thread: *const c_char, ts: u64, index: u64) -> *mut c_char {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+    match roundtrip(|reply| Command::FetchAttachment { thread_id: t, ts, index: index as usize, reply }) {
+        Ok(Ok(path)) => ok_string(path),
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            std::ptr::null_mut()
         }
     }
 }
