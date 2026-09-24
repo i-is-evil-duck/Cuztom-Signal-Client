@@ -45,6 +45,11 @@ has `InMemorySecretStore` (tests) and `KeychainSecretStore` (prod).
   offline `isLinkedAccount()` probe; `ChatViewModel` picks Live backend when
   the dylib is present, Mock otherwise (indicator in sidebar footer)
 - [x] 13 `swift test`s green, incl. live-dylib offline init against a temp store
+- [x] UI phase gate (`starting → linking → linked | failed`): no more QR
+  flash; real QR rendered from the `sgnl://` URL; Live failures show
+  Retry + Continue-with-demo instead of silently dropping to mock
+- [x] Release dylib builds (12 MB); bundled next to the binary so the app
+  boots the Live backend
 - [ ] Manual: real phone scan → QR → linked → restart persists (needs user)
 - [ ] M1b: receive loop + send + contacts/groups sync
 

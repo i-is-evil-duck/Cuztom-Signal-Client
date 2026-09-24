@@ -1,21 +1,60 @@
 import SwiftUI
+import CoreImage.CIFilterBuiltins
 
 struct ContentView: View {
     @Environment(ChatViewModel.self) private var vm
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView()
-        } detail: {
-            MessageListView()
+        Group {
+            switch vm.phase {
+            case .linked:
+                NavigationSplitView {
+                    SidebarView()
+                } detail: {
+                    MessageListView()
+                }
+            default:
+                StatusView()
+            }
         }
         .task {
-            if !vm.isLinked {
-                await vm.startLinking()
-                if let first = vm.conversations.first {
-                    await vm.select(first.id)
+            if vm.phase == .starting {
+                await vm.start()
+            }
+        }
+    }
+}
+
+struct StatusView: View {
+    @Environment(ChatViewModel.self) private var vm
+
+    var body: some View {
+        switch vm.phase {
+        case .starting:
+            VStack(spacing: 12) {
+                ProgressView()
+                Text("Starting…").foregroundStyle(.secondary)
+            }
+            .padding(40)
+        case .linking:
+            LinkDeviceView()
+        case .failed:
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle").font(.system(size: 48))
+                Text("Couldn't link").font(.title2)
+                if let err = vm.errorMessage {
+                    Text(err).font(.caption).monospaced().foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                HStack {
+                    Button("Retry") { Task { await vm.retry() } }
+                        .keyboardShortcut(.defaultAction)
+                    Button("Continue with demo") { Task { await vm.startDemo() } }
                 }
             }
+            .padding(40)
+        case .linked:
+            EmptyView()
         }
     }
 }
@@ -106,16 +145,36 @@ struct LinkDeviceView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: "qrcode").font(.system(size: 64))
+            Image(systemName: "qrcode").font(.system(size: 48))
             Text("Link your phone").font(.title2)
+            Text("Signal → Settings → Linked devices → Link new device")
+                .font(.footnote).foregroundStyle(.secondary)
             if let qr = vm.linkQR {
-                Text(qr.payload).font(.caption).monospaced().foregroundStyle(.secondary)
-                Text("M1 will render a real QR from the Rust core (presage link-device).")
-                    .font(.footnote).foregroundStyle(.secondary)
+                if qr.payload.hasPrefix("sgnl://") {
+                    if let img = qrNSImage(qr.payload) {
+                        Image(nsImage: img)
+                            .interpolation(.none)
+                            .cornerRadius(8)
+                    }
+                } else {
+                    // Mock backend payload (dev only).
+                    Text(qr.payload).font(.caption).monospaced().foregroundStyle(.secondary)
+                }
             } else {
-                ProgressView("Preparing QR…")
+                ProgressView("Contacting Signal…")
             }
         }
         .padding(40)
     }
+}
+
+private func qrNSImage(_ string: String) -> NSImage? {
+    let context = CIContext()
+    let filter = CIFilter.qrCodeGenerator()
+    filter.message = Data(string.utf8)
+    filter.correctionLevel = "M"
+    guard let output = filter.outputImage else { return nil }
+    let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
+    guard let cg = context.createCGImage(scaled, from: scaled.extent) else { return nil }
+    return NSImage(cgImage: cg, size: NSSize(width: 240, height: 240))
 }

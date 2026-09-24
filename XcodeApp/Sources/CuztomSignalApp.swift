@@ -15,38 +15,68 @@ struct CuztomSignalApp: App {
     }
 }
 
+enum LinkPhase: Equatable {
+    case starting
+    case linking
+    case linked
+    case failed
+}
+
 /// Thin @Observable wrapper over `ChatController` (which owns all logic and
-/// is unit-tested under CLT). Property names are the exact surface
-/// `Views.swift` binds to; M1 swaps the injected service to `RustCoreService`.
+/// is unit-tested under CLT). Live backend when the rust dylib is present,
+/// Mock only as an explicit fallback — never a silent switch.
 @Observable
 @MainActor
 final class ChatViewModel {
     private var controller: ChatController?
 
+    var phase = LinkPhase.starting
     var conversations: [Conversation] = []
     var selectedId: String?
     var messages: [ChatMessage] = []
     var linkQR: LinkQR?
     var isLinked = false
     var backendName = "…"
+    var errorMessage: String?
 
-    func startLinking(deviceName: String = "CuztomMac") async {
-        // Live backend when the rust dylib sits next to the build;
-        // otherwise the deterministic mock (Xcode previews, CI).
+    func start() async {
+        phase = .starting
+        errorMessage = nil
         let live = RustCoreService()
-        let svc: any SignalService
         if live.loadLibrary() {
-            svc = live
             backendName = "Live"
+            let controller = ChatController(service: live)
+            self.controller = controller
+            guard await controller.begin() else {
+                fail(controller)
+                return
+            }
+            phase = .linking
+            sync()
+            guard await controller.finish() else {
+                fail(controller)
+                return
+            }
+            succeed(controller)
         } else {
-            let (convs, msgs) = Self.previewData()
-            svc = MockSignalService(seedConversations: convs, seedMessages: msgs)
-            backendName = "Mock"
+            await startDemo()
         }
-        let controller = ChatController(service: svc)
+    }
+
+    func retry() async {
+        await start()
+    }
+
+    func startDemo() async {
+        phase = .starting
+        errorMessage = nil
+        let (convs, msgs) = Self.previewData()
+        let controller = ChatController(service: MockSignalService(seedConversations: convs, seedMessages: msgs))
         self.controller = controller
-        await controller.link(deviceName: deviceName)
+        backendName = "Mock"
+        await controller.link()
         sync()
+        phase = .linked
         if let first = conversations.first {
             await select(first.id)
         }
@@ -60,6 +90,20 @@ final class ChatViewModel {
     func send(_ body: String) async {
         await controller?.send(body)
         sync()
+    }
+
+    private func succeed(_ controller: ChatController) {
+        sync()
+        phase = .linked
+        if let first = conversations.first {
+            Task { await self.select(first.id) }
+        }
+    }
+
+    private func fail(_ controller: ChatController) {
+        sync()
+        errorMessage = controller.lastError ?? "unknown error"
+        phase = .failed
     }
 
     private func sync() {

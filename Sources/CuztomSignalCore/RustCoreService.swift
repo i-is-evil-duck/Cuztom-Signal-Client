@@ -26,12 +26,14 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     private var libraryHandle: UnsafeMutableRawPointer?
     public private(set) var libraryPath: String?
+    private let explicitPath: String?
     private let dbPath: String
     private var didInit = false
     private var linked = false
 
     public init(libraryPath: String? = nil, dbPath: String? = nil) {
         self.libraryPath = libraryPath
+        self.explicitPath = libraryPath
         self.dbPath = dbPath ?? Self.defaultDBPath()
         var sc: AsyncStream<ConnectionState>.Continuation!
         self.connectionState = AsyncStream { sc = $0 }
@@ -79,6 +81,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     @discardableResult
     public func loadLibrary() -> Bool {
         if libraryHandle != nil { return true }
+        // An explicit path is strict: a missing file means "not available",
+        // never silently fall back to a different build (test determinism).
+        if explicitPath != nil { return false }
         for path in Self.defaultSearchPaths() {
             if let handle = Self.openLibrary(at: path) {
                 libraryHandle = handle

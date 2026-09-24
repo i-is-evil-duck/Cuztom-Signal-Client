@@ -46,7 +46,27 @@ import Testing
     #expect(err == nil)
 }
 
-@Test func controllerSurfacesLinkFailure() async {
+@Test func controllerBeginFinishSplit() async throws {
+    let conv = Conversation(id: "c1", title: "Peer", peer: SignalAddress(phone: "+1"))
+    let svc = MockSignalService(seedConversations: [conv])
+    let controller = await ChatController(service: svc)
+
+    let begun = await controller.begin(deviceName: "TestMac")
+    #expect(begun)
+    let qr = await controller.linkQR
+    #expect(qr != nil)
+    let conn = await controller.connection
+    #expect(conn == .linking)
+    // Not linked yet: roster still empty before finish().
+    #expect(await controller.isLinked == false)
+
+    let done = await controller.finish()
+    #expect(done)
+    #expect(await controller.isLinked)
+    #expect(await controller.conversations.count == 1)
+}
+
+@Test func controllerBeginFailure() async {
     struct Broken: SignalService, Sendable {
         var connectionState: AsyncStream<ConnectionState> { AsyncStream { _ in } }
         func beginLinking(deviceName: String) async throws -> LinkQR { throw SignalError.network("offline") }
@@ -59,11 +79,11 @@ import Testing
         func incomingMessages() -> AsyncStream<ChatMessage> { AsyncStream { _ in } }
     }
     let controller = await ChatController(service: Broken())
-    await controller.link()
-    let linked = await controller.isLinked
-    #expect(!linked)
+    #expect(!(await controller.begin()))
     let err = await controller.lastError
     #expect(err != nil)
+    let conn = await controller.connection
+    #expect(conn == .offline)
 }
 
 @Test func rustCoreWithoutLibraryThrowsUnsupported() async {

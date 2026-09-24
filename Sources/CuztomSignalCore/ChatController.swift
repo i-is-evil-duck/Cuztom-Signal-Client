@@ -31,17 +31,38 @@ public final class ChatController {
 
     public func link(deviceName: String = "CuztomMac") async {
         lastError = nil
+        guard await begin(deviceName: deviceName) else { return }
+        _ = await finish()
+    }
+
+    /// Step 1: fetch the provisioning QR. Returns false on error.
+    public func begin(deviceName: String = "CuztomMac") async -> Bool {
+        lastError = nil
         do {
             linkQR = try await service.beginLinking(deviceName: deviceName)
             connection = .linking
             observeConnection()
+            return true
+        } catch {
+            lastError = String(describing: error)
+            connection = .offline
+            return false
+        }
+    }
+
+    /// Step 2: wait for the phone scan, then sync. Returns false on error.
+    /// Split from `begin()` so UI can paint the QR while this runs.
+    public func finish() async -> Bool {
+        do {
             try await service.waitForLink()
             connection = .syncing
             try await refresh()
             connection = .connected
+            return true
         } catch {
             lastError = String(describing: error)
             connection = .offline
+            return false
         }
     }
 
