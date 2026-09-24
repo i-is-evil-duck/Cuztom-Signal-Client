@@ -154,18 +154,38 @@ final class ChatViewModel {
 
     func send(_ body: String) async {
         guard let controller else { return }
+        sendError = nil
         if body.hasPrefix("/") {
             await controller.sendOrCommand(body, plugins: plugins, ctx: pluginCtx())
             sync()
             return
         }
+        if !pendingFiles.isEmpty {
+            sendingAttachment = true
+            let files = pendingFiles
+            pendingFiles = []
+            replyingTo = nil
+            var first = true
+            for url in files {
+                let caption = first ? body : ""
+                first = false
+                await controller.sendAttachment(fileURL: url, caption: caption)
+            }
+            sendingAttachment = false
+            sendError = controller.lastError
+            sync()
+            try? FileManager.default.removeItem(at: pendingDir())
+            return
+        }
         if let quote = replyingTo, let id = controller.selectedId {
             replyingTo = nil
             await controller.sendReply(body: body, to: id, quote: quote)
+            sendError = controller.lastError
             sync()
             return
         }
         await controller.send(body)
+        sendError = controller.lastError
         sync()
     }
 
