@@ -126,6 +126,7 @@ Honest status as of the M1b sync build. Checked = done, open = not yet.
 | Rust unit (FFI) | `cargo test` (in `rust-core/`) | 3 tests, green |
 | Live link + resume | manual, real phone | done (user-verified) |
 | Roster + live receive | manual | done (6 convs, `queue_empty`) |
+| Routing (DM + group + self) | live probes 1–5 via `live_test` | done 5/5 (2026-09-23) |
 | 500-msg paging | manual | TODO |
 | Attachment round-trip | manual | TODO |
 | Logout → fresh QR | manual | TODO (Settings → Log out) |
