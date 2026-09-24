@@ -173,6 +173,10 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
     let (tx, mut cmd_rx) = tmpsc::unbounded_channel::<Command>();
     std::thread::Builder::new()
         .name("cuztom-signal-core".to_string())
+        // presage's `receive_messages` future (websockets, ciphers, caches)
+        // is enormous: the default 2 MiB spawned-thread stack overflows.
+        // presage-cli never hits this — it runs on the 8 MiB main thread.
+        .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

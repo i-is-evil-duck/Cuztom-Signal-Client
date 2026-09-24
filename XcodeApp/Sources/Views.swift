@@ -210,7 +210,11 @@ struct AttachmentRow: View {
                     }
             } else if att.mimeType.hasPrefix("video/"), let url = att.localURL {
                 VStack(alignment: .leading, spacing: 4) {
-                    VideoPlayer(player: AVPlayer(url: url))
+                    // NOTE: SwiftUI's `VideoPlayer` aborts at view-creation
+                    // time on this OS (see crash 2026-09-23, _AVKit_SwiftUI
+                    // metadata init → SIGABRT). AppKit's AVPlayerView is used
+                    // directly instead and is rock solid.
+                    AppKitVideoPlayer(url: url)
                         .frame(height: 240)
                         .cornerRadius(6)
                     Button("Expand") {
@@ -272,7 +276,7 @@ struct AttachmentPreview: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                 } else if item.mime.hasPrefix("video/") {
-                    VideoPlayer(player: AVPlayer(url: item.url))
+                    AppKitVideoPlayer(url: item.url)
                 } else {
                     Image(systemName: "doc").font(.system(size: 64))
                     Text(item.mime).foregroundStyle(.secondary)
@@ -320,8 +324,7 @@ struct LinkDeviceView: View {
     }
 }
 
-private func qrNSImage(_ string: String) -> NSImage? {
-    let context = CIContext()
+private func qrNSImage(_ string: String) -> NSImage? {    let context = CIContext()
     let filter = CIFilter.qrCodeGenerator()
     filter.message = Data(string.utf8)
     filter.correctionLevel = "M"
