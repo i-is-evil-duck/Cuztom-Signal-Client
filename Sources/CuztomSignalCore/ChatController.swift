@@ -22,11 +22,11 @@ public final class ChatController: @unchecked Sendable {
     public private(set) var selfAci: String?
 
     private let service: any SignalService
-    private var store: MessageStore
+    private var store: any MessageStoring
     private var observerTask: Task<Void, Never>?
     private var watchTask: Task<Void, Never>?
 
-    public init(service: any SignalService, store: MessageStore = MessageStore()) {
+    public init(service: any SignalService, store: any MessageStoring = InMemoryMessageStore()) {
         self.service = service
         self.store = store
     }
