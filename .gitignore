@@ -1,0 +1,36 @@
+# macOS / Xcode
+.DS_Store
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+*.xcworkspace/xcuserdata/
+
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Rust
+rust-core/target/
+rust-core/Cargo.lock
+**/*.rs.bk
+
+# App data / secrets (never commit)
+*.env
+.env
+config/
+data/
+*.png
+signal_qr.png
+Application\ Support/
+
+# SQLite / state
+*.sqlite
+*.sqlite-journal
+*.db
+
+# Notarization / releases
+*.dmg
+*.pkg
