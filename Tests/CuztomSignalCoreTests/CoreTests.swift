@@ -81,3 +81,43 @@ import Testing
     await store.delete(key: "identity")
     #expect(await store.load(key: "identity") == nil)
 }
+
+@Test func sqliteStoreRoundTrips() async throws {
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("sqlite-test-\(UUID())")
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+    
+    let store = try SQLiteMessageStore(path: tmpDir)
+    
+    let conv = Conversation(id: "c1", title: "Peer", peer: SignalAddress(phone: "+1"),
+                            lastActiveAt: Date(timeIntervalSince1970: 100))
+    await store.upsertConversation(conv)
+    let all = await store.allConversations()
+    #expect(all.count == 1)
+    #expect(all.first?.title == "Peer")
+    
+    let msg = ChatMessage(conversationId: "c1",
+                          author: SignalAddress(phone: "+1"),
+                          body: "hi",
+                          direction: .incoming,
+                          status: .delivered)
+    await store.saveMessage(msg)
+    let msgs = await store.messages(in: "c1")
+    #expect(msgs.count == 1)
+    #expect(msgs.first?.body == "hi")
+    
+    let unread = await store.allConversations()
+    #expect(unread.first?.unreadCount == 1)
+    await store.markRead(conversationId: "c1")
+    let read = await store.allConversations()
+    #expect(read.first?.unreadCount == 0)
+    
+    // Persistence: reopen and verify
+    let store2 = try SQLiteMessageStore(path: tmpDir)
+    let reloaded = await store2.allConversations()
+    #expect(reloaded.count == 1)
+    #expect(reloaded.first?.title == "Peer")
+    let reloadedMsgs = await store2.messages(in: "c1")
+    #expect(reloadedMsgs.count == 1)
+    #expect(reloadedMsgs.first?.body == "hi")
+}
