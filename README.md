@@ -91,6 +91,9 @@ Important implementation areas:
   `NativeProcessState.swift` — process-wide lifecycle serialization,
   shared database-path session epochs, and cross-instance wipe-poison
   protection.
+- `Sources/CuztomSignalCore/RustCoreServiceStateBoxes.swift` — lock-backed
+  storage for the dylib handle, native init/linked state, and the event-pump
+  task.
 - `rust-core/src/sync.rs` — message normalization, stable timestamps, control
   envelope filtering, attachment metadata, profile/group-member resolution,
   and send helpers.
@@ -101,7 +104,9 @@ Important implementation areas:
 - `XcodeApp/Sources/Views.swift` — message list, sender-run chips, media
   rendering, and scrolling.
 - `XcodeApp/Sources/NotificationManager.swift` — local macOS notifications.
-- `Sources/CuztomSignalCore/CallController.swift` — Swift call state machine.
+- `Sources/CuztomSignalCore/CallController.swift` — Swift call state machine,
+  tracked accept/end/mute tasks, and the `CallNativeControlling` seam that lets
+  call actions be tested without booting RingRTC.
 
 ## Build and test
 

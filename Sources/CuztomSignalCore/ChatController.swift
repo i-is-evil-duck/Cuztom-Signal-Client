@@ -40,6 +40,12 @@ public final class ChatController: @unchecked Sendable {
     private var watchTask: Task<Void, Never>?
     private var autoFetchTask: Task<Void, Never>?
     private var liveFetchTasks: [UUID: Task<Void, Never>] = [:]
+    /// Short callback hops are tracked too; lifecycle teardown awaits them
+    /// before allowing a replacement account to publish state.
+    private var ownedTasks: [UUID: Task<Void, Never>] = [:]
+    /// While owned work is being drained, late callbacks must not register
+    /// new tasks that this drain would not await.
+    private var isDrainingTasks = false
     private let pluginHost: PluginHost
     private let contactResolver: ContactResolver
 
@@ -108,65 +114,7 @@ public final class ChatController: @unchecked Sendable {
             // Live backend: pull contact sync + start the receive loop.
             // Non-fatal: the roster still loads from the local store.
             if let live = service as? RustCoreService {
-                let callbackLifecycle = lifecycleGeneration
-                live.onSyncEvent = { [weak self] note in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        self.noteSync(note)
-                    }
-                }
-                live.onReaction = { [weak self] thread, sts, emoji, remove, sender in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        await self.applyReaction(thread: thread, targetSts: sts, emoji: emoji, remove: remove, senderName: sender)
-                    }
-                }
-                live.onReceipt = { [weak self] sender, kind, stamps in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        await self.applyReceipt(kind: kind, timestamps: stamps, senderID: sender)
-                    }
-                }
-                live.onReceiptScoped = { [weak self] thread, sender, kind, stamps in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        await self.applyReceipt(
-                            kind: kind,
-                            timestamps: stamps,
-                            thread: thread,
-                            senderID: sender
-                        )
-                    }
-                }
-                live.onTyping = { [weak self] thread, sender, started in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        await self.applyTyping(thread: thread, senderName: sender, started: started)
-                    }
-                }
-                live.onTypingWithID = { [weak self] thread, senderID, senderName, started in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        await self.applyTyping(
-                            thread: thread,
-                            senderName: senderName,
-                            started: started,
-                            senderID: senderID
-                        )
-                    }
-                }
-                live.onEdit = { [weak self] thread, sts, body, sender, senderName in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        await self.applyEdit(thread: thread, targetSts: sts, body: body, senderID: sender, senderName: senderName)
-                    }
-                }
-                live.onDelete = { [weak self] thread, sts, sender, senderName in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        await self.applyDelete(thread: thread, targetSts: sts, senderID: sender, senderName: senderName)
-                    }
-                }
+                installLiveCallbacks(on: live)
                 do {
                     try await live.startLiveSync()
                     guard lifecycle == lifecycleGeneration else { return false }
@@ -692,25 +640,152 @@ public final class ChatController: @unchecked Sendable {
         }
     }
 
+    /// Wire the native event callbacks for the current lifecycle generation.
+    ///
+    /// Every handler is registered as tracked work and re-checks the
+    /// generation, so an event already in flight when logout, retry, or an
+    /// account switch retires this controller cannot publish into the next
+    /// account. Kept separate from `finish()` so the fencing is directly
+    /// testable without a live native core.
+    func installLiveCallbacks(on live: RustCoreService) {
+        let callbackLifecycle = lifecycleGeneration
+        live.onSyncEvent = { [weak self] note in
+            Task { @MainActor [weak self] in
+                self?.trackCallback(generation: callbackLifecycle) { controller in
+                    controller.noteSync(note)
+                }
+            }
+        }
+        live.onReaction = { [weak self] thread, sts, emoji, remove, sender in
+            Task { @MainActor [weak self] in
+                self?.trackCallback(generation: callbackLifecycle) { controller in
+                    await controller.applyReaction(
+                        thread: thread,
+                        targetSts: sts,
+                        emoji: emoji,
+                        remove: remove,
+                        senderName: sender
+                    )
+                }
+            }
+        }
+        live.onReceipt = { [weak self] sender, kind, stamps in
+            Task { @MainActor [weak self] in
+                self?.trackCallback(generation: callbackLifecycle) { controller in
+                    await controller.applyReceipt(kind: kind, timestamps: stamps, senderID: sender)
+                }
+            }
+        }
+        live.onReceiptScoped = { [weak self] thread, sender, kind, stamps in
+            Task { @MainActor [weak self] in
+                self?.trackCallback(generation: callbackLifecycle) { controller in
+                    await controller.applyReceipt(
+                        kind: kind,
+                        timestamps: stamps,
+                        thread: thread,
+                        senderID: sender
+                    )
+                }
+            }
+        }
+        live.onTyping = { [weak self] thread, sender, started in
+            Task { @MainActor [weak self] in
+                self?.trackCallback(generation: callbackLifecycle) { controller in
+                    await controller.applyTyping(thread: thread, senderName: sender, started: started)
+                }
+            }
+        }
+        live.onTypingWithID = { [weak self] thread, senderID, senderName, started in
+            Task { @MainActor [weak self] in
+                self?.trackCallback(generation: callbackLifecycle) { controller in
+                    await controller.applyTyping(
+                        thread: thread,
+                        senderName: senderName,
+                        started: started,
+                        senderID: senderID
+                    )
+                }
+            }
+        }
+        live.onEdit = { [weak self] thread, sts, body, sender, senderName in
+            Task { @MainActor [weak self] in
+                self?.trackCallback(generation: callbackLifecycle) { controller in
+                    await controller.applyEdit(
+                        thread: thread,
+                        targetSts: sts,
+                        body: body,
+                        senderID: sender,
+                        senderName: senderName
+                    )
+                }
+            }
+        }
+        live.onDelete = { [weak self] thread, sts, sender, senderName in
+            Task { @MainActor [weak self] in
+                self?.trackCallback(generation: callbackLifecycle) { controller in
+                    await controller.applyDelete(
+                        thread: thread,
+                        targetSts: sts,
+                        senderID: sender,
+                        senderName: senderName
+                    )
+                }
+            }
+        }
+    }
+
+    private func trackCallback(
+        generation: Int,
+        _ operation: @escaping @MainActor @Sendable (ChatController) async -> Void
+    ) {
+        trackOwnedTask { [weak self] in
+            guard let self, self.lifecycleGeneration == generation else { return }
+            await operation(self)
+        }
+    }
+
+    private func trackOwnedTask(
+        _ operation: @escaping @MainActor @Sendable () async -> Void
+    ) {
+        guard !isDrainingTasks else { return }
+        let id = UUID()
+        ownedTasks[id] = Task { @MainActor [weak self] in
+            await operation()
+            guard let self, !Task.isCancelled else { return }
+            self.ownedTasks[id] = nil
+        }
+    }
+
     private func cancelOwnedTasks() async {
-        let tasks = [observerTask, watchTask, autoFetchTask, rosterRefreshTask]
-        let liveTasks = Array(liveFetchTasks.values)
-        observerTask?.cancel()
-        watchTask?.cancel()
-        autoFetchTask?.cancel()
-        rosterRefreshTask?.cancel()
-        for task in liveFetchTasks.values { task.cancel() }
-        liveFetchTasks.removeAll()
-        observerTask = nil
-        watchTask = nil
-        autoFetchTask = nil
-        rosterRefreshTask = nil
-        for task in tasks {
-            await task?.value
+        isDrainingTasks = true
+        defer { isDrainingTasks = false }
+        // Drain repeatedly (bounded): a native callback can land between the
+        // snapshot and the awaits below. Its body is already fenced by the
+        // lifecycle generation, but it must still be awaited, not leaked.
+        for _ in 0..<4 {
+            let tasks = [observerTask, watchTask, autoFetchTask, rosterRefreshTask].compactMap { $0 }
+            let batch = tasks + Array(liveFetchTasks.values) + Array(ownedTasks.values)
+            observerTask = nil
+            watchTask = nil
+            autoFetchTask = nil
+            rosterRefreshTask = nil
+            liveFetchTasks.removeAll()
+            ownedTasks.removeAll()
+            guard !batch.isEmpty else { return }
+            for task in batch { task.cancel() }
+            for task in batch { await task.value }
         }
-        for task in liveTasks {
-            await task.value
-        }
+    }
+
+    /// Retire this controller before a retry or account switch. All owned
+    /// work is canceled/awaited so an old watcher cannot publish into a new
+    /// controller instance.
+    public func shutdown() async {
+        lifecycleGeneration += 1
+        selectionGeneration += 1
+        await cancelOwnedTasks()
+        await contactResolver.clear()
+        notifyStateChange()
     }
 
     /// Reset Swift-side state after the live service has already performed its

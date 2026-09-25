@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 67/67 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 71/71 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 11/11 passed |
@@ -44,9 +44,11 @@ The following checks were run during the latest review:
 | `cargo fmt --all -- --check` | Not run: rustfmt component unavailable |
 | Default Command Line Tools Swift build | Fails because the `SwiftUIMacros` plugin is unavailable |
 
-The test suite currently exercises mostly mock/in-memory behavior. It does not
-cover the SwiftUI application, native FFI success paths, account switching,
-large SQLite histories, or a two-client Signal/RingRTC integration.
+The test suite covers controller lifecycle, account-switch task cancellation,
+queued call actions through an injectable native bridge, encrypted SQLite
+storage, and the native executor/epoch/gate primitives. It does not cover the
+SwiftUI application views, real native FFI success paths, or a two-client
+Signal/RingRTC integration.
 
 ---
 
@@ -73,17 +75,19 @@ selection changes, and local mutations.
 
 #### P0-2: `RustCoreService` is unsynchronized and the native core is process-global
 
-The Swift service is still a regular class marked `@unchecked Sendable`; its
-mutable Swift caches and initialization state are not yet actor-isolated. The
-account cache maps are now protected by a recursive state lock, while native
-command/poll FFI is serialized through a process-wide executor and every service
-FFI operation carries a session token checked before and after native work. The
-remaining risk is lifecycle/task ownership and state reads outside the new
-boundary, not unserialized native calls.
+The Swift service remains a class marked `@unchecked Sendable`, but its
+mutable state is now explicitly serialized: account caches use a recursive
+state lock, while library/init/pump state use dedicated lock-backed boxes.
+Native command/poll FFI is serialized through a process-wide executor, and
+every service FFI operation carries a session token checked before and after
+native work. The remaining risk is task ownership and real-device integration,
+not unserialized native or Swift state.
 
-The Rust worker remains process-wide. The native core continues to reject
-conflicting database paths while linked, but the Swift service should still
-eventually become an actor/private executor to remove the remaining cache races.
+The Rust worker remains process-wide. The native core rejects conflicting
+database paths while linked, and every remaining mutable Swift field now has an
+explicit serialization boundary, so a literal actor conversion is no longer
+required for Phase 1. A future actor/private-executor conversion is still an
+option if the state grows.
 
 **Impact:** Dictionary races, lost cache writes, duplicate initialization,
 wrong-account operations, and corrupted UUID/path mappings.
@@ -111,10 +115,12 @@ and await all tasks, quiesce the native receive loop, close stores, clear
 account-bound caches and key material, verify deletion, and refuse to relink
 after a failed wipe.
 
-**Current status:** The native wipe now runs behind the serial executor, the
-event pump is cancelled and awaited, failed teardown poisons the service, and
-cache/key removal remains fail-closed. Full controller task ownership and
-account-switch integration coverage are still open.
+**Current status:** The native wipe runs behind the serial executor, the event
+pump is cancelled and awaited, failed teardown poisons the service, and
+cache/key removal is fail-closed. Controller/service/app tasks are now owned,
+cancelled, and awaited before retry, logout, and account switch. The remaining
+gap is real-device/two-client verification of the native success paths, not
+Swift-side lifecycle ownership.
 
 #### P0-4: SQLite paging and unread state are incorrect
 
@@ -447,9 +453,9 @@ metadata survives replay.
 
 **Goal:** Prevent cross-account leakage and make logout/retry reliable.
 
-- [ ] Convert `RustCoreService` to an actor or finish serializing the remaining
-      mutable Swift state; account caches are now lock-protected, but
-      lifecycle/task ownership still needs actorization.
+- [x] Finish serializing `RustCoreService` mutable state: cache maps use the
+      state lock, while library/init/pump state use dedicated lock-backed
+      boxes; a literal actor conversion is no longer required for Phase 1.
 - [x] Move native command, initialization, polling, and call FFI calls to a
       process-wide serial background executor; keep the synchronous loader as
       a compatibility seam.
@@ -468,10 +474,13 @@ metadata survives replay.
       allowing relink.
 - [x] Guard call startup so rapid taps cannot create duplicate native calls;
       the in-flight flag and lifecycle generation fence the post-FFI commit.
-- [ ] Track and await all controller/service tasks.
+- [x] Track and await all controller/service tasks: `ChatController` callback
+      hops, watcher/refresh/auto-fetch, and `CallController` accept/end/mute
+      work are registered, cancelled, and awaited during teardown.
 - [x] Track app selection/diagnostics tasks and await them before retry/logout.
-- [ ] Cancel watcher, refresh, selection, auto-fetch, and diagnostic tasks
-      before logout/retry.
+- [x] Cancel watcher, refresh, selection, auto-fetch, and diagnostic tasks
+      before logout/retry, including an awaited `ChatController.shutdown()`
+      when a retry or account switch retires the old controller.
 - [x] Make `clearAllData()` throw on any failure and never continue relinking
       after failure.
 - [x] Add a native shutdown/reset operation that closes stores and returns
@@ -485,11 +494,31 @@ metadata survives replay.
       poisoning, and cross-instance refusal.
 - [x] Add a delayed-service integration regression proving a stale
       `finish()` continuation cannot publish after logout.
-- [ ] Add full controller/native integration coverage for logout failure,
-      account switching, task cancellation, and queued call actions.
+- [x] Add regressions proving an old watcher stops before an account switch and
+      that a late native sync/edit/delete/receipt/typing callback cannot publish
+      into a retired controller.
+- [x] Add full controller/native integration coverage for logout failure,
+      account switching, task cancellation, and queued call actions, using an
+      injectable `CallNativeControlling` bridge so call actions are testable
+      without booting RingRTC.
 
 **Exit criteria:** Logging out cannot resume the old account, and no callback
 or task from account A can update account B.
+
+#### Milestone 2 — code complete 2026-09-25
+
+All Milestone 2 code items are implemented and covered by the Swift suite. The
+only remaining Phase 1 work is manual verification that cannot be produced in
+this environment:
+
+- Link a real phone and a real Mac client, then confirm logout, relink, and
+  account switching on device.
+- Exercise reconnect/offline soak and queued native call actions against the
+  real RingRTC stack.
+- Confirm Keychain and SQLCipher behavior inside a signed application.
+
+These are tracked in the two-client integration section below and must stay
+open until they are actually run.
 
 ---
 

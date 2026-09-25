@@ -154,8 +154,8 @@ struct LiveEvent: Decodable {
 ///
 /// The library is loaded lazily with `dlopen` so the Swift package still
 /// builds/tests on machines without Rust. Native command and poll work is
-/// serialized on `SerialNativeExecutor`; the remaining mutable Swift state is
-/// tracked separately until the service actorization follow-up.
+/// serialized on `SerialNativeExecutor`; the remaining mutable state is
+/// protected by the lock-backed boxes and state lock declared below.
 public final class RustCoreService: SignalService, @unchecked Sendable {
     public static let expectedNativeABI: UInt32 = 2
     private static let dylibEnvironmentKey = "CUZTOM_SIGNAL_CORE_PATH"
@@ -168,8 +168,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private let incomingContinuation: AsyncStream<ChatMessage>.Continuation
     private let incoming: AsyncStream<ChatMessage>
 
-    private var libraryHandle: UnsafeMutableRawPointer?
-    public private(set) var libraryPath: String?
+    private let libraryBox = NativeLibraryBox()
+    public var libraryPath: String? { libraryBox.path }
     private let explicitPath: String?
     private let dbPath: String
     /// Stable namespace for account-bound Swift maps. The native database path
@@ -180,11 +180,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private let sessionEpoch: SessionEpoch
     private let nativeExecutor = SerialNativeExecutor.shared
     private let lifecycleGate = NativeProcessState.shared.lifecycleGate
-    private let initLock = NSLock()
     private let stateLock = NSRecursiveLock()
-    private let libraryLoadLock = NSLock()
-    private var didInit = false
-    private var linked = false
+    private let sessionState = NativeSessionStateBox()
+    private let pumpBox = PumpTaskBox()
     /// Own ACI (resolved after linking via whoami) for identifying our own messages.
     private var _selfAci: String?
     public var selfAci: String? {
@@ -207,7 +205,6 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))?.path ?? NSTemporaryDirectory()
         return URL(fileURLWithPath: (base as NSString).appendingPathComponent("CuztomSignal/uuid_cache.json"))
     }
-    private var pumpTask: Task<Void, Never>?
     /// Wire key -> local file path, persisted across launches so roster
     /// re-seeds don't re-download (or re-prompt) every restart.
     private var pathCache: [String: String] = [:]
@@ -219,19 +216,19 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     private var linkedState: Bool {
-        withStateLock { linked }
+        sessionState.linked
     }
 
     private func setLinkedState(_ value: Bool) {
-        withStateLock { linked = value }
+        sessionState.setLinked(value)
     }
 
     private var initializedState: Bool {
-        withStateLock { didInit }
+        sessionState.initialized
     }
 
     private func setInitializedState(_ value: Bool) {
-        withStateLock { didInit = value }
+        sessionState.setInitialized(value)
     }
 
     private var pathCacheURL: URL {
@@ -369,7 +366,6 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     public init(libraryPath: String? = nil, dbPath: String? = nil) {
-        self.libraryPath = libraryPath
         self.explicitPath = libraryPath
         self.dbPath = dbPath ?? Self.defaultDBPath()
         self.cacheNamespace = Self.cacheNamespace(for: self.dbPath)
@@ -391,7 +387,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     deinit {
-        pumpTask?.cancel()
+        pumpBox.cancel()
         // The Rust command worker and RingRTC actor are process-wide and may
         // still be finishing callbacks. Never dlclose the dylib from a Swift
         // service deinit; the OS will reclaim it at process exit.
@@ -447,9 +443,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     public var isLibraryLoaded: Bool {
-        libraryLoadLock.lock()
-        defer { libraryLoadLock.unlock() }
-        return libraryHandle != nil
+        libraryBox.isLoaded
     }
 
     @discardableResult
@@ -464,9 +458,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     private func loadLibraryOnNativeQueue() -> Bool {
-        libraryLoadLock.lock()
-        defer { libraryLoadLock.unlock() }
-        if libraryHandle != nil { return true }
+        if libraryBox.isLoaded { return true }
         // An explicit path is strict: a missing file means "not available",
         // never silently fall back to a different build (test determinism).
         let paths: [String]
@@ -478,8 +470,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         for path in paths {
             guard let handle = Self.openLibrary(at: path) else { continue }
             if Self.validateLoadedLibrary(handle, at: path) {
-                libraryHandle = handle
-                libraryPath = path
+                libraryBox.install(handle: handle, path: path)
                 return true
             }
             #if canImport(Darwin)
@@ -487,6 +478,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             #endif
         }
         return false
+    }
+
+    private func stopPump() async {
+        let pump = pumpBox.take()
+        pump?.cancel()
+        await pump?.value
     }
 
     public func beginLinking(deviceName: String) async throws -> LinkQR {
@@ -511,10 +508,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         // before begin_link so no pre-link task can publish into the new QR
         // session, and stop the old pump before native teardown/replacement.
         let token = try sessionEpoch.rotate()
-        let oldPump = pumpTask
-        pumpTask = nil
-        oldPump?.cancel()
-        await oldPump?.value
+        await stopPump()
 
         let url: String? = try await withCore(token: token, lifecycleOwned: true) { sym in
             // Recheck after the rotation in case another native actor linked
@@ -1099,10 +1093,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     private func startLiveSyncInternal() async throws {
         let eventToken = try sessionEpoch.rotate()
-        let oldPump = pumpTask
-        pumpTask = nil
-        oldPump?.cancel()
-        await oldPump?.value
+        await stopPump()
 
         let contactsAlreadySynced: Bool = try await withCore(token: eventToken, lifecycleOwned: true) { sym in
             let requestResult = sym.requestContacts()
@@ -1117,13 +1108,13 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 stateContinuation.yield(.syncing)
             }
         }
-        pumpTask = Task { [weak self] in
+        pumpBox.set(Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, self.sessionEpoch.isCurrent(eventToken) else { return }
                 await self.drainEvents(token: eventToken)
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
-        }
+        })
     }
 
     /// Offline-safe: opens (or creates) the store and reports whether a
@@ -1203,10 +1194,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
         let teardownToken = sessionEpoch.suspend()
         detachCallbacks()
-        let pump = pumpTask
-        pumpTask = nil
-        pump?.cancel()
-        await pump?.value
+        await stopPump()
 
         try await withCore(token: teardownToken, allowStale: true, lifecycleOwned: true) { sym in
             guard sym.logout() == 0 else {
@@ -1255,10 +1243,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
         let teardownToken = sessionEpoch.suspend()
         detachCallbacks()
-        let pump = pumpTask
-        pumpTask = nil
-        pump?.cancel()
-        await pump?.value
+        await stopPump()
 
         _ = try await withCore(
             token: teardownToken,
@@ -1780,7 +1765,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     /// Must only be called from `nativeExecutor` (or during construction).
     private func coreSymbolsOnNativeQueue() throws -> Symbols {
-        guard loadLibrary(), let handle = libraryHandle else {
+        guard loadLibrary(), let handle = libraryBox.handle else {
             throw SignalError.unsupported("rust core not bundled — build it: cd rust-core && cargo build --release (see rust-core/README)")
         }
         guard let sym = Self.resolve(in: handle) else {
@@ -1796,9 +1781,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     private func initializeCoreIfNeeded(_ sym: Symbols) throws -> Int32 {
-        initLock.lock()
-        defer { initLock.unlock() }
-        if initializedState { return linkedState ? 1 : 0 }
+        try sessionState.withLock {
+            if initializedState { return linkedState ? 1 : 0 }
 
         #if canImport(Security)
         let keychain = KeychainSecretStore()
@@ -1844,6 +1828,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         #else
         throw SignalError.unsupported("SQLCipher requires macOS Security/Keychain support")
         #endif
+        }
     }
 
     private static func canCreateNativeDatabaseKey(at path: String) -> Bool {

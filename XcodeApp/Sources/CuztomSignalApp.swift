@@ -230,6 +230,9 @@ final class ChatViewModel {
         oldSelection?.cancel()
         await oldDiagnostics?.value
         await oldSelection?.value
+        await controller?.shutdown()
+        controller = nil
+        liveService = nil
         selectionInProgress = false
         phase = .starting
         errorMessage = nil
@@ -298,7 +301,7 @@ final class ChatViewModel {
             self.activeCall = call
             if call != nil { self.incomingCall = nil }
         }
-        callController.configure(with: live, transport: live)
+        await callController.configure(with: live, transport: live)
         // Wire typing indicator callback to update ViewModel state
         controller.onTypingUpdateWithID = { [weak self] thread, senderID, senderName, started in
             Task { @MainActor in
@@ -791,7 +794,7 @@ func sendTyping(started: Bool) async {
         oldSelection?.cancel()
         await oldDiagnostics?.value
         await oldSelection?.value
-        callController.reset()
+        await callController.resetAndAwait()
         notifiedCallIDs.removeAll()
         NotificationManager.shared.cancelAll()
 

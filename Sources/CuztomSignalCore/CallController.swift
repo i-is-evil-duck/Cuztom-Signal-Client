@@ -103,6 +103,19 @@ public protocol CallSignalTransport: Sendable {
     var incomingCallSignals: AsyncStream<CallSignalMessage> { get }
 }
 
+/// Native call operations used by `CallController`. Keeping this seam small
+/// makes queued accept/mute/end work testable without booting RingRTC.
+public protocol CallNativeControlling: AnyObject, Sendable {
+    var onCallSignal: ((CallSignal) -> Void)? { get set }
+    var onCallState: ((CallStateEvent) -> Void)? { get set }
+    func startCall(thread: String, mediaType: String) async throws -> UInt64
+    func acceptCall(callId: UInt64) async throws
+    func hangupCall() async throws
+    func setCallMuted(_ muted: Bool) async throws
+}
+
+extension RustCoreService: CallNativeControlling {}
+
 /// Coordinates the UI-facing call state with the native RingRTC engine.
 ///
 /// The Rust core owns WebRTC, ICE, DTLS/SRTP, microphone capture, and Signal
@@ -120,8 +133,11 @@ public final class CallController: ObservableObject {
     /// Called on the main actor whenever the connected/in-progress overlay changes.
     public var onActiveCallChanged: ((ActiveCall?) -> Void)?
 
-    private var rustCore: RustCoreService?
-    private var signalTask: Task<Void, Never>?
+    private var bridge: (any CallNativeControlling)?
+    private var pendingTasks: [String: Task<Void, Never>] = [:]
+    /// While queued call work is being drained, a late native callback must not
+    /// register new work that this drain would not await.
+    private var isDrainingTasks = false
     private var nativeIDByRecord: [UUID: UInt64] = [:]
     private var recordIDByNativeID: [UInt64: UUID] = [:]
     private var finishedNativeIDs: Set<UInt64> = []
@@ -141,33 +157,65 @@ public final class CallController: ObservableObject {
     /// Invalidates callbacks and in-flight starts across configure/reset.
     private var callLifecycleGeneration = 0
 
-    private init() {}
+    init() {}
 
-    public func configure(with service: any SignalService, transport: any CallSignalTransport) {
+    public func configure(
+        with bridge: any CallNativeControlling,
+        transport: any CallSignalTransport
+    ) async {
         _ = transport // retained in the signature for existing integrations
+        // Retire the previous generation first so a late callback from the old
+        // bridge cannot run against the new configuration.
         callLifecycleGeneration += 1
+        await drainPendingTasks()
         startCallInFlight = false
-        signalTask?.cancel()
-        signalTask = nil
-        rustCore?.onCallSignal = nil
-        rustCore?.onCallState = nil
-        guard let rust = service as? RustCoreService else {
-            rustCore = nil
-            return
-        }
-        rustCore = rust
+        self.bridge?.onCallSignal = nil
+        self.bridge?.onCallState = nil
+        let nativeBridge = bridge
+        self.bridge = nativeBridge
         let callbackGeneration = callLifecycleGeneration
-        rust.onCallSignal = { [weak self] signal in
+        nativeBridge.onCallSignal = { [weak self] signal in
             Task { @MainActor [weak self] in
-                guard let self, self.callLifecycleGeneration == callbackGeneration else { return }
-                self.receive(signal)
+                guard let self else { return }
+                self.own("callback-\(UUID())") { [weak self] in
+                    guard let self, self.callLifecycleGeneration == callbackGeneration else { return }
+                    self.receive(signal)
+                }
             }
         }
-        rust.onCallState = { [weak self] event in
+        nativeBridge.onCallState = { [weak self] event in
             Task { @MainActor [weak self] in
-                guard let self, self.callLifecycleGeneration == callbackGeneration else { return }
-                self.receive(event)
+                guard let self else { return }
+                self.own("callback-\(UUID())") { [weak self] in
+                    guard let self, self.callLifecycleGeneration == callbackGeneration else { return }
+                    self.receive(event)
+                }
             }
+        }
+    }
+
+    private func own(_ key: String, _ body: @escaping @MainActor @Sendable () async -> Void) {
+        guard !isDrainingTasks else { return }
+        pendingTasks[key]?.cancel()
+        pendingTasks[key] = Task { @MainActor [weak self] in
+            await body()
+            guard let self, !Task.isCancelled else { return }
+            self.pendingTasks[key] = nil
+        }
+    }
+
+    private func drainPendingTasks() async {
+        isDrainingTasks = true
+        defer { isDrainingTasks = false }
+        // Bounded repeat: a native callback can land between the snapshot and
+        // the awaits below. Its body is fenced by the call lifecycle
+        // generation, but it must still be awaited, not leaked.
+        for _ in 0..<4 {
+            let batch = Array(pendingTasks.values)
+            pendingTasks.removeAll()
+            guard !batch.isEmpty else { return }
+            for task in batch { task.cancel() }
+            for task in batch { await task.value }
         }
     }
 
@@ -185,7 +233,7 @@ public final class CallController: ObservableObject {
         guard startGeneration == callLifecycleGeneration else {
             throw CallError.signalingFailed("call start cancelled")
         }
-        guard let rust = rustCore else { throw CallError.signalingFailed("call core unavailable") }
+        guard let rust = bridge else { throw CallError.signalingFailed("call core unavailable") }
         guard activeCall == nil else { throw CallError.alreadyInCall }
         guard !peer.isGroup else { throw CallError.signalingFailed("group calls are not supported") }
 
@@ -249,14 +297,18 @@ public final class CallController: ObservableObject {
 
     private func performAccept(nativeID: UInt64) {
         pendingAcceptIDs.remove(nativeID)
-        guard let rust = rustCore,
+        guard let rust = bridge,
               let recordID = recordIDByNativeID[nativeID],
               let call = activeCall,
               call.callRecord.id == recordID else { return }
-        Task { @MainActor [weak self] in
+        let generation = callLifecycleGeneration
+        own("accept-\(nativeID)") { [weak self] in
+            guard let self, generation == self.callLifecycleGeneration else { return }
             do {
                 try await rust.acceptCall(callId: nativeID)
-                guard let self, let current = self.activeCall,
+                guard !Task.isCancelled,
+                      generation == self.callLifecycleGeneration,
+                      let current = self.activeCall,
                       current.callRecord.id == recordID else { return }
                 var updated = current
                 updated.callRecord.state = .connecting
@@ -264,7 +316,9 @@ public final class CallController: ObservableObject {
                 self.onIncomingCallChanged?(nil)
                 self.onActiveCallChanged?(updated)
             } catch {
-                guard let self, let current = self.activeCall,
+                guard !Task.isCancelled,
+                      generation == self.callLifecycleGeneration,
+                      let current = self.activeCall,
                       current.callRecord.id == recordID else { return }
                 // Leave the call in Ringing so the user can retry.
                 var retry = current
@@ -287,7 +341,7 @@ public final class CallController: ObservableObject {
     }
 
     private func endCall(_ call: ActiveCall, reason: CallEndReason) async throws {
-        guard let rust = rustCore else { throw CallError.signalingFailed("call core unavailable") }
+        guard let rust = bridge else { throw CallError.signalingFailed("call core unavailable") }
         if let nativeID = nativeIDByRecord[call.callRecord.id] {
             try await rust.hangupCall()
             // Keep the ID until the native state callback arrives. If the
@@ -298,9 +352,12 @@ public final class CallController: ObservableObject {
                 activeCall = ending
                 onActiveCallChanged?(ending)
                 let recordID = call.callRecord.id
-                Task { @MainActor [weak self] in
+                let generation = callLifecycleGeneration
+                own("end-fallback-\(recordID)") { [weak self] in
                     try? await Task.sleep(for: .seconds(3))
-                    guard let self,
+                    guard !Task.isCancelled,
+                          let self,
+                          generation == self.callLifecycleGeneration,
                           let current = self.activeCall,
                           current.callRecord.id == recordID else { return }
                     self.finish(current, reason: reason)
@@ -312,8 +369,14 @@ public final class CallController: ObservableObject {
     }
 
     public func setMuted(_ muted: Bool) {
-        if let rust = rustCore {
-            Task { try? await rust.setCallMuted(muted) }
+        if let rust = bridge {
+            let generation = callLifecycleGeneration
+            // Coalesce by intent: only the most recent mute request matters,
+            // so a burst of taps cannot queue an unbounded backlog.
+            own("mute") { [weak self] in
+                guard !Task.isCancelled, self?.callLifecycleGeneration == generation else { return }
+                try? await rust.setCallMuted(muted)
+            }
         }
         guard var call = activeCall else { return }
         call.muted = muted
@@ -335,7 +398,15 @@ public final class CallController: ObservableObject {
         onActiveCallChanged?(call)
     }
 
+    /// Test seam: replaces the AVFoundation microphone prompt so the call
+    /// start/cancel path can be exercised without a device or TCC approval.
+    var microphonePermissionOverride: (@Sendable () async -> Bool)?
+
     private func ensureMicrophonePermission() async throws {
+        if let override = microphonePermissionOverride {
+            guard await override() else { throw CallError.microphonePermissionDenied }
+            return
+        }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             return
@@ -357,9 +428,7 @@ public final class CallController: ObservableObject {
     public func reset() {
         callLifecycleGeneration += 1
         startCallInFlight = false
-        if let rust = rustCore {
-            Task { try? await rust.setCallMuted(false) }
-        }
+        for task in pendingTasks.values { task.cancel() }
         activeCall = nil
         nativeIDByRecord.removeAll()
         recordIDByNativeID.removeAll()
@@ -370,15 +439,22 @@ public final class CallController: ObservableObject {
         pendingRemoteEndReasons.removeAll()
         onIncomingCallChanged?(nil)
         onActiveCallChanged?(nil)
-        rustCore?.onCallSignal = nil
-        rustCore?.onCallState = nil
-        rustCore = nil
+        bridge?.onCallSignal = nil
+        bridge?.onCallState = nil
+        bridge = nil
+    }
+
+    /// Reset and await queued accept/end/mute work before an authoritative
+    /// logout or account transition.
+    public func resetAndAwait() async {
+        reset()
+        await drainPendingTasks()
     }
 
     // MARK: - Core events
 
     private func receive(_ signal: CallSignal) {
-        guard rustCore != nil else { return }
+        guard bridge != nil else { return }
         switch signal.kind {
         case .offer:
             Log.info("call UI: received offer while active=\(activeCall != nil)")
@@ -438,7 +514,7 @@ public final class CallController: ObservableObject {
     }
 
     private func receive(_ event: CallStateEvent) {
-        guard rustCore != nil else { return }
+        guard bridge != nil else { return }
         nativeStates[event.callId] = event.state
         Log.info("call UI: native state \(event.state) for \(event.callId)")
         guard let recordID = recordIDByNativeID[event.callId],
@@ -523,9 +599,12 @@ public final class CallController: ObservableObject {
         Log.info("call UI: remote end received; waiting for native conclusion for \(nativeID)")
 
         let recordID = call.callRecord.id
-        Task { @MainActor [weak self] in
+        let generation = callLifecycleGeneration
+        own("remote-end-\(nativeID)") { [weak self] in
             try? await Task.sleep(for: .milliseconds(1500))
-            guard let self,
+            guard !Task.isCancelled,
+                  let self,
+                  generation == self.callLifecycleGeneration,
                   let reason = self.pendingRemoteEndReasons[nativeID],
                   let current = self.activeCall,
                   current.callRecord.id == recordID else { return }
