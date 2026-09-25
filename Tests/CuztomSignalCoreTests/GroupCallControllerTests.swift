@@ -191,7 +191,7 @@ struct GroupCallControllerTests {
 
         func members(masterKeyHex: String) -> [String] { memberACIs }
         func title(masterKeyHex: String) -> String { groupTitle }
-        func masterKeyHex(forGroupIdHex groupIdHex: String) -> String? {
+        func masterKeyHex(forGroupIdHex groupIdHex: String) async -> String? {
             knownGroupIdHex == groupIdHex ? Self.masterKeyHex : nil
         }
 

@@ -227,10 +227,22 @@ struct MessageListView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
-                            ForEach(Array(vm.messages.enumerated()), id: \.element.id) { index, msg in
+                            // Bound once per render pass. SwiftUI resolves row
+                            // bodies lazily and can do so after the list has
+                            // been replaced by a different chat, so reading
+                            // `vm.messages` inside the row body would mix a
+                            // row's index from one list with an array from
+                            // another. That mismatch is what trapped when
+                            // switching chats mid-scroll.
+                            let snapshot = vm.messages
+                            ForEach(Array(snapshot.enumerated()), id: \.element.id) { index, msg in
                                 MessageRow(
                                     msg: msg,
-                                    showsSender: shouldShowSender(at: index),
+                                    showsSender: shouldShowSender(
+                                        msg,
+                                        previous: index > 0 ? snapshot[index - 1] : nil,
+                                        in: snapshot
+                                    ),
                                     onOpenReply: { reference in
                                         openReply(reference, proxy: proxy)
                                     }
@@ -436,13 +448,27 @@ struct MessageListView: View {
         }
     }
 
-    private func shouldShowSender(at index: Int) -> Bool {
-        let message = vm.messages[index]
+    /// Whether a row should show its sender name.
+    ///
+    /// `message` and `previous` must both come from the same array snapshot the
+    /// row was built from. Reading `vm.messages` here instead would look up a
+    /// newer array than the one the row indexes came from: switching chats
+    /// replaces the list while a scroll animation is still resolving rows from
+    /// the previous chat, and the shorter list made this trap. That is why this
+    /// takes the row's own neighbour rather than an index.
+    private func shouldShowSender(
+        _ message: ChatMessage,
+        previous: ChatMessage?,
+        in snapshot: [ChatMessage]
+    ) -> Bool {
+        // A row is only ever asked about itself, so anything else is a
+        // programming error rather than something to guess at.
+        assert(snapshot.contains { $0.id == message.id })
+        _ = snapshot
         guard message.direction == .incoming, message.author.groupId != nil else {
             return false
         }
-        guard index > 0 else { return true }
-        let previous = vm.messages[index - 1]
+        guard let previous else { return true }
         let sameSender = previous.direction == .incoming
             && previous.author.groupId != nil
             && previous.author.uuidString == message.author.uuidString

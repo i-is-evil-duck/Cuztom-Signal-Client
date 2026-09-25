@@ -333,9 +333,11 @@ public final class GroupCallController: ObservableObject {
             throw SignalError.network("group call needs a group master key")
         }
         let groupIdHex = try await bridge.groupCallGroupId(masterKeyHex: key)
+        Log.info("[group-call] step=group-id-derived group=\(groupIdHex.prefix(8))…")
         let members = roster.members(masterKeyHex: key)
         let resolvedTitle = title ?? roster.title(masterKeyHex: key)
         let handle = try await bridge.startGroupCall(groupIdHex: groupIdHex, sfuURL: sfuURL)
+        Log.info("[group-call] step=client-created client=\(handle.clientId)")
 
         let stateID = UUID()
         session = Session(
@@ -357,6 +359,7 @@ public final class GroupCallController: ObservableObject {
         // Joining is what raises the membership-proof request. The SFU join is
         // blocked until a proof is presented, so this must happen now.
         try await bridge.joinGroupCall(handle)
+        Log.info("[group-call] step=join-requested client=\(handle.clientId)")
         return current ?? GroupCallState(
             id: stateID,
             groupIdHex: groupIdHex,
@@ -387,8 +390,11 @@ public final class GroupCallController: ObservableObject {
             await leaveActiveCall()
         }
         guard let bridge else { return }
-        guard let masterKeyHex = roster.masterKeyHex(forGroupIdHex: groupIdHex) else {
-            Log.error("[group-call] inbound call for a group this device is not in")
+        guard let masterKeyHex = await roster.masterKeyHex(forGroupIdHex: groupIdHex) else {
+            // Either this device is not in that group, or the id-to-key map
+            // could not be read. Both mean the call is not receivable, and both
+            // are reported rather than guessed around.
+            Log.error("[group-call] inbound call could not be resolved to a local group")
             return
         }
         do {
@@ -496,22 +502,28 @@ public final class GroupCallController: ObservableObject {
         }
     }
 
-    /// Fetch, redeem, and present the membership proof.
+    /// Present a membership proof.
     ///
     /// This is the step that unblocks the SFU join. It cannot be skipped or
     /// approximated: the token comes from a ZK credential the service issued, so
     /// there is nothing to fall back to.
+    ///
+    /// Every step is logged by name but never by value. The authorization string
+    /// and the resulting token are both secret, and neither is written anywhere.
     private func presentMembershipProof(clientId: UInt32) async {
         guard let bridge, let session, session.handle.clientId == clientId else { return }
         do {
+            Log.info("[group-call] step=proof-fetch client=\(clientId)")
             let authorization = try await bridge.groupCallProofAuthorization(
                 groupIdHex: session.handle.groupIdHex
             )
+            Log.info("[group-call] step=proof-redeem client=\(clientId)")
             let proof = try await redeemer.fetchToken(
                 cdnBaseURL: cdnBaseURL,
                 authorization: authorization,
                 groupIdHex: session.handle.groupIdHex
             )
+            Log.info("[group-call] step=proof-present client=\(clientId) tokenBytes=\(proof.token.count)")
             guard self.session?.handle.clientId == clientId else {
                 // The call ended while the CDN round trip was in flight. The
                 // token is dropped rather than handed to a dead client.
@@ -519,6 +531,7 @@ public final class GroupCallController: ObservableObject {
             }
             try await bridge.groupCallSetMembershipProof(clientId: clientId, token: proof.token)
             self.session?.proofPresented = true
+            Log.info("[group-call] step=proof-accepted client=\(clientId)")
         } catch {
             fail("Could not join the call: \(Self.describe(error))")
         }
@@ -536,12 +549,14 @@ public final class GroupCallController: ObservableObject {
             fail("Could not read the group's members: \(Self.describe(error))")
             return
         }
+        Log.info("[group-call] step=members-built client=\(clientId) count=\(identities.count)")
         guard self.session?.handle.clientId == clientId else { return }
         do {
             try await bridge.groupCallSetGroupMembers(
                 clientId: clientId,
                 members: identities.map { (userId: $0.userId, memberId: $0.memberId) }
             )
+            Log.info("[group-call] step=members-sent client=\(clientId)")
         } catch {
             fail("Could not send the group's members: \(Self.describe(error))")
         }
@@ -555,6 +570,9 @@ public final class GroupCallController: ObservableObject {
     /// is different from an HTTP error status.
     private func performSFURequest(_ request: RustCoreService.PendingHTTPRequest) async {
         guard let bridge else { return }
+        // The method and path are logged; the headers carry the membership proof
+        // and are never written.
+        Log.info("[group-call] step=sfu-request id=\(request.requestId) \(request.method) \(Self.sanitizedPath(request.url))")
         do {
             let result = try await http.perform(request)
             try await bridge.deliverHTTPResponse(
@@ -562,7 +580,9 @@ public final class GroupCallController: ObservableObject {
                 status: result.status,
                 body: result.body
             )
+            Log.info("[group-call] step=sfu-answered id=\(request.requestId) status=\(result.status)")
         } catch {
+            Log.error("[group-call] sfu request \(request.requestId) failed: \(Self.describe(error))")
             try? await bridge.deliverHTTPResponse(
                 requestId: request.requestId,
                 status: nil,
@@ -633,6 +653,16 @@ public final class GroupCallController: ObservableObject {
         trackedTasks.removeAll()
     }
 
+    /// A request URL reduced to host and path, so an SFU request can be
+    /// identified in the log without writing query values, which can carry
+    /// identifiers.
+    static func sanitizedPath(_ url: String) -> String {
+        guard let parsed = URL(string: url), let host = parsed.host else {
+            return "<unparsable url>"
+        }
+        return host + parsed.path
+    }
+
     /// A message safe to put in front of a user.
     ///
     /// Native errors are passed through because they are written for this
@@ -661,7 +691,8 @@ public final class GroupCallController: ObservableObject {
 extension GroupCallProofService: GroupCallController.ProofRedeeming {}
 
 /// Group membership and titles, which the controller needs but should not own.
-public protocol GroupRosterProviding: Sendable {    /// Member ACI UUIDs for a group, in any order.
+public protocol GroupRosterProviding: Sendable {
+    /// Member ACI UUIDs for a group, in any order.
     func members(masterKeyHex: String) -> [String]
     /// A display name, or an empty string when unknown.
     func title(masterKeyHex: String) -> String
@@ -669,7 +700,13 @@ public protocol GroupRosterProviding: Sendable {    /// Member ACI UUIDs for a g
     ///
     /// An inbound call can only be joined by mapping its group id back to a
     /// group on this device. Returning `nil` means the call is not receivable.
-    func masterKeyHex(forGroupIdHex groupIdHex: String) -> String?
+    ///
+    /// This is `async` because the mapping may need reading from the store on
+    /// first use. It cannot be fetched eagerly at startup: the mapping lives
+    /// behind the sync loop's live manager, which is not running yet at that
+    /// point, so an eager read always fails and inbound calls then stay
+    /// unresolvable for the life of the process.
+    func masterKeyHex(forGroupIdHex groupIdHex: String) async -> String?
 }
 
 /// A roster that knows nothing, so the controller is usable before the host
@@ -679,5 +716,5 @@ public struct EmptyGroupRoster: GroupRosterProviding {
     public init() {}
     public func members(masterKeyHex: String) -> [String] { [] }
     public func title(masterKeyHex: String) -> String { "" }
-    public func masterKeyHex(forGroupIdHex groupIdHex: String) -> String? { nil }
+    public func masterKeyHex(forGroupIdHex groupIdHex: String) async -> String? { nil }
 }

@@ -1921,6 +1921,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         // The key is account-bound to the wiped native store. Delete it only
         // after the database wipe and all Swift cache removal succeeded.
         try KeychainSecretStore().deleteStrict(key: Self.nativeStoreKeychainAccount)
+        // The presentation store's key is wiped separately, and this process may
+        // have cached it. A relink must re-read the Keychain rather than reuse
+        // this process's copy of a key that no longer matches any database.
+        KeychainSecretStore.invalidateResolvedSecrets()
         #endif
 
         setInitializedState(false)
@@ -2498,7 +2502,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let keychain = KeychainSecretStore()
         let keyData: Data
         do {
-            if let existing = try keychain.loadStrict(key: Self.nativeStoreKeychainAccount) {
+            let existing = try keychain.loadStrict(key: Self.nativeStoreKeychainAccount)
+            if let existing {
                 guard existing.count == 32 else {
                     throw SignalError.storage("native database key has an invalid length")
                 }

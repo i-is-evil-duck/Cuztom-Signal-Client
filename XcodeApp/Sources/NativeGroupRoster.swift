@@ -41,8 +41,25 @@ public final class NativeGroupRoster: GroupRosterProviding, @unchecked Sendable 
         lock.withLock { cached[masterKeyHex]?.title ?? titles[masterKeyHex] ?? "" }
     }
 
-    public func masterKeyHex(forGroupIdHex groupIdHex: String) -> String? {
-        lock.withLock { groupIdToMasterKey?[groupIdHex] }
+    /// Resolve a ZK group id to one of this device's groups, reading the map on
+    /// first use.
+    ///
+    /// The map is loaded lazily rather than at startup because it lives behind
+    /// the sync loop's live manager, which is not running yet when the app
+    /// finishes configuring. Loading it eagerly failed every launch, which left
+    /// inbound group calls unresolvable for the rest of the process.
+    public func masterKeyHex(forGroupIdHex groupIdHex: String) async -> String? {
+        if let known = lock.withLock({ groupIdToMasterKey?[groupIdHex] }) {
+            return known
+        }
+        // Empty or stale: refresh once, then look again. A group this device has
+        // left is simply absent from the map, so a second lookup coming back
+        // empty is the answer rather than a failure worth retrying.
+        guard (try? await loadGroupIdMap()) != nil else {
+            Log.error("[group-call] group id map unreadable; inbound calls are unresolvable")
+            return nil
+        }
+        return lock.withLock { groupIdToMasterKey?[groupIdHex] }
     }
 
     /// Read a group's roster into the cache.

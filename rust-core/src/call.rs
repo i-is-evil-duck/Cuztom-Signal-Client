@@ -796,6 +796,7 @@ pub async fn prepare_group_call_proof(
     group_id: &[u8],
     our_aci: &str,
 ) -> Result<String, String> {
+    eprintln!("[core] group call proof: resolving group id to a local group");
     let master_key = crate::sync::group_master_key_for_id(manager, group_id).await?;
     let aci = crate::sync::parse_service_id(our_aci)?;
     let now = std::time::SystemTime::now()
@@ -803,12 +804,25 @@ pub async fn prepare_group_call_proof(
         .map_err(|e| e.to_string())?
         .as_secs();
     let day = crate::group_calls::current_redemption_day(now);
+    eprintln!("[core] group call proof: requesting ZK auth credentials");
     let (body, server_params) = manager
         .group_auth_credentials_raw(day, day + 1)
         .await
         .map_err(|e| format!("group credential request: {e}"))?;
-    crate::group_calls::build_proof_authorization(&master_key, &body, &server_params, aci, day)
-        .map_err(|e| e.to_string())
+    // The credential body is secret, so only its shape is reported.
+    eprintln!(
+        "[core] group call proof: credential response {} bytes",
+        body.len()
+    );
+    let authorization =
+        crate::group_calls::build_proof_authorization(&master_key, &body, &server_params, aci, day)
+            .map_err(|e| e.to_string())?;
+    // The authorization string is the membership proof itself and is never logged.
+    eprintln!(
+        "[core] group call proof: presented {} hex chars",
+        authorization.len()
+    );
+    Ok(authorization)
 }
 
 /// Hand a group-call membership proof to RingRTC.
@@ -1652,6 +1666,7 @@ async fn send_group_call_signal(
     group_id: &[u8],
     proto: Vec<u8>,
 ) -> Result<(), String> {
+    eprintln!("[core] group call proof: resolving group id to a local group");
     let master_key = crate::sync::group_master_key_for_id(manager, group_id).await?;
     // presage panics on a master key that is not 32 bytes, so the length is
     // checked here rather than discovered as an abort.

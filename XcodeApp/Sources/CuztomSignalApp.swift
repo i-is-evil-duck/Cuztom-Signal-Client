@@ -325,15 +325,10 @@ final class ChatViewModel {
                 self.sync()
             }
         }
-        Task {
-            do {
-                try await roster.loadGroupIdMap()
-            } catch {
-                // Reported rather than fatal: an inbound call that cannot be
-                // resolved is skipped, and an outgoing one still works.
-                Log.error("[group-call] group id map unavailable: \(error.localizedDescription)")
-            }
-        }
+        // The id-to-key map is deliberately *not* loaded here. It lives behind
+        // the sync loop's live manager, which is not running at configure time,
+        // so an eager read fails and inbound group calls stay unresolvable for
+        // the rest of the process. `NativeGroupRoster` loads it on first use.
         // Wire typing indicator callback to update ViewModel state
         controller.onTypingUpdateWithID = { [weak self] thread, senderID, senderName, started in
             Task { @MainActor in

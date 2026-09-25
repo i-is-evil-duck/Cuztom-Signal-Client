@@ -77,7 +77,8 @@ enum PresentationDatabaseSecurity {
         #if canImport(Security)
         let keychain = KeychainSecretStore()
         let account = keychainAccount(for: url)
-        if let existing = try keychain.loadStrict(key: account) {
+        let existing = try keychain.loadStrict(key: account)
+        if let existing {
             guard existing.count == 32 else {
                 throw SignalError.storage("presentation database key has an invalid length")
             }

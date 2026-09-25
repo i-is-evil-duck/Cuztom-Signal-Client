@@ -29,8 +29,31 @@ import Security
 /// like signal-bridge-V2 used (`config/instagram_session.json` + bind mounts).
 public struct KeychainSecretStore: SecretStoring {
     private let service: String
+
+    /// Values already read in this process, keyed by account.
+    ///
+    /// A Keychain read of an item created by a *different* code signature makes
+    /// macOS show an authorization prompt. Reading the same item again in the
+    /// same process prompts again, so a second read of an already-resolved key
+    /// costs the user another click for no new information. Caching means each
+    /// account is read at most once per launch, and the prompt count becomes the
+    /// number of distinct keys rather than the number of call sites.
+    ///
+    /// Cleared explicitly on logout, because a relink must be able to read a
+    /// freshly written key rather than the one this process resolved earlier.
+    private static let resolved = NSLock()
+    nonisolated(unsafe) private static var cache: [String: Data] = [:]
+
     public init(service: String = "top.furryfemboys.cuztom-signal") {
         self.service = service
+    }
+
+    /// Forget every cached value. Called on logout and relink so the next
+    /// database open re-reads the Keychain rather than trusting this process.
+    public static func invalidateResolvedSecrets() {
+        resolved.lock()
+        cache.removeAll()
+        resolved.unlock()
     }
 
     public func load(key: String) async -> Data? {
@@ -41,6 +64,14 @@ public struct KeychainSecretStore: SecretStoring {
     /// genuinely missing item from a locked/inaccessible Keychain. Callers
     /// must never generate replacement encryption material on the latter.
     public func loadStrict(key: String) throws -> Data? {
+        let cacheKey = "\(service)/\(key)"
+        Self.resolved.lock()
+        if let cached = Self.cache[cacheKey] {
+            Self.resolved.unlock()
+            return cached
+        }
+        Self.resolved.unlock()
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -55,24 +86,42 @@ public struct KeychainSecretStore: SecretStoring {
             guard let data = item as? Data else {
                 throw SignalError.storage("keychain returned an invalid value")
             }
+            Self.remember(cacheKey, data)
             return data
         case errSecItemNotFound:
+            // Not cached: a missing item may be created moments later by
+            // `loadOrCreateRandom`, and caching the absence would make that
+            // look like a second missing read.
+            Log.info("[keychain] no item for \(key)")
             return nil
         default:
-            throw SignalError.storage("keychain read failed: \(status)")
+            // Not cached either, so a transient failure does not become a
+            // sticky "no key" for the rest of the process.
+            throw SignalError.storage("keychain read failed: \(status) for \(key)")
         }
+    }
+
+    private static func remember(_ cacheKey: String, _ data: Data) {
+        resolved.lock()
+        cache[cacheKey] = data
+        resolved.unlock()
+        Log.info("[keychain] resolved \(cacheKey) (\(data.count) bytes)")
     }
 
     /// Return the existing secret or create one only when the item is truly
     /// absent. This is synchronous so initialization can be serialized without
     /// holding a lock across an `await`.
+    ///
+    /// A caller that has just read the item will not cause a second prompt: the
+    /// value it resolved is cached, and a read of an absent item does not
+    /// trigger an authorization check.
     public func loadOrCreateRandom(key: String, count: Int = 32) throws -> Data {
         guard count > 0 else { throw SignalError.storage("keychain secret length is invalid") }
-        if let existing = try loadStrict(key: key) {
-            guard existing.count == count else {
+        if let found = try loadStrict(key: key) {
+            guard found.count == count else {
                 throw SignalError.storage("keychain secret has an invalid length")
             }
-            return existing
+            return found
         }
         var bytes = [UInt8](repeating: 0, count: count)
         let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
@@ -80,9 +129,12 @@ public struct KeychainSecretStore: SecretStoring {
             throw SignalError.storage("secure random generation failed: \(status)")
         }
         let data = Data(bytes)
-        if let existing = try addIfAbsent(key: key, value: data) {
-            return existing
+        if let won = try addIfAbsent(key: key, value: data) {
+            return won
         }
+        // The item now exists and this process created it, so remember it rather
+        // than reading it back.
+        Self.remember("\(service)/\(key)", data)
         return data
     }
 
@@ -154,6 +206,11 @@ public struct KeychainSecretStore: SecretStoring {
             kSecAttrAccount as String: key,
         ]
         let status = SecItemDelete(query as CFDictionary)
+        // Forget the cached copy first: leaving it would let the rest of this
+        // process keep opening a database with a key that no longer exists.
+        Self.resolved.lock()
+        Self.cache.removeValue(forKey: "\(service)/\(key)")
+        Self.resolved.unlock()
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw SignalError.storage("keychain delete failed: \(status)")
         }
