@@ -449,6 +449,16 @@ private struct ReactionSummary: Identifiable {
     var id: String { emoji }
 }
 
+/// Reports the width a message bubble's content wants. Each `MessageRow`
+/// observes the value produced by its own subtree, so rows measure
+/// independently.
+private struct MessageContentWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat { 0 }
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct MessageRow: View {
     @Environment(ChatViewModel.self) private var vm
     var msg: ChatMessage
@@ -457,8 +467,31 @@ struct MessageRow: View {
 
     private let quickEmojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
 
+    /// Bubbles hug their content between these bounds. A plain
+    /// `.frame(maxWidth:)` is greedy: it expands to the proposed width, which
+    /// made every bubble — including a one-character message and every
+    /// attachment — render at the full maximum. Measuring the content and
+    /// clamping it keeps short text narrow, lets media sit at its own size,
+    /// and still wraps long text at the maximum.
+    private let minBubbleWidth: CGFloat = 64
+    private let maxBubbleWidth: CGFloat = 460
+    /// Receipt lists name every reader, so cap them well below the bubble
+    /// maximum; otherwise they alone stretch the bubble to full width.
+    private let receiptLineWidth: CGFloat = 320
+
+    @State private var contentWidth: CGFloat = 0
+
     private var isGroupMessage: Bool {
         msg.author.groupId != nil
+    }
+
+    private var bubbleWidth: CGFloat {
+        guard contentWidth > 0 else { return minBubbleWidth }
+        return min(max(contentWidth, minBubbleWidth), maxBubbleWidth)
+    }
+
+    private var bubbleAlignment: Alignment {
+        msg.direction == .outgoing ? .trailing : .leading
     }
 
     var body: some View {
@@ -503,7 +536,6 @@ struct MessageRow: View {
                                     .lineLimit(2)
                             }
                         }
-                        .frame(maxWidth: 380, alignment: .leading)
                         .padding(6)
                         .background(Color.accentColor.opacity(0.10))
                         .clipShape(RoundedRectangle(cornerRadius: 7))
@@ -555,12 +587,26 @@ struct MessageRow: View {
                     Button {
                         vm.receiptTarget = msg
                     } label: {
-                        Text(receiptLine).font(.caption2).foregroundStyle(.secondary)
+                        Text(receiptLine)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            // Without a cap this one line is wide enough to
+                            // stretch the whole bubble to its maximum.
+                            .frame(maxWidth: receiptLineWidth, alignment: .leading)
                     }
                     .buttonStyle(.plain)
                 }
             }
-            .frame(maxWidth: 560, alignment: .leading)
+            .background {
+                // Measure before clamping: the background is sized by the
+                // content's own layout, so this reports the width the content
+                // actually wants, not the clamped bubble width.
+                GeometryReader { proxy in
+                    Color.clear.preference(key: MessageContentWidthKey.self, value: proxy.size.width)
+                }
+            }
+            .frame(width: bubbleWidth, alignment: .leading)
             .padding(8)
             .background(msg.direction == .outgoing ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -591,6 +637,11 @@ struct MessageRow: View {
                 }
             }
             if msg.direction == .incoming { Spacer() }
+        }
+        .onPreferenceChange(MessageContentWidthKey.self) { width in
+            // Only react to real changes; the clamp is applied on read so the
+            // value itself can stay unclamped.
+            if abs(width - contentWidth) > 0.5 { contentWidth = width }
         }
     }
 
@@ -707,7 +758,7 @@ struct AttachmentRow: View {
                     }
                 }
                 .padding(6)
-                .frame(maxWidth: 480, alignment: .leading)
+                .frame(maxWidth: 300, alignment: .leading)
                 .background(Color.gray.opacity(0.1))
                 .cornerRadius(6)
             }
@@ -1243,7 +1294,9 @@ struct LinkPreviewsView: View {
                             }
                     }
                 }
-                .frame(maxWidth: 520, alignment: .leading)
+                // No max-width frame here: a greedy frame would make every
+                // message that contains a link report a full-width bubble.
+                // The surrounding bubble owns the maximum.
             }
         }
         .task(id: text) {

@@ -148,20 +148,28 @@ The UI build tag comes from `CFBundleShortVersionString`/`CFBundleVersion`; a
 bundle built by the script shows e.g. `Build 0.1.0 (1)`, local SwiftPM runs show
 `Build dev`, and CI can override it with `CUZTOM_SIGNAL_BUILD_TAG`.
 
+An ad-hoc signature is derived from the binary, so every rebuild produces a new
+app identity. macOS therefore re-prompts for access to the existing Signal
+database key after each rebuild; choose **Always Allow** in that dialog, or the
+app cannot decrypt its message store. A stable Developer ID removes this
+friction (see Milestone 7).
+
 ## Verification status
 
 | Area | Status |
 |---|---|
-| Swift core tests | **71 passed** with full Xcode |
+| Swift core tests | **78 passed** with full Xcode |
 | Rust library tests | **11 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |
 | Ad-hoc signed bundle | Built and launched; embedded dylib passes in-bundle/signature/hash/ABI checks |
+| Call audio routing | Built-in ⇄ headset toggle via the CoreAudio default output; verified by unit tests on real devices |
 | QR link/resume | Manually verified |
 | Contacts/groups/name resolution | Manually verified after fresh reset |
 | 1:1/group text routing | Manually verified |
 | Duplicate/control-envelope cleanup | Verified against the local encrypted SQLite store |
 | Presentation SQLCipher migration | Plaintext export, encrypted reopen, and wrong-key rejection tested |
+| Keychain access in a signed app | Ad-hoc rebuilds re-prompt for the database key; stable-identity behaviour still open (Milestone 7) |
 | 1:1 native voice call | Manually verified with two-way audio |
 | Group call | Not enabled; blocked on SFU/membership-proof work |
 | 500-message paging | Still needs a dedicated manual test |

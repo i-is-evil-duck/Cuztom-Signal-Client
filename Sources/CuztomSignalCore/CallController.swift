@@ -134,6 +134,7 @@ public final class CallController: ObservableObject {
     public var onActiveCallChanged: ((ActiveCall?) -> Void)?
 
     private var bridge: (any CallNativeControlling)?
+    private var audioRouter: any CallAudioRouting
     private var pendingTasks: [String: Task<Void, Never>] = [:]
     /// While queued call work is being drained, a late native callback must not
     /// register new work that this drain would not await.
@@ -157,7 +158,27 @@ public final class CallController: ObservableObject {
     /// Invalidates callbacks and in-flight starts across configure/reset.
     private var callLifecycleGeneration = 0
 
-    init() {}
+    init(audioRouter: any CallAudioRouting = AudioOutputRouter()) {
+        self.audioRouter = audioRouter
+    }
+
+    /// `false` when the machine has only one audio output, so the UI can hide
+    /// or disable the speaker control instead of offering a dead button.
+    public var canToggleSpeaker: Bool {
+        let routes = audioRouter.availableOutputRoutes()
+        guard routes.count > 1 else { return false }
+        return routes.contains(where: \.isBuiltIn)
+    }
+
+    /// Where a speaker toggle would send audio, for the button's tooltip.
+    public var speakerRouteDescription: String {
+        let routes = audioRouter.availableOutputRoutes()
+        let target = routes.first(where: { $0.isBuiltIn })
+        guard let target else { return "No built-in speaker" }
+        return activeCall?.speakerOn == true
+            ? "Switch to \(target.name)"
+            : "Switch to built-in speaker"
+    }
 
     public func configure(
         with bridge: any CallNativeControlling,
@@ -229,6 +250,9 @@ public final class CallController: ObservableObject {
         startCallInFlight = true
         let startGeneration = callLifecycleGeneration
         defer { startCallInFlight = false }
+        // Remember where audio is playing before the call so the speaker
+        // toggle can return here, and so ending the call restores it.
+        audioRouter.captureCurrentRoute()
         try await ensureMicrophonePermission()
         guard startGeneration == callLifecycleGeneration else {
             throw CallError.signalingFailed("call start cancelled")
@@ -384,11 +408,31 @@ public final class CallController: ObservableObject {
         onActiveCallChanged?(call)
     }
 
+    /// Toggle between the built-in speaker and the connected headset.
+    ///
+    /// The `speakerOn` flag is only updated once the system output actually
+    /// changed, so the button never claims a route that did not switch. A
+    /// machine with a single output, or a CoreAudio refusal, leaves the state
+    /// alone and reports through the log.
     public func setSpeakerOn(_ on: Bool) {
-        guard var call = activeCall else { return }
-        call.speakerOn = on
-        activeCall = call
-        onActiveCallChanged?(call)
+        guard activeCall != nil else { return }
+        let generation = callLifecycleGeneration
+        own("speaker") { [weak self] in
+            guard let self, !Task.isCancelled,
+                  generation == self.callLifecycleGeneration else { return }
+            do {
+                try await self.audioRouter.setSpeakerphone(on)
+            } catch {
+                Log.error("speaker toggle failed: \(error)")
+                return
+            }
+            guard !Task.isCancelled,
+                  generation == self.callLifecycleGeneration,
+                  var call = self.activeCall else { return }
+            call.speakerOn = on
+            self.activeCall = call
+            self.onActiveCallChanged?(call)
+        }
     }
 
     public func setLocalVideoEnabled(_ enabled: Bool) {
@@ -449,6 +493,8 @@ public final class CallController: ObservableObject {
     public func resetAndAwait() async {
         reset()
         await drainPendingTasks()
+        // Also undo a speaker toggle that outlived the call itself.
+        await audioRouter.restoreCapturedRoute()
     }
 
     // MARK: - Core events
@@ -481,6 +527,9 @@ public final class CallController: ObservableObject {
                 nativeReadyIDs.insert(signal.callId)
             }
             finishedNativeIDs.remove(signal.callId)
+            // Remember the pre-call route for an inbound call too, so the
+            // speaker toggle can return to it and hangup can restore it.
+            audioRouter.captureCurrentRoute()
             let call = ActiveCall(callRecord: record)
             activeCall = call
             if nativeAlreadyConnected {
@@ -640,6 +689,11 @@ public final class CallController: ObservableObject {
         activeCall = nil
         onIncomingCallChanged?(nil)
         onActiveCallChanged?(nil)
+        // A speaker toggle is a temporary deviation; put audio back where the
+        // user had it. Tracked so teardown can await it.
+        own("speaker-restore") { [weak self] in
+            await self?.audioRouter.restoreCapturedRoute()
+        }
     }
 
     private func reason(for state: String) -> CallEndReason {

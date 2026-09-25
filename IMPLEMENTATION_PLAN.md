@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 71/71 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 78/78 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 11/11 passed |
@@ -519,6 +519,20 @@ this environment:
 
 These are tracked in the two-client integration section below and must stay
 open until they are actually run.
+
+#### Phase 1 manual verification status 2026-09-25
+
+A first real-device pass confirmed linking, messaging, media, and a two-way
+1:1 call, and surfaced one packaging finding:
+
+- An ad-hoc signature is derived from the binary, so every rebuild is a new app
+  identity to macOS. The app now re-prompts for access to the existing Signal
+  database key on each rebuild, and the encrypted message store cannot be
+  opened until the user approves it. This is expected for ad-hoc signing, not a
+  storage regression, but it must be re-checked with a stable Developer ID
+  (Milestone 7) before any release claim.
+
+Real logout, relink, and account switching on device are still to be run.
 
 ---
 

@@ -226,12 +226,16 @@ struct CallControlsBar: View {
                 callController.setMuted(!call.muted)
             }
 
-            // Speaker
+            // Speaker: switches the system output between the built-in
+            // speaker and the connected headset. Disabled when the machine has
+            // only one output device, so the control is never a dead button.
             ControlButton(
                 icon: call.speakerOn ? "speaker.wave.3.fill" : "speaker.wave.2.fill",
                 label: call.speakerOn ? "Speaker Off" : "Speaker On",
                 isActive: call.speakerOn,
-                color: .white
+                color: .white,
+                isEnabled: callController.canToggleSpeaker,
+                help: callController.speakerRouteDescription
             ) {
                 callController.setSpeakerOn(!call.speakerOn)
             }
@@ -269,6 +273,8 @@ struct ControlButton: View {
     let label: String
     let isActive: Bool
     let color: Color
+    var isEnabled: Bool = true
+    var help: String?
     let action: () -> Void
 
     var body: some View {
@@ -280,13 +286,18 @@ struct ControlButton: View {
                     .frame(width: 72, height: 72)
                     .background(isActive ? color.opacity(0.2) : Color.white.opacity(0.15))
                     .clipShape(Circle())
+                    .opacity(isEnabled ? 1 : 0.4)
 
                 Text(label)
                     .font(.caption)
                     .foregroundStyle(.white)
+                    .opacity(isEnabled ? 1 : 0.4)
             }
         }
         .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .help(help ?? label)
+        .accessibilityLabel(label)
     }
 }
 

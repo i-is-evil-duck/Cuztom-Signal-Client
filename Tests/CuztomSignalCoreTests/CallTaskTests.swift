@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import CuztomSignalCore
 
-private final class ScriptedCallBridge: CallNativeControlling, CallSignalTransport, @unchecked Sendable {
+final class ScriptedCallBridge: CallNativeControlling, CallSignalTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var signalHandler: ((CallSignal) -> Void)?
     private var stateHandler: ((CallStateEvent) -> Void)?
@@ -92,6 +92,16 @@ private final class ScriptedCallBridge: CallNativeControlling, CallSignalTranspo
 
     var incomingCallSignals: AsyncStream<CallSignalMessage> {
         AsyncStream { $0.finish() }
+    }
+
+    /// Deliver a native signaling event to whoever configured this bridge.
+    func emit(_ signal: CallSignal) {
+        onCallSignal?(signal)
+    }
+
+    /// Deliver a native media state transition to whoever configured this bridge.
+    func emit(_ event: CallStateEvent) {
+        onCallState?(event)
     }
 
     deinit {

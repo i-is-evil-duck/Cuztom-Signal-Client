@@ -94,3 +94,8 @@ codesign --verify --deep --strict --verbose=2 "$bundle" 2>&1 | sed 's/^/    /'
 "$root/scripts/verify-app.sh" "$bundle"
 echo "==> Built $bundle (version $version build $build)"
 echo "    Run with: open \"$bundle\""
+echo
+echo "    Heads-up: an ad-hoc signature changes with every rebuild, so macOS"
+echo "    treats each build as a new app and re-prompts for access to the"
+echo "    existing Signal database key. Choose 'Always Allow' when the keychain"
+echo "    dialog appears, otherwise the app cannot decrypt its message store."
