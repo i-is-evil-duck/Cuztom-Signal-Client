@@ -39,6 +39,7 @@ public final class ChatController: @unchecked Sendable {
     private var observerTask: Task<Void, Never>?
     private var watchTask: Task<Void, Never>?
     private var autoFetchTask: Task<Void, Never>?
+    private var liveFetchTasks: [UUID: Task<Void, Never>] = [:]
     private let pluginHost: PluginHost
     private let contactResolver: ContactResolver
 
@@ -681,16 +682,22 @@ public final class ChatController: @unchecked Sendable {
 
     private func cancelOwnedTasks() async {
         let tasks = [observerTask, watchTask, autoFetchTask, rosterRefreshTask]
+        let liveTasks = Array(liveFetchTasks.values)
         observerTask?.cancel()
         watchTask?.cancel()
         autoFetchTask?.cancel()
         rosterRefreshTask?.cancel()
+        for task in liveFetchTasks.values { task.cancel() }
+        liveFetchTasks.removeAll()
         observerTask = nil
         watchTask = nil
         autoFetchTask = nil
         rosterRefreshTask = nil
         for task in tasks {
             await task?.value
+        }
+        for task in liveTasks {
+            await task.value
         }
     }
 
@@ -1035,6 +1042,7 @@ public final class ChatController: @unchecked Sendable {
         notifyStateChange()
         if inserted && message.direction == .incoming {
             onIncomingMessage?(message)
+            scheduleLiveAttachmentFetch(for: message.id)
         }
 
         // Auto-send delivery receipt for incoming messages
@@ -1067,6 +1075,32 @@ public final class ChatController: @unchecked Sendable {
         await pluginHost.notifyMessage(message, ctx: ctx)
     }
 
+    private func scheduleLiveAttachmentFetch(for messageID: UUID) {
+        guard service is RustCoreService, liveFetchTasks[messageID] == nil else { return }
+        let lifecycle = lifecycleGeneration
+        liveFetchTasks[messageID] = Task { @MainActor [weak self] in
+            await self?.autoFetchMessage(messageID, lifecycle: lifecycle)
+            self?.liveFetchTasks[messageID] = nil
+        }
+    }
+
+    private func autoFetchMessage(_ messageID: UUID, lifecycle: Int) async {
+        guard lifecycle == lifecycleGeneration,
+              let message = await store.message(id: messageID) else { return }
+        var fetched = 0
+        for index in message.attachments.indices {
+            guard lifecycle == lifecycleGeneration, fetched < 4 else { return }
+            let attachment = message.attachments[index]
+            guard (attachment.isImage || attachment.isVideo),
+                  attachment.localURL == nil,
+                  attachment.byteCount > 0,
+                  attachment.byteCount <= 25_000_000 else { continue }
+            if await downloadAttachment(messageId: messageID, index: index) {
+                fetched += 1
+            }
+        }
+    }
+
     /// Auto-fetch missing attachments after launch (roster seeds metadata
     /// only). Media (images/video, incl. GIFs) fetch automatically; other
     /// file types stay manual. Bounded: newest-first, capped count.
@@ -1093,7 +1127,10 @@ public final class ChatController: @unchecked Sendable {
                     let stillHasFile = att.localURL.map {
                         FileManager.default.fileExists(atPath: $0.path)
                     } ?? false
-                    guard !stillHasFile, att.isImage || att.isVideo else { continue }
+                    guard !stillHasFile,
+                          att.isImage || att.isVideo,
+                          att.byteCount > 0,
+                          att.byteCount <= 25_000_000 else { continue }
                     if await downloadAttachment(messageId: m.id, index: idx) {
                         fetched += 1
                     }

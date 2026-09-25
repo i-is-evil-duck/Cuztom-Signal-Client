@@ -378,6 +378,7 @@ fn mime_extension(mime: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(dead_code)]
 pub fn is_media_attachment(p: &AttachmentPointer) -> bool {
     let mime = normalized_attachment_mime(p);
     mime.starts_with("image/") || mime.starts_with("video/")
@@ -405,11 +406,36 @@ fn effective_attachment_name(p: &AttachmentPointer, mime: &str) -> String {
 
 /// Max auto-download per attachment (25 MB); larger stay metadata-only.
 pub const MAX_AUTO_DOWNLOAD_BYTES: u32 = 25_000_000;
+/// Keep the media cache bounded even when a user downloads many files.
+pub const MAX_ATTACHMENT_CACHE_BYTES: u64 = 500_000_000;
 
 fn caches_dir() -> std::path::PathBuf {
     std::env::var("HOME")
         .map(|h| std::path::PathBuf::from(h).join("Library/Caches/CuztomSignal"))
         .unwrap_or_else(|_| std::env::temp_dir().join("CuztomSignal"))
+}
+
+fn enforce_attachment_cache_quota() {
+    let root = caches_dir();
+    let Ok(entries) = std::fs::read_dir(&root) else { return };
+    let mut files: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else { continue };
+        if !metadata.is_file() { continue; }
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        total = total.saturating_add(metadata.len());
+        files.push((path, modified, metadata.len()));
+    }
+    if total <= MAX_ATTACHMENT_CACHE_BYTES { return; }
+    files.sort_by_key(|(_, modified, _)| *modified);
+    for (path, _, size) in files {
+        if total <= MAX_ATTACHMENT_CACHE_BYTES { break; }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
 }
 
 fn attachment_path(thread_id: &str, ts: u64, index: usize, name: &str) -> std::path::PathBuf {
@@ -436,7 +462,11 @@ pub async fn download_attachment(
     ts: u64,
     index: usize,
 ) -> Result<Option<String>, String> {
-    let size = ptr.size.unwrap_or(0);
+    let Some(size) = ptr.size else {
+        // Unknown-size CDN objects are not safe to auto-buffer. Keep them
+        // metadata-only until a future streaming transfer can enforce a cap.
+        return Ok(None);
+    };
     if size > MAX_AUTO_DOWNLOAD_BYTES {
         return Ok(None);
     }
@@ -444,6 +474,7 @@ pub async fn download_attachment(
     let name = effective_attachment_name(ptr, &mime);
     let dest = attachment_path(thread_id, ts, index, &name);
     if dest.exists() {
+        enforce_attachment_cache_quota();
         return Ok(Some(dest.to_string_lossy().into_owned()));
     }
     if let Some(parent) = dest.parent() {
@@ -453,8 +484,12 @@ pub async fn download_attachment(
         .get_attachment(ptr)
         .await
         .map_err(|e| format!("download: {e}"))?;
+    if bytes.len() as u64 > MAX_AUTO_DOWNLOAD_BYTES as u64 {
+        return Err("downloaded attachment exceeds the auto-download limit".to_string());
+    }
     eprintln!("[core] attachment downloaded bytes={} -> {}", bytes.len(), dest.display());
     std::fs::write(&dest, &bytes).map_err(|e| format!("cache write: {e}"))?;
+    enforce_attachment_cache_quota();
     Ok(Some(dest.to_string_lossy().into_owned()))
 }
 
@@ -1320,6 +1355,13 @@ pub async fn upload_file(
     manager: &mut StoredManager,
     path: &std::path::Path,
 ) -> Result<AttachmentPointer, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("stat file: {e}"))?;
+    if !metadata.is_file() {
+        return Err("attachment path is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_UPLOAD_BYTES {
+        return Err("file exceeds 100 MB".to_string());
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("read file: {e}"))?;
     if bytes.len() as u64 > MAX_UPLOAD_BYTES {
         return Err("file exceeds 100 MB".to_string());

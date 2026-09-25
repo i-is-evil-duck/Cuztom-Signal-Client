@@ -6,6 +6,7 @@
 //! posts commands over a channel and blocks on the reply.
 //!
 //! C ABI (Swift `RustCoreService` resolves these with `dlsym`):
+//!   `core_abi_version() -> u32`          ABI gate before symbol use
 //!   `core_cmd_init(db_path) -> i32`      1 linked, 0 fresh, -1 error
 //!   `core_cmd_begin_link(name) -> *mut c_char`  provisioning URL (free with
 //!                                        `core_free_string`), null on error
@@ -519,7 +520,7 @@ impl LinkedState {
 }
 
 struct Core {
-    cmd_tx: tmpsc::UnboundedSender<Command>,
+    cmd_tx: tmpsc::Sender<Command>,
 }
 
 static CORE: OnceLock<Core> = OnceLock::new();
@@ -566,14 +567,17 @@ where
     let core = core_handle()?;
     let (tx, rx) = oneshot::channel();
     core.cmd_tx
-        .send(build(tx))
-        .map_err(|_| "core worker is gone".to_string())?;
+        .try_send(build(tx))
+        .map_err(|error| match error {
+            tmpsc::error::TrySendError::Full(_) => "core command queue is full".to_string(),
+            tmpsc::error::TrySendError::Closed(_) => "core worker is gone".to_string(),
+        })?;
     rx.blocking_recv()
         .map_err(|_| "core worker dropped the reply".to_string())
 }
 
-fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
-    let (tx, mut cmd_rx) = tmpsc::unbounded_channel::<Command>();
+fn spawn_worker() -> tmpsc::Sender<Command> {
+    let (tx, mut cmd_rx) = tmpsc::channel::<Command>(256);
     std::thread::Builder::new()
         .name("cuztom-signal-core".to_string())
         // presage's `receive_messages` future (websockets, ciphers, caches)
@@ -1350,7 +1354,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                         if let Some(rv) = sync::typing_part(&c, &names) {
                                             let _ = event_tx.send(rv.to_string());
                                         }
-                                        if let Some((mut v, pointers)) =
+                                        if let Some((v, _pointers)) =
                                             sync::content_parts(&c, &self_aci, &names)
                                         {
                                             let body_empty = v
@@ -1358,45 +1362,17 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                                 .and_then(|b| b.as_str())
                                                 .map(|b| b.is_empty())
                                                 .unwrap_or(true);
-                                            let is_chat = !body_empty || !pointers.is_empty();
-                                            if is_chat {
-                                                // Eagerly fetch small media so the UI
-                                                // can render inline. Other file types
-                                                // stay metadata-only (manual Download).
-                                                let thread = v.get("thread")
-                                                    .and_then(|t| t.as_str())
-                                                    .unwrap_or("")
-                                                    .to_string();
-                                                // Use the store/client timestamp for
-                                                // cache identity.
-                                                let ts = v
-                                                    .get("sts")
-                                                    .and_then(|t| t.as_u64())
-                                                    .filter(|t| *t != 0)
-                                                    .or_else(|| v.get("ts").and_then(|t| t.as_u64()))
-                                                    .unwrap_or(0);
-                                                for (i, ptr) in pointers.iter().enumerate() {
-                                                    if !sync::is_media_attachment(ptr) {
-                                                        continue;
-                                                    }
-                                                    match sync::download_attachment(
-                                                        &mut manager, ptr, &thread, ts, i,
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(Some(path)) => {
-                                                            v["attachments"][i]["path"] =
-                                                                serde_json::Value::String(path);
-                                                        }
-                                                        Ok(None) => {}
-                                                        Err(e) => {
-                                                            let _ = event_tx.send(format!(
-                                                                r#"{{"type":"attachment_error","error":{}}}"#,
-                                                                serde_json::json!(e)
-                                                            ));
-                                                        }
-                                                    }
-                                                }
+                                            let has_quote = v.get("reply_to").is_some();
+                                            let has_attachments = v
+                                                .get("attachments")
+                                                .and_then(|a| a.as_array())
+                                                .map(|a| !a.is_empty())
+                                                .unwrap_or(false);
+                                            if !body_empty || has_attachments || has_quote {
+                                                // Keep the receive loop metadata-only. CDN
+                                                // downloads are performed by the bounded
+                                                // Swift auto-fetch/on-demand path instead
+                                                // of blocking websocket processing.
                                                 let _ = event_tx.send(
                                                     serde_json::json!({"type": "message", "message": v})
                                                         .to_string(),
@@ -2313,6 +2289,14 @@ async fn cmd_fetch_attachment(
 }
 
 // ---- C ABI ----
+
+/// ABI version consumed by the Swift loader before any other symbol is used.
+pub const CORE_ABI_VERSION: u32 = 1;
+
+#[no_mangle]
+pub extern "C" fn core_abi_version() -> u32 {
+    CORE_ABI_VERSION
+}
 
 fn c_str_arg(ptr: *const c_char, what: &str) -> Result<String, String> {
     if ptr.is_null() {
@@ -3288,6 +3272,11 @@ pub extern "C" fn core_free_string(s: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abi_version_is_stable() {
+        assert_eq!(core_abi_version(), CORE_ABI_VERSION);
+    }
 
     #[test]
     fn null_args_fail_loudly() {

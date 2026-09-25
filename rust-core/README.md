@@ -27,6 +27,9 @@ link the Rust crate directly; it loads the release dylib at runtime.
 - Profile-name lookup with group-member profile-key fallback.
 - Native RingRTC 1:1 offer/answer/ICE/hangup/busy signaling and call state.
 - Explicit data/logout cleanup support for the Swift app.
+- Native ABI gating, release bundle/signature/hash checks, bounded command
+  intake, oversized/unknown attachment rejection, and a 500 MB media-cache
+  quota.
 
 Group calls, authenticated TURN, APNs/urgent delivery, and the group-call SFU
 HTTP/membership-proof path are not complete.
@@ -69,6 +72,17 @@ The release library is written to:
 rust-core/target/release/libcuztom_signal_core.dylib
 ```
 
+For a local debug run outside an app bundle, point the loader at that build
+explicitly; the loader no longer infers a path from the current directory:
+
+```bash
+export CUZTOM_SIGNAL_CORE_PATH="$PWD/rust-core/target/release/libcuztom_signal_core.dylib"
+```
+
+Release app bundles must place the dylib inside the signed bundle. The Swift
+loader checks its code signature, ABI symbol, and optional
+`CUZTOM_SIGNAL_CORE_SHA256`/`CuztomSignalCoreSHA256` pin before loading.
+
 For a local app bundle, copy that dylib next to the Swift executable in
 `CuztomSignal.app/Contents/MacOS/` and ad-hoc sign the bundle. The app bundle
 and user databases are intentionally not committed.
@@ -77,6 +91,7 @@ and user databases are intentionally not committed.
 
 The exact declarations are in `src/lib.rs`; the important groups are:
 
+- ABI gate: `core_abi_version` is checked before any other symbol is resolved.
 - Session/sync: `core_cmd_init`, `core_cmd_begin_link`,
   `core_cmd_poll_link`, `core_cmd_is_linked`, `core_cmd_roster`,
   `core_cmd_thread`, `core_cmd_whoami`, `core_cmd_request_contacts`,
@@ -120,9 +135,9 @@ and downloaded media. User data and the local app bundle are gitignored.
 ## Verification status
 
 - `cargo check`: passed.
-- `cargo test --lib`: 8 tests passed.
+- `cargo test --lib`: 9 tests passed.
 - `cargo build --release`: passed.
-- Full Xcode `swift test`: 50 tests passed.
+- Full Xcode `swift test`: 51 tests passed.
 - Manual verification: fresh QR link/resume, contacts/groups, name resolution,
   duplicate cleanup, message routing, and native 1:1 voice calling.
 

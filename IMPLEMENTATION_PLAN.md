@@ -34,10 +34,10 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 50/50 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 51/51 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
-| `cargo test --all-targets` | 8/8 passed |
+| `cargo test --all-targets` | 9/9 passed |
 | `cargo check --all-targets` | Passed with warnings |
 | `cargo build --release` | Passed with warnings |
 | `cargo clippy --all-targets -- -D warnings` | Not run: Clippy component unavailable |
@@ -209,6 +209,11 @@ ABI validation.
 the current-directory fallback, verify code signature/hash, and negotiate an
 ABI version before resolving function pointers.
 
+**Status:** Implemented: checkout/cwd inference is removed, an explicit
+`CUZTOM_SIGNAL_CORE_PATH` is available for debug builds, release builds require
+bundle/signature validation with optional SHA-256 pinning, and `core_abi_version`
+is checked before other symbols are used.
+
 #### P1-4: Attachment processing can exhaust resources
 
 Uploads read the whole file before checking the size limit. Missing size
@@ -218,6 +223,11 @@ loop and fully buffer responses. Several Rust queues are unbounded.
 **Required fix:** Check metadata before reading, stream with hard byte limits,
 reject unknown sizes for automatic downloads, move downloads off the receive
 loop, bound queues, and add cache quotas/eviction.
+
+**Status:** Implemented metadata preflight, unknown/oversized download
+rejection, a 500 MB attachment-cache quota, and receive-loop decoupling. The
+presage attachment API still returns a bounded in-memory body; true streaming
+transport and all remaining queue conversions are follow-up work.
 
 #### P1-5: Link previews create an automatic network/privacy path
 
@@ -280,6 +290,10 @@ aliases; account-scoped eviction/quotas remain part of the broader cache work.
 - [x] Persist manual attachment paths and hydrate them after service restart.
 - [x] Resolve receipt scope from native target timestamps, retain stable sender
       IDs, and drop ambiguous cross-conversation acknowledgements.
+- [x] Remove implicit native-library search paths and gate release loads on
+      bundle/signature/hash/ABI validation.
+- [x] Bound command intake, reject unknown/oversized media, move receive-loop
+      downloads to the Swift fetcher, and enforce an attachment-cache quota.
 
 ### P2 — reliability, UX, and maintainability
 

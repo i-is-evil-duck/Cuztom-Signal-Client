@@ -1,7 +1,12 @@
 import Foundation
+import CryptoKit
 
 #if canImport(Darwin)
 import Darwin
+#endif
+
+#if canImport(Security)
+import Security
 #endif
 
 /// Decoded roster snapshot from `core_cmd_roster` (see rust-core/src/sync.rs).
@@ -149,6 +154,10 @@ struct LiveEvent: Decodable {
 /// The library is loaded lazily with `dlopen` so the Swift package still
 /// builds/tests on machines without Rust.
 public final class RustCoreService: SignalService, @unchecked Sendable {
+    public static let expectedNativeABI: UInt32 = 1
+    private static let dylibEnvironmentKey = "CUZTOM_SIGNAL_CORE_PATH"
+    private static let dylibHashInfoKey = "CuztomSignalCoreSHA256"
+
     private let stateContinuation: AsyncStream<ConnectionState>.Continuation
     public let connectionState: AsyncStream<ConnectionState>
 
@@ -293,8 +302,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         self.incoming = AsyncStream { ic = $0 }
         self.incomingContinuation = ic
         if let path = libraryPath {
-            libraryHandle = Self.openLibrary(at: path)
-            if libraryHandle != nil { self.libraryPath = path }
+            if let handle = Self.openLibrary(at: path), Self.validateLoadedLibrary(handle, at: path) {
+                libraryHandle = handle
+                self.libraryPath = path
+            }
         }
         loadPathCache()
         loadUUIDCache()
@@ -314,17 +325,21 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     public static func defaultSearchPaths() -> [String] {
         var paths: [String] = []
+        if let override = ProcessInfo.processInfo.environment[dylibEnvironmentKey],
+           !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            paths.append(override)
+        }
         if let exeDir = Bundle.main.executableURL?.deletingLastPathComponent().path {
             paths.append((exeDir as NSString).appendingPathComponent("libcuztom_signal_core.dylib"))
         }
+        #if DEBUG
+        // Development builds may use an explicit Application Support copy,
+        // but never infer a path from the process working directory.
         let fm = FileManager.default
         if let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
             paths.append(appSupport.appendingPathComponent("CuztomSignal/libcuztom_signal_core.dylib").path)
         }
-        // Dev checkouts: release first, then debug.
-        let cwd = fm.currentDirectoryPath
-        paths.append((cwd as NSString).appendingPathComponent("rust-core/target/release/libcuztom_signal_core.dylib"))
-        paths.append((cwd as NSString).appendingPathComponent("rust-core/target/debug/libcuztom_signal_core.dylib"))
+        #endif
         return paths
     }
 
@@ -337,11 +352,15 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         // never silently fall back to a different build (test determinism).
         if explicitPath != nil { return false }
         for path in Self.defaultSearchPaths() {
-            if let handle = Self.openLibrary(at: path) {
+            guard let handle = Self.openLibrary(at: path) else { continue }
+            if Self.validateLoadedLibrary(handle, at: path) {
                 libraryHandle = handle
                 libraryPath = path
                 return true
             }
+            #if canImport(Darwin)
+            dlclose(handle)
+            #endif
         }
         return false
     }
@@ -952,6 +971,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     // MARK: - private FFI
 
     private struct Symbols {
+        let abiVersion: @convention(c) () -> UInt32
         let initCore: @convention(c) (UnsafePointer<CChar>) -> Int32
         let beginLink: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let pollLink: @convention(c) () -> Int32
@@ -1402,7 +1422,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private static func resolve(in handle: UnsafeMutableRawPointer) -> Symbols? {
         #if canImport(Darwin)
         let wp = dlsym(handle, "core_cmd_wipe")
-        guard let i = dlsym(handle, "core_cmd_init"),
+        guard let abi = dlsym(handle, "core_abi_version"),
+              let i = dlsym(handle, "core_cmd_init"),
               let b = dlsym(handle, "core_cmd_begin_link"),
               let p = dlsym(handle, "core_cmd_poll_link"),
               let l = dlsym(handle, "core_cmd_is_linked"),
@@ -1443,6 +1464,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let e = dlsym(handle, "core_last_error"),
               let f = dlsym(handle, "core_free_string") else { return nil }
         return Symbols(
+            abiVersion: unsafeBitCast(abi, to: (@convention(c) () -> UInt32).self),
             initCore: unsafeBitCast(i, to: (@convention(c) (UnsafePointer<CChar>) -> Int32).self),
             beginLink: unsafeBitCast(b, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             pollLink: unsafeBitCast(p, to: (@convention(c) () -> Int32).self),
@@ -1490,9 +1512,71 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         #endif
     }
 
+    private static func validateLoadedLibrary(_ handle: UnsafeMutableRawPointer, at path: String) -> Bool {
+        guard let symbols = resolve(in: handle) else { return false }
+        guard symbols.abiVersion() == expectedNativeABI else {
+            Log.error("native core ABI mismatch: expected \(expectedNativeABI), got \(symbols.abiVersion())")
+            return false
+        }
+        #if !DEBUG
+        guard isReleaseBundlePath(path) else {
+            Log.error("native core rejected: path is outside the signed app bundle")
+            return false
+        }
+        #endif
+        return true
+    }
+
+    private static func preflightLibrary(at path: String) -> Bool {
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else { return false }
+        #if !DEBUG
+        guard isReleaseBundlePath(url.path) else { return false }
+        guard verifyCodeSignature(url) else { return false }
+        if let expected = expectedDylibHash(), !matchesSHA256(expected, for: url) {
+            return false
+        }
+        #endif
+        return true
+    }
+
+    private static func isReleaseBundlePath(_ path: String) -> Bool {
+        let bundle = URL(fileURLWithPath: Bundle.main.bundlePath).standardizedFileURL.path
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL.path
+        return candidate == bundle || candidate.hasPrefix(bundle + "/")
+    }
+
+    private static func expectedDylibHash() -> String? {
+        let value = ProcessInfo.processInfo.environment["CUZTOM_SIGNAL_CORE_SHA256"]
+            ?? (Bundle.main.object(forInfoDictionaryKey: dylibHashInfoKey) as? String)
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func matchesSHA256(_ expected: String, for url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return false }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return digest == expected
+    }
+
+    private static func verifyCodeSignature(_ url: URL) -> Bool {
+        #if canImport(Security)
+        var staticCode: SecStaticCode?
+        let createStatus = SecStaticCodeCreateWithPath(url as CFURL, [], &staticCode)
+        guard createStatus == errSecSuccess, let staticCode else { return false }
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate)
+        return SecStaticCodeCheckValidity(staticCode, flags, nil) == errSecSuccess
+        #else
+        return false
+        #endif
+    }
+
     private static func openLibrary(at path: String) -> UnsafeMutableRawPointer? {
         #if canImport(Darwin)
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        guard preflightLibrary(at: path) else { return nil }
         return dlopen(path, RTLD_NOW | RTLD_LOCAL)
         #else
         return nil
