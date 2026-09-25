@@ -144,6 +144,14 @@ public final class GroupCallController: ObservableObject {
 
     /// Performs the CDN redemption that turns a proof into a call token.
     public protocol ProofRedeeming: Sendable {
+        /// The CDN hosts the service configuration declares, in its order.
+        ///
+        /// Supplied by the host rather than hardcoded here: the host owns the
+        /// native service, and a CDN host baked into this class is wrong on
+        /// staging and fails as an unreachable endpoint rather than as a
+        /// configuration mistake.
+        func cdnBaseURLs() async throws -> [URL]
+
         func fetchToken(
             cdnBaseURL: URL,
             authorization: String,
@@ -178,10 +186,6 @@ public final class GroupCallController: ObservableObject {
         }
     }
 
-    /// The CDN root that redeems membership proofs. Signal's own is
-    /// `https://cdn.signal.org`; it is never inferred from the environment.
-    public static let defaultCDNBaseURL = URL(string: "https://cdn.signal.org")!
-
     /// One in-flight group call's private bookkeeping.
     private struct Session {
         let stateID: UUID
@@ -201,7 +205,6 @@ public final class GroupCallController: ObservableObject {
     private let proofService: GroupCallProofService
     private let redeemer: any ProofRedeeming
     private let http: any HTTPPerforming
-    private let cdnBaseURL: URL
     private let sfuURL: String?
     /// Resolves a group's title and membership. Injected so the controller does
     /// not need the whole app model.
@@ -215,12 +218,12 @@ public final class GroupCallController: ObservableObject {
 
     public init(
         proofService: GroupCallProofService = GroupCallProofService(),
-        cdnBaseURL: URL = GroupCallController.defaultCDNBaseURL,
         sfuURL: String? = nil,
-        roster: any GroupRosterProviding = EmptyGroupRoster()
+        roster: any GroupRosterProviding = EmptyGroupRoster(),
+        redeemer: (any ProofRedeeming)? = nil
     ) {
         self.proofService = proofService
-        self.redeemer = proofService
+        self.redeemer = redeemer ?? proofService
         self.http = LiveHTTP(session: {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.urlCache = nil
@@ -229,7 +232,6 @@ public final class GroupCallController: ObservableObject {
             configuration.httpShouldSetCookies = false
             return URLSession(configuration: configuration)
         }())
-        self.cdnBaseURL = cdnBaseURL
         self.sfuURL = sfuURL
         self.roster = roster
     }
@@ -239,7 +241,6 @@ public final class GroupCallController: ObservableObject {
         proofService: GroupCallProofService = GroupCallProofService(),
         redeemer: any ProofRedeeming,
         http: any HTTPPerforming,
-        cdnBaseURL: URL = GroupCallController.defaultCDNBaseURL,
         sfuURL: String? = nil,
         roster: any GroupRosterProviding = EmptyGroupRoster()
     ) {
@@ -247,7 +248,6 @@ public final class GroupCallController: ObservableObject {
         self.proofService = proofService
         self.redeemer = redeemer
         self.http = http
-        self.cdnBaseURL = cdnBaseURL
         self.sfuURL = sfuURL
         self.roster = roster
     }
@@ -529,11 +529,42 @@ public final class GroupCallController: ObservableObject {
                 groupIdHex: session.handle.groupIdHex
             )
             Log.info("[group-call] step=proof-redeem client=\(clientId)")
-            let proof = try await redeemer.fetchToken(
-                cdnBaseURL: cdnBaseURL,
-                authorization: authorization,
-                groupIdHex: session.handle.groupIdHex
-            )
+            // The hosts come from the service configuration. Each is tried in
+            // the order the service lists them: a host that is simply not
+            // serving this endpoint should not end the attempt, but a host that
+            // answers with a rejection should, because that is a real answer.
+            let bases = try await redeemer.cdnBaseURLs()
+            guard !bases.isEmpty else {
+                fail("Could not join the call: no call service is configured")
+                return
+            }
+            var proof: GroupCallProofService.Proof?
+            var lastFailure: Error?
+            for base in bases {
+                do {
+                    proof = try await redeemer.fetchToken(
+                        cdnBaseURL: base,
+                        authorization: authorization,
+                        groupIdHex: session.handle.groupIdHex
+                    )
+                    break
+                } catch let error as GroupCallProofService.Failure {
+                    lastFailure = error
+                    // An HTTP status or a malformed body is a real answer from a
+                    // host that exists; only transport failures justify the next.
+                    switch error {
+                    case .transport, .invalidCDNHost:
+                        continue
+                    default:
+                        throw error
+                    }
+                }
+            }
+            guard let proof else {
+                throw lastFailure ?? GroupCallProofService.Failure.transport(
+                    "the call service could not be reached"
+                )
+            }
             Log.info("[group-call] step=proof-present client=\(clientId) tokenBytes=\(proof.token.count)")
             guard self.session?.handle.clientId == clientId else {
                 // The call ended while the CDN round trip was in flight. The
@@ -713,7 +744,18 @@ public final class GroupCallController: ObservableObject {
     }
 }
 
-extension GroupCallProofService: GroupCallController.ProofRedeeming {}
+extension GroupCallProofService: GroupCallController.ProofRedeeming {
+    /// Signal's own CDN root.
+    ///
+    /// Used only when no native service configuration is available, which in
+    /// practice means a test. A live redemption reads the hosts from the service
+    /// configuration, because they differ between staging and production.
+    public static let fallbackCDNBaseURL = URL(string: "https://cdn.signal.org")!
+
+    public func cdnBaseURLs() async throws -> [URL] {
+        [Self.fallbackCDNBaseURL]
+    }
+}
 
 /// Group membership and titles, which the controller needs but should not own.
 public protocol GroupRosterProviding: Sendable {

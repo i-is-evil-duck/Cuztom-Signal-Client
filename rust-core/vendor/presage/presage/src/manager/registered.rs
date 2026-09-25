@@ -372,6 +372,40 @@ impl<S: Store> Manager<S, Registered> {
         Ok(self.identified_websocket(false).await?.whoami().await?)
     }
 
+    /// The CDN base URLs this account's service configuration declares, as
+    /// `(id, url)` pairs ordered by id.
+    ///
+    /// Added for group calls. A group membership proof is redeemed at a CDN, and
+    /// the CDN host belongs to the service configuration rather than to a client:
+    /// the set of hosts differs between staging and production, and a wrong host
+    /// presents as an unreachable endpoint rather than as a configuration
+    /// mistake. `cdn_urls` is private in libsignal-service, so the entries are
+    /// resolved through the public `Endpoint::into_url`, which reports an id the
+    /// configuration does not declare instead of inventing a host for it. That
+    /// makes this a read of the configuration rather than a guess: a host only
+    /// appears here if the service declared it.
+    pub fn cdn_urls(&self) -> Vec<(u32, url::Url)> {
+        use libsignal_service::configuration::Endpoint;
+        let configuration = self.state.service_configuration();
+        let mut resolved: Vec<(u32, url::Url)> = (0..=7u32)
+            .filter_map(|cdn_id| {
+                // The root is only used to read the configured base; the path is
+                // replaced by the caller with the endpoint it needs.
+                let endpoint = Endpoint::Cdn {
+                    cdn_id,
+                    path: "".into(),
+                    query: None,
+                };
+                endpoint
+                    .into_url(&configuration)
+                    .ok()
+                    .map(|url| (cdn_id, url))
+            })
+            .collect();
+        resolved.sort_by_key(|(id, _)| *id);
+        resolved
+    }
+
     /// Fetches raw ZK group auth credentials for a day range, as JSON, along
     /// with the server's ZK public parameters.
     ///

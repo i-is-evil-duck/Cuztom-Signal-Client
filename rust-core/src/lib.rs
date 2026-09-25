@@ -148,6 +148,10 @@ enum Command {
         master_key_hex: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// The CDN base URLs the service configuration declares.
+    CdnUrls {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     /// Every ZK group id this device belongs to, mapped to its master key.
     GroupIdMap {
         reply: oneshot::Sender<Result<String, String>>,
@@ -422,6 +426,10 @@ enum LoopCtrl {
     /// A group's title and member ACIs, which a group call's roster needs.
     GroupRoster {
         master_key_hex: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// The CDN base URLs the service configuration declares.
+    CdnUrls {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Every ZK group id this device belongs to, mapped to its master key.
@@ -819,6 +827,10 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::GroupRoster { master_key_hex, reply } => {
                             let result = cmd_group_roster(&state, &master_key_hex).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::CdnUrls { reply } => {
+                            let result = cmd_cdn_urls(&state).await;
                             let _ = reply.send(result);
                         }
                         Command::GroupIdMap { reply } => {
@@ -1370,6 +1382,18 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 Some(LoopCtrl::GroupRoster { master_key_hex, reply }) => {
                                     let r = groups::group_roster(&mut manager, &master_key_hex).await;
                                     let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::CdnUrls { reply }) => {
+                                    let r = manager.cdn_urls();
+                                    let listed: Vec<serde_json::Value> = r
+                                        .iter()
+                                        .map(|(id, url)| {
+                                            serde_json::json!({ "id": id, "url": url.as_str() })
+                                        })
+                                        .collect();
+                                    let encoded = serde_json::to_string(&listed)
+                                        .map_err(|e| format!("cdn url list: {e}"));
+                                    let _ = reply.send(encoded);
                                 }
                                 Some(LoopCtrl::GroupIdMap { reply }) => {
                                     let r = groups::group_id_map(&mut manager).await;
@@ -2047,6 +2071,23 @@ async fn cmd_get_group_info(
         }
         _ => Err("not linked".to_string()),
     }
+}
+
+/// The CDN base URLs from the service configuration.
+///
+/// Also routed through the loop, for the same reason as the roster: the
+/// configuration lives on the live manager.
+async fn cmd_cdn_urls(state: &WorkerState) -> Result<String, String> {
+    let sender = match state {
+        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
+            Some(sender) => sender,
+            None => return Err("sync loop is not running".to_string()),
+        },
+        _ => return Err("not linked".to_string()),
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    send_sync_ctrl_wait(sender, LoopCtrl::CdnUrls { reply: reply_tx }).await?;
+    reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
 }
 
 /// A group's title and member ACIs, for the group call roster.
@@ -3190,6 +3231,23 @@ pub extern "C" fn core_cmd_group_get_info(
         Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
     };
     match roundtrip(|reply| Command::GetGroupInfo { master_key_hex: mk, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// The CDN base URLs this account's service configuration declares.
+///
+/// Returns malloc'd JSON: `[{"id":0,"url":"https://…"}, …]`.
+///
+/// A group membership proof is redeemed at a CDN, and the host belongs to the
+/// service configuration rather than to the client. A hardcoded host is wrong on
+/// staging and looks like an unreachable endpoint rather than a configuration
+/// mistake, so it is read from the configuration instead. Fails when no CDN is
+/// configured, rather than falling back to a guess.
+#[no_mangle]
+pub extern "C" fn core_cmd_cdn_urls() -> *mut c_char {
+    match roundtrip(|reply| Command::CdnUrls { reply }) {
         Ok(Ok(json)) => ok_string(json),
         Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
     }

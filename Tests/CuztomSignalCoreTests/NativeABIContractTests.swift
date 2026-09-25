@@ -46,11 +46,18 @@ struct GroupCallWiringTests {
         )
     }
 
-    @Test func theAppGivesTheControllerItsRealRoster() throws {
+    @Test func theAppGivesTheControllerItsRealRosterAndRosterlessRedeemer() throws {
         let source = try Self.appSource("CuztomSignalApp.swift")
         #expect(
-            source.contains("GroupCallController(roster: roster)"),
+            source.contains("roster: roster"),
             "the controller must be built with the same roster the view model primes"
+        )
+        // The CDN hosts come from the live service configuration. A hardcoded one
+        // is wrong on staging and fails as an unreachable endpoint, which says
+        // nothing about the real problem.
+        #expect(
+            source.contains("NativeGroupCallRedeemer(service: live)"),
+            "the redeemer must read CDN hosts from the service configuration"
         )
     }
 

@@ -322,7 +322,14 @@ final class ChatViewModel {
         groupRoster = roster
         // The controller must hold the same roster the view model primes, or a
         // call is placed with no members and inbound groups stay unresolvable.
-        let groupCalls = GroupCallController(roster: roster)
+        // The CDN hosts come from the live service configuration, not from a
+        // constant: they differ between staging and production, and a hardcoded
+        // host fails as an unreachable endpoint rather than as a configuration
+        // mistake.
+        let groupCalls = GroupCallController(
+            roster: roster,
+            redeemer: NativeGroupCallRedeemer(service: live)
+        )
         groupCallController = groupCalls
         groupCalls.configure(with: live)
         // An inbound group call names a group by identifier, and one for a group

@@ -91,3 +91,44 @@ public final class NativeGroupRoster: GroupRosterProviding, @unchecked Sendable 
         }
     }
 }
+
+/// Redeems a group membership proof at the CDN, using the hosts the native
+/// service configuration declares.
+///
+/// The host is deliberately not hardcoded here. Signal's service configuration
+/// lists the CDN hosts that exist for the current environment, and they differ
+/// between staging and production; a client that picks one is wrong half the
+/// time and finds out as an unreachable endpoint.
+public struct NativeGroupCallRedeemer: GroupCallController.ProofRedeeming {
+    private let service: RustCoreService
+    private let fallback: GroupCallProofService
+
+    public init(service: RustCoreService, fallback: GroupCallProofService = GroupCallProofService()) {
+        self.service = service
+        self.fallback = fallback
+    }
+
+    public func cdnBaseURLs() async throws -> [URL] {
+        let configured = try await service.cdnUrls()
+        guard !configured.isEmpty else {
+            // Failing is the point: a made-up host would fail as an unreachable
+            // endpoint, which says nothing about the real problem.
+            throw SignalError.network("the service configuration declares no CDN")
+        }
+        let hosts = configured.map { $0.host ?? "?" }.joined(separator: ", ")
+        Log.info("[group-call] configured CDNs: \(hosts)")
+        return configured
+    }
+
+    public func fetchToken(
+        cdnBaseURL: URL,
+        authorization: String,
+        groupIdHex: String
+    ) async throws -> GroupCallProofService.Proof {
+        try await fallback.fetchToken(
+            cdnBaseURL: cdnBaseURL,
+            authorization: authorization,
+            groupIdHex: groupIdHex
+        )
+    }
+}

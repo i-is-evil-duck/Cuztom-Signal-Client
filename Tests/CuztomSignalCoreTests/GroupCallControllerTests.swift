@@ -143,11 +143,24 @@ struct GroupCallControllerTests {
     final class FakeRedeemer: GroupCallController.ProofRedeeming, @unchecked Sendable {
         let token: [UInt8]
         var failure: Error?
+        /// Hosts the redeemer offers, in order. Two by default so the retry across
+        /// configured hosts is exercised rather than assumed.
+        var bases: [URL] = [
+            URL(string: "https://cdn-first.example.test")!,
+            URL(string: "https://cdn-second.example.test")!,
+        ]
+        var basesError: Error?
         private(set) var requests = 0
+        private(set) var attemptedHosts: [String] = []
 
         init(token: [UInt8], failure: Error? = nil) {
             self.token = token
             self.failure = failure
+        }
+
+        func cdnBaseURLs() async throws -> [URL] {
+            if let basesError { throw basesError }
+            return bases
         }
 
         func fetchToken(
@@ -156,6 +169,7 @@ struct GroupCallControllerTests {
             groupIdHex: String
         ) async throws -> GroupCallProofService.Proof {
             requests += 1
+            attemptedHosts.append(cdnBaseURL.host ?? "?")
             if let failure { throw failure }
             #expect(authorization.contains(":"))
             return GroupCallProofService.Proof(groupIdHex: groupIdHex, token: token)
@@ -201,15 +215,14 @@ struct GroupCallControllerTests {
     @MainActor
     private func makeController(
         bridge: FakeBridge,
-        redeemer: FakeRedeemer = FakeRedeemer(token: [0xAA, 0xBB]),
+        redeemer: (any GroupCallController.ProofRedeeming)? = nil,
         http: FakeHTTP = FakeHTTP(),
         roster: FakeRoster = FakeRoster()
     ) -> GroupCallController {
         let controller = GroupCallController(
             bridge: bridge,
-            redeemer: redeemer,
+            redeemer: redeemer ?? FakeRedeemer(token: [0xAA, 0xBB]),
             http: http,
-            cdnBaseURL: URL(string: "https://cdn.example.test")!,
             roster: roster
         )
         controller.configure(with: bridge)
@@ -320,6 +333,80 @@ struct GroupCallControllerTests {
         #expect(controller.current?.phase == .failed)
         #expect(controller.current?.failure?.contains("403") == true)
         #expect(!bridge.steps.contains(where: { $0.hasPrefix("presentProof") }))
+    }
+
+    @Test @MainActor func aTransportFailureMovesToTheNextConfiguredHost() async throws {
+        // The service configuration lists several CDN hosts. A host that is not
+        // serving this endpoint should not end the attempt, or a single
+        // unreachable host makes group calls impossible.
+        let bridge = FakeBridge()
+        // The first host refuses to connect; the second answers.
+        let failing = FailingFirstRedeemer(token: [0xAA])
+        let controller = makeController(bridge: bridge, redeemer: failing)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+
+        #expect(failing.attemptedHosts.count == 2, "both configured hosts were tried")
+        #expect(
+            controller.current?.phase == .connecting,
+            "the second host answered, so the call is still joining"
+        )
+    }
+
+    @Test @MainActor func anHTTPRejectionFromAHostEndsTheAttempt() async throws {
+        // A host that answers with a status has given a real answer; asking the
+        // next host would just repeat the rejection elsewhere.
+        let bridge = FakeBridge()
+        let redeemer = FakeRedeemer(
+            token: [],
+            failure: GroupCallProofService.Failure.unexpectedStatus(403)
+        )
+        let controller = makeController(bridge: bridge, redeemer: redeemer)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+
+        #expect(redeemer.requests == 1, "a rejection is not retried elsewhere")
+        #expect(redeemer.attemptedHosts == ["cdn-first.example.test"])
+        #expect(controller.current?.failure?.contains("403") == true)
+    }
+
+    @Test @MainActor func noConfiguredHostFailsVisibly() async throws {
+        let bridge = FakeBridge()
+        let redeemer = FakeRedeemer(token: [])
+        redeemer.bases = []
+        let controller = makeController(bridge: bridge, redeemer: redeemer)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+
+        #expect(controller.current?.phase == .failed)
+        #expect(controller.current?.failure?.contains("no call service") == true)
+    }
+
+    /// A transport error on `failuresBefore` attempts, then success.
+    final class FailingFirstRedeemer: GroupCallController.ProofRedeeming, @unchecked Sendable {
+        let token: [UInt8]
+        private(set) var attemptedHosts: [String] = []
+
+        init(token: [UInt8]) { self.token = token }
+
+        func cdnBaseURLs() async throws -> [URL] {
+            [
+                URL(string: "https://cdn-first.example.test")!,
+                URL(string: "https://cdn-second.example.test")!,
+            ]
+        }
+
+        func fetchToken(
+            cdnBaseURL: URL,
+            authorization: String,
+            groupIdHex: String
+        ) async throws -> GroupCallProofService.Proof {
+            attemptedHosts.append(cdnBaseURL.host ?? "?")
+            if attemptedHosts.count == 1 {
+                throw GroupCallProofService.Failure.transport("the call service could not be reached")
+            }
+            return GroupCallProofService.Proof(groupIdHex: groupIdHex, token: token)
+        }
     }
 
     @Test @MainActor func aRepeatedProofRequestDoesNotRedeemASecondToken() async throws {

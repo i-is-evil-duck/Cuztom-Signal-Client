@@ -54,6 +54,15 @@ int32_t core_cmd_send_typing(const char *thread, int32_t started);
 
 char *core_cmd_group_get_info(const char *master_key_hex);
 
+/* The CDN base URLs this account's service configuration declares, as
+ * [{"id":0,"url":"https://..."}, ...]. Returns malloc'd JSON, or NULL.
+ *
+ * A group membership proof is redeemed at a CDN, and the host belongs to the
+ * service configuration rather than to the client: a hardcoded host is wrong on
+ * staging and presents as an unreachable endpoint rather than a configuration
+ * mistake. Fails when no CDN is configured, rather than falling back. */
+char *core_cmd_cdn_urls(void);
+
 /* A group's title and member ACIs, which a group call's roster needs. Returns
  * malloc'd JSON, or NULL. A group this device is not a member of is refused
  * rather than reported as empty: an empty roster reads as "you are alone". */

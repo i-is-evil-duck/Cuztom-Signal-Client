@@ -993,6 +993,35 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         public let memberAciUUIDs: [String]
     }
 
+    /// The CDN base URLs the service configuration declares.
+    ///
+    /// A group membership proof is redeemed at a CDN, and the host belongs to
+    /// the service configuration: it differs between staging and production, and
+    /// a hardcoded host fails as an unreachable endpoint rather than as a
+    /// configuration mistake. Throws rather than falling back to a guess.
+    public func cdnUrls() async throws -> [URL] {
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            guard let pointer = sym.cdnUrls() else {
+                throw SignalError.network("no CDN is configured: \(Self.lastError(sym))")
+            }
+            defer { sym.freeString(pointer) }
+            let json = String(cString: pointer)
+            guard let data = json.data(using: .utf8) else {
+                throw SignalError.storage("CDN list was not UTF-8")
+            }
+            struct Entry: Decodable {
+                let url: String
+            }
+            guard let entries = try? JSONDecoder().decode([Entry].self, from: data) else {
+                throw SignalError.storage("CDN list was malformed")
+            }
+            // Order is preserved from the service configuration, so the first
+            // entry is the one the service lists first.
+            return entries.compactMap { URL(string: $0.url) }
+        }
+    }
+
     /// Read a group's title and membership.
     ///
     /// A group call needs the member ACIs because the SFU maps the opaque
@@ -1988,6 +2017,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let httpResponse: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupAuthCredentials: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let groupRoster: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let cdnUrls: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let groupIdMap: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let groupCallProofAuthorization: @convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?
         let groupCallGroupId: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -2647,6 +2677,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let chr = dlsym(handle, "core_cmd_http_response"),
               let cgac = dlsym(handle, "core_cmd_group_auth_credentials"),
               let cgr = dlsym(handle, "core_cmd_group_roster"),
+              let ccdn = dlsym(handle, "core_cmd_cdn_urls"),
               let cgim = dlsym(handle, "core_cmd_group_id_map"),
               let cgcpa = dlsym(handle, "core_cmd_group_call_proof_authorization"),
               let cgcid = dlsym(handle, "core_cmd_group_call_group_id"),
@@ -2702,6 +2733,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             httpResponse: unsafeBitCast(chr, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupAuthCredentials: unsafeBitCast(cgac, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             groupRoster: unsafeBitCast(cgr, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            cdnUrls: unsafeBitCast(ccdn, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             groupIdMap: unsafeBitCast(cgim, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             groupCallProofAuthorization: unsafeBitCast(cgcpa, to: (@convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?).self),
             groupCallGroupId: unsafeBitCast(cgcid, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),

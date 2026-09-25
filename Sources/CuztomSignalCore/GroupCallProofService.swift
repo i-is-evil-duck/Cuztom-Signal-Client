@@ -35,6 +35,15 @@ public struct GroupCallProofService: Sendable {
         case unexpectedStatus(Int)
         case responseTooLarge(Int)
         case malformedCredential
+        /// The request never produced a response.
+        ///
+        /// Carried as text rather than the underlying error because
+        /// `URLError` is not a `LocalizedError`: letting one escape produced the
+        /// generic "the call could not be completed", which is the same message
+        /// for a wrong host, a refused connection and a TLS failure. The
+        /// description is a fixed phrase per cause, so it cannot leak a path or
+        /// a hostname.
+        case transport(String)
 
         public var errorDescription: String? {
             switch self {
@@ -48,7 +57,39 @@ public struct GroupCallProofService: Sendable {
                 return "CDN response exceeded the \(limit) byte limit"
             case .malformedCredential:
                 return "CDN response was not a valid group call credential"
+            case .transport(let reason):
+                return "Could not reach the call service: \(reason)"
             }
+        }
+    }
+
+    /// Name a `URLError` without exposing anything about the endpoint.
+    ///
+    /// The code is what matters and it is a fixed enum, so mapping it to a phrase
+    /// is safe. Interpolating `localizedDescription` would be a one-liner, but
+    /// it can name a host, and this string reaches a banner and a log.
+    static func transportReason(for error: Error) -> String {
+        guard let urlError = error as? URLError else {
+            return "the request failed"
+        }
+        switch urlError.code {
+        case .notConnectedToInternet, .networkConnectionLost:
+            return "the network connection was lost"
+        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed:
+            return "the call service could not be reached"
+        case .timedOut:
+            return "the request timed out"
+        case .secureConnectionFailed, .serverCertificateUntrusted,
+             .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
+             .serverCertificateNotYetValid, .clientCertificateRejected,
+             .clientCertificateRequired, .appTransportSecurityRequiresSecureConnection:
+            return "the secure connection to the call service failed"
+        case .appTransportSecurityRequiresSecureConnection:
+            return "the call service requires a secure connection"
+        case .cancelled:
+            return "the request was cancelled"
+        default:
+            return "the request failed (\(urlError.code.rawValue))"
         }
     }
 
@@ -92,17 +133,7 @@ public struct GroupCallProofService: Sendable {
         groupIdHex: String
     ) async throws -> Proof {
         let basic = try Self.basicAuthorizationValue(authorization)
-
-        guard var components = URLComponents(
-            url: cdnBaseURL.appendingPathComponent(Self.tokenPath),
-            resolvingAgainstBaseURL: false
-        ), components.scheme?.lowercased() == "https", components.host != nil else {
-            throw Failure.invalidCDNHost(cdnBaseURL.absoluteString)
-        }
-        components.query = nil
-        guard let url = components.url else {
-            throw Failure.invalidCDNHost(cdnBaseURL.absoluteString)
-        }
+        let url = try Self.tokenURL(base: cdnBaseURL)
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -112,7 +143,22 @@ public struct GroupCallProofService: Sendable {
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.httpBody = nil
 
-        let (data, status) = try await transport.send(request)
+        // Host and path only. The `Authorization` header carries the membership
+        // proof and is never logged, and neither is the query.
+        Log.info("[group-call] CDN GET \(url.host ?? "?")\(url.path)")
+
+        let (data, status): (Data, Int)
+        do {
+            (data, status) = try await transport.send(request)
+        } catch {
+            // Classified rather than propagated: an escaping `URLError` reads as
+            // "the call could not be completed", which is the same for a wrong
+            // host, a refused connection and a TLS failure.
+            let reason = Self.transportReason(for: error)
+            Log.error("[group-call] CDN request failed: \(reason)")
+            throw Failure.transport(reason)
+        }
+        Log.info("[group-call] CDN responded \(status), \(data.count) bytes")
         guard (200..<300).contains(status) else {
             // The body may contain a server diagnostic, but it can also echo
             // request material, so it is deliberately not surfaced.
@@ -126,6 +172,25 @@ public struct GroupCallProofService: Sendable {
             throw Failure.malformedCredential
         }
         return Proof(groupIdHex: groupIdHex, token: token)
+    }
+
+    /// The token URL for a CDN base, https only.
+    ///
+    /// https is required rather than preferred: the `Authorization` header on
+    /// this request *is* the membership proof, so plaintext would hand it to
+    /// anyone on the path.
+    static func tokenURL(base: URL) throws -> URL {
+        guard var components = URLComponents(
+            url: base.appendingPathComponent(Self.tokenPath),
+            resolvingAgainstBaseURL: false
+        ), components.scheme?.lowercased() == "https", components.host != nil else {
+            throw Failure.invalidCDNHost(base.absoluteString)
+        }
+        components.query = nil
+        guard let url = components.url else {
+            throw Failure.invalidCDNHost(base.absoluteString)
+        }
+        return url
     }
 
     /// `hex(groupPublicParams) + ":" + hex(presentation)` base64-encoded, with
