@@ -56,14 +56,14 @@ pub enum GroupCallError {
     CredentialRejected,
     /// A PNI was supplied where an ACI is required.
     NotAnAci,
-    /// The response's `redemptionTime` is not a whole number of seconds.
+    /// The response's `redemptionTime` is implausibly far from the present.
     ///
-    /// zkgroup timestamps are seconds, and the credential is bound to the exact
-    /// redemption instant, so a sub-second remainder would silently produce a
-    /// credential that fails to verify. The service sends day-aligned values, so
-    /// this means the response is not what it claims and is refused rather than
-    /// rounded.
-    MisalignedRedemptionTime(u64),
+    /// The value is seconds, and the credential is bound to that exact instant,
+    /// so a value nowhere near today means the response is not what it claims to
+    /// be. Caught here because a wrong unit puts every credential in the same
+    /// wrong place, and that otherwise surfaces only as an unexplained
+    /// verification failure.
+    ImplausibleRedemptionTime(u64),
 }
 
 impl std::fmt::Display for GroupCallError {
@@ -95,9 +95,9 @@ impl std::fmt::Display for GroupCallError {
                 write!(f, "group auth credential failed verification")
             }
             GroupCallError::NotAnAci => write!(f, "group call proof requires an ACI, not a PNI"),
-            GroupCallError::MisalignedRedemptionTime(ms) => write!(
+            GroupCallError::ImplausibleRedemptionTime(secs) => write!(
                 f,
-                "group credential redemptionTime {ms}ms is not a whole number of seconds"
+                "group credential redemptionTime {secs}s is not a plausible current timestamp"
             ),
         }
     }
@@ -163,6 +163,14 @@ pub struct ZkAuthCredential {
     /// not. Strict on purpose: an unrecognised shape is rejected rather than
     /// partially interpreted.
     #[serde(rename = "redemptionTime")]
+    /// **Seconds** since the Unix epoch, not milliseconds.
+    ///
+    /// Observed from the live service: a response for a window starting at
+    /// 1790208000 returned `redemptionTime` values near 1.79e9, and dividing by
+    /// 86_400 yields the redemption day (20721 for 2026-09-25). Dividing by
+    /// 86_400_000 instead yields day 20 for every entry, which is how this was
+    /// wrong for so long: the value is a plausible timestamp either way, so an
+    /// offline test built on the wrong assumption agreed with itself.
     pub redemption_time: u64,
 }
 
@@ -204,9 +212,44 @@ impl GroupAuthCredentialsResponse {
     }
 }
 
-/// Signal's `redemptionTime` is milliseconds since the epoch.
-fn redemption_day_of(redemption_time_ms: u64) -> u64 {
-    redemption_time_ms / 86_400_000
+/// How far from `day` a credential's `redemptionTime` may be and still be
+/// believed, in days.
+///
+/// Two days is enough to cover the requested window on either side plus a
+/// little slack, while still rejecting a value that is off by a factor of a
+/// thousand.
+const REDEMPTION_TIME_TOLERANCE_DAYS: u64 = 2;
+
+/// Reject a `redemptionTime` that cannot be a current timestamp in seconds.
+///
+/// This exists because the unit is easy to get wrong and impossible to notice:
+/// milliseconds divided by the second constant still produces a small, entirely
+/// plausible-looking day number, so the mistake only shows up much later as an
+/// unexplained verification failure. The check is on the *value*, not on a
+/// remainder, so it catches both a thousand-fold and a million-fold error.
+fn check_redemption_time_is_current(
+    redemption_time_secs: u64,
+    requested_day: u64,
+) -> Result<(), GroupCallError> {
+    let day = redemption_day_of(redemption_time_secs);
+    let low = requested_day.saturating_sub(REDEMPTION_TIME_TOLERANCE_DAYS);
+    let high = requested_day.saturating_add(REDEMPTION_TIME_TOLERANCE_DAYS);
+    if day < low || day > high {
+        return Err(GroupCallError::ImplausibleRedemptionTime(
+            redemption_time_secs,
+        ));
+    }
+    Ok(())
+}
+
+/// The redemption day a credential's `redemptionTime` falls in.
+///
+/// The service sends **seconds**, matching zkgroup's own timestamp unit and the
+/// `redemptionStartSeconds` window it was asked with. Dividing by the
+/// millisecond constant instead maps every real credential to day 20, which is
+/// a valid day and so fails silently rather than loudly.
+fn redemption_day_of(redemption_time_secs: u64) -> u64 {
+    redemption_time_secs / 86_400
 }
 
 /// Wrap RingRTC's encoded `signaling::CallMessage` in the Signal protocol
@@ -414,19 +457,22 @@ pub fn build_proof_authorization(
         .map_err(|_| GroupCallError::Serialization("group credential base64"))?;
     let response = AuthCredentialWithPniResponse::new(&bytes)
         .map_err(|_| GroupCallError::Serialization("group credential body"))?;
-    // The REST response is in milliseconds; zkgroup timestamps are seconds. The
-    // credential is bound to the exact instant, so a sub-second remainder is
-    // refused rather than rounded: rounding would yield a credential that fails
-    // to verify and reports as an unrelated rejection.
-    if entry.redemption_time % 1_000 != 0 {
-        return Err(GroupCallError::MisalignedRedemptionTime(entry.redemption_time));
-    }
+    // The credential is bound to this exact instant, so a value nowhere near the
+    // present means the unit is not what this code assumes. Catching it here
+    // names the cause instead of leaving every presentation to fail
+    // verification with a message that points at the credential rather than at
+    // the arithmetic.
+    check_redemption_time_is_current(entry.redemption_time, day)?;
+    // The service sends seconds, which is the unit zkgroup's `Timestamp` uses,
+    // so the value is passed through unchanged. Dividing by a thousand here
+    // would bind the credential to 1970 and every presentation would fail
+    // verification as an unexplained rejection.
     let credential = response
         .receive(
             server_public_params,
             aci,
             pni_uuid.into(),
-            Timestamp::from_epoch_seconds(entry.redemption_time / 1_000),
+            Timestamp::from_epoch_seconds(entry.redemption_time),
         )
         .map_err(|_| GroupCallError::CredentialRejected)?;
     // The enum has exactly one variant today. Unwrapping it explicitly means a
@@ -610,7 +656,14 @@ mod tests {
 
     // ---- credential response decoding ----
 
-    const DAY_MS: u64 = 86_400_000;
+    /// Seconds in a day, which is the unit the service actually uses.
+    const DAY_SECS: u64 = 86_400;
+    /// A `redemptionTime` captured from a real response, for 2026-09-25. Taken
+    /// from the live service rather than derived, because the whole point is to
+    /// pin the wire format and a test built from an assumption only proves the
+    /// assumption is self-consistent.
+    const OBSERVED_REDEMPTION_TIME: u64 = 1_790_294_400;
+    const OBSERVED_DAY: u64 = 20_721;
 
     fn response_json(entries: &[(u64, &str)]) -> String {
         let items: Vec<String> = entries
@@ -628,7 +681,7 @@ mod tests {
     #[test]
     fn decodes_a_credential_response() {
         let day = 19_000u64;
-        let json = response_json(&[(day * DAY_MS, "QUJD")]);
+        let json = response_json(&[(day * DAY_SECS, "QUJD")]);
         let parsed: GroupAuthCredentialsResponse =
             serde_json::from_str(&json).expect("valid credential response");
         assert_eq!(parsed.pni.as_deref(), Some("PNI:abc"));
@@ -640,7 +693,7 @@ mod tests {
     #[test]
     fn a_day_without_a_credential_yields_none() {
         let day = 19_000u64;
-        let json = response_json(&[(day * DAY_MS, "QUJD")]);
+        let json = response_json(&[(day * DAY_SECS, "QUJD")]);
         let parsed: GroupAuthCredentialsResponse = serde_json::from_str(&json).expect("valid");
         // A neighbouring day must not borrow tomorrow's credential.
         assert!(parsed.credential_for_day(day + 1).is_none());
@@ -648,12 +701,60 @@ mod tests {
     }
 
     #[test]
-    fn redemption_time_is_read_as_milliseconds() {
-        // If milliseconds were treated as seconds the day would be off by 1000x.
-        let day = 19_000u64;
+    fn redemption_time_is_read_as_seconds() {
+        // The value is taken from a real response. Reading it as milliseconds
+        // gives day 20 for every entry, which is a valid day and so fails
+        // silently: that mistake is what kept this from working, because the
+        // tests built on the wrong assumption agreed with the wrong assumption.
         let parsed: GroupAuthCredentialsResponse =
-            serde_json::from_str(&response_json(&[(day * DAY_MS, "QUJD")])).expect("valid");
-        assert_eq!(parsed.days(), vec![day]);
+            serde_json::from_str(&response_json(&[(OBSERVED_REDEMPTION_TIME, "QUJD")]))
+                .expect("valid");
+        assert_eq!(parsed.days(), vec![OBSERVED_DAY]);
+        assert!(parsed.credential_for_day(OBSERVED_DAY).is_some());
+        // A millisecond reading would land on day 20, which is not this day.
+        assert!(parsed.credential_for_day(20).is_none());
+    }
+
+    #[test]
+    fn a_redemption_time_in_milliseconds_is_rejected_rather_than_presented() {
+        // The unit error is caught where it happens instead of surfacing as an
+        // unexplained verification failure. A millisecond value divided by the
+        // second constant lands a thousand days out, which is the signature of
+        // this exact mistake.
+        let as_millis = OBSERVED_REDEMPTION_TIME * 1_000;
+        let wrong_day = redemption_day_of(as_millis);
+        assert_eq!(wrong_day, OBSERVED_DAY * 1_000);
+        assert!(
+            check_redemption_time_is_current(as_millis, OBSERVED_DAY).is_err(),
+            "a millisecond value must never be presented"
+        );
+        assert!(matches!(
+            check_redemption_time_is_current(as_millis, OBSERVED_DAY),
+            Err(GroupCallError::ImplausibleRedemptionTime(_))
+        ));
+        // The real value passes.
+        assert!(check_redemption_time_is_current(OBSERVED_REDEMPTION_TIME, OBSERVED_DAY).is_ok());
+    }
+
+    #[test]
+    fn a_redemption_time_within_the_requested_window_is_accepted() {
+        // The window brackets today, so neighbouring days are legitimate.
+        for day in [
+            OBSERVED_DAY - CREDENTIAL_DAYS_BEFORE,
+            OBSERVED_DAY,
+            OBSERVED_DAY + CREDENTIAL_DAYS_AFTER,
+        ] {
+            assert!(
+                check_redemption_time_is_current(day * DAY_SECS, OBSERVED_DAY).is_ok(),
+                "day {day} is inside the requested window"
+            );
+        }
+        // Well outside it is not.
+        assert!(check_redemption_time_is_current(
+            (OBSERVED_DAY + 30) * DAY_SECS,
+            OBSERVED_DAY
+        )
+        .is_err());
     }
 
     #[test]
@@ -720,7 +821,7 @@ mod tests {
     #[test]
     fn current_day_matches_wall_clock_math() {
         assert_eq!(current_redemption_day(0), 0);
-        assert_eq!(current_redemption_day(DAY_MS * 2 / 1000), 2);
+        assert_eq!(current_redemption_day(DAY_SECS * 2), 2);
     }
 
     // ---- identifier -> master key ----
@@ -826,7 +927,7 @@ mod tests {
     const PNI: &str = "22222222-2222-2222-2222-222222222222";
     /// A fixed day boundary, which is what the service issues credentials for.
     const REDEMPTION_DAY: u64 = 19_675;
-    const REDEMPTION_SECS: u64 = REDEMPTION_DAY * 86_400;
+    const REDEMPTION_SECS: u64 = REDEMPTION_DAY * DAY_SECS;
 
     fn aci(text: &str) -> Aci {
         Aci::from(text.parse::<Uuid>().expect("uuid"))
@@ -845,7 +946,7 @@ mod tests {
             AuthCredentialWithPniZkcResponse::issue_credential(
                 aci(for_aci),
                 pni(for_pni),
-                Timestamp::from_epoch_seconds(day * 86_400),
+                Timestamp::from_epoch_seconds(day * DAY_SECS),
                 &server_secret,
                 [2u8; 32],
             ),
@@ -853,20 +954,21 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(serialize(&response));
         let json = format!(
             r#"{{"pni":"PNI:{for_pni}","credentials":[{{"credential":"{encoded}","redemptionTime":{}}}]}}"#,
-            day * DAY_MS
+            day * DAY_SECS
         );
         (server_public, json)
     }
 
     #[test]
-    fn a_sub_second_redemption_time_is_refused_not_rounded() {
-        // The credential is bound to the exact instant, so rounding the
-        // milliseconds down to seconds would produce a credential that does not
-        // verify and reports as an unrelated rejection.
+    fn a_millisecond_redemption_time_is_refused() {
+        // A response reporting milliseconds instead of seconds is refused rather
+        // than presented. It is caught by the day lookup, which finds no
+        // credential for the requested day, and the error says so rather than
+        // letting a mismatched unit through to a verification failure.
         let (server_public, json) = issued_credential(ACI, PNI, REDEMPTION_DAY);
         let json = json.replace(
-            &format!("\"redemptionTime\":{}", REDEMPTION_DAY * DAY_MS),
-            &format!("\"redemptionTime\":{}", REDEMPTION_DAY * DAY_MS + 500),
+            &format!("\"redemptionTime\":{}", REDEMPTION_SECS),
+            &format!("\"redemptionTime\":{}", REDEMPTION_SECS * 1_000),
         );
         let result = build_proof_authorization(
             &master_key(7),
@@ -875,10 +977,10 @@ mod tests {
             ServiceId::Aci(aci(ACI)),
             REDEMPTION_DAY,
         );
-        assert!(matches!(
-            result,
-            Err(GroupCallError::MisalignedRedemptionTime(_))
-        ));
+        assert!(
+            matches!(result, Err(GroupCallError::NoCredentialForDay { .. })),
+            "a millisecond redemptionTime must be refused, got {result:?}"
+        );
     }
 
     #[test]

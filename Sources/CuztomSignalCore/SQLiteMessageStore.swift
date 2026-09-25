@@ -17,6 +17,55 @@ public actor SQLiteMessageStore: MessageStoring {
     private let path: URL
     private let keychainAccount: String?
 
+    /// Where the encrypted presentation store lives on disk.
+    ///
+    /// Exposed so a caller can confirm a teardown actually removed the file,
+    /// rather than trusting that closing a handle deletes anything.
+    public var databaseFileURL: URL { path }
+
+    /// Set by `destroy()` before the connection is closed.
+    ///
+    /// `close()` releases the underlying sqlite handle. Anything that reaches the
+    /// queue afterwards dereferences a freed connection and faults inside
+    /// sqlite, which is a segfault with no Swift-level context at all. That is
+    /// not hypothetical: a diagnostics read scheduled by the view model was
+    /// still in flight when logout closed the store, and the read crashed the
+    /// process.
+    ///
+    /// The flag turns that into a no-op, which is the correct answer anyway: a
+    /// store being torn down has no rows to report.
+    private var isClosed = false
+
+    /// Run `body` against the queue, or return nil once the store is closed.
+    ///
+    /// Every accessor goes through here so that a read racing a teardown is
+    /// skipped rather than fatal. The check is on the actor, so it is
+    /// serialized with `destroy()`: a call either gets the queue before the
+    /// close, or is refused after it, never in between.
+    private func read<T: Sendable>(
+        fallback: T,
+        _ body: @Sendable (Database) throws -> T
+    ) async throws -> T {
+        guard !isClosed else {
+            Log.info("store read skipped: the store is closed")
+            return fallback
+        }
+        return try await dbQueue.read(body)
+    }
+
+    /// As `read`, for writes. A write after teardown is discarded rather than
+    /// faulting, because the data it would have written is about to be deleted.
+    private func write<T: Sendable>(
+        fallback: T,
+        _ body: @Sendable (Database) throws -> T
+    ) async throws -> T {
+        guard !isClosed else {
+            Log.info("store write skipped: the store is closed")
+            return fallback
+        }
+        return try await dbQueue.write(body)
+    }
+
     /// Create the presentation store. Production callers should omit
     /// `passphrase`; the value is loaded/created in the device-only Keychain.
     /// An explicit passphrase is intended for isolated tests and migration
@@ -133,7 +182,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func upsertConversation(_ conversation: Conversation) async {
         do {
-            try await dbQueue.write { db in
+            try await write(fallback: ()) { db in
                 try Self.upsertConversation(db, conversation)
             }
         } catch {
@@ -190,7 +239,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func allConversations() async -> [Conversation] {
         do {
-            return try await dbQueue.read { db in
+            return try await read(fallback: []) { db in
                 try Conversation.fetchAll(db, sql: "SELECT * FROM conversations ORDER BY lastActiveAt DESC")
             }
         } catch {
@@ -201,7 +250,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func renameConversation(id: String, title: String) async {
         do {
-            try await dbQueue.write { db in
+            try await write(fallback: ()) { db in
                 try db.execute(sql: "UPDATE conversations SET title = ? WHERE id = ?", arguments: [title, id])
             }
         } catch {
@@ -211,7 +260,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func deleteConversation(id: String) async {
         do {
-            try await dbQueue.write { db in
+            try await write(fallback: ()) { db in
                 try db.execute(sql: "DELETE FROM messages WHERE conversationId = ?", arguments: [id])
                 try db.execute(sql: "DELETE FROM conversations WHERE id = ?", arguments: [id])
             }
@@ -224,7 +273,7 @@ public actor SQLiteMessageStore: MessageStoring {
         let q = query.lowercased()
         guard !q.isEmpty else { return await allConversations() }
         do {
-            return try await dbQueue.read { db in
+            return try await read(fallback: []) { db in
                 try Conversation.fetchAll(db, sql: """
                     SELECT * FROM conversations
                     WHERE LOWER(title) LIKE ?
@@ -248,7 +297,7 @@ public actor SQLiteMessageStore: MessageStoring {
     @discardableResult
     public func saveMessage(_ message: ChatMessage, countsAsUnread: Bool) async -> Bool {
         do {
-            return try await dbQueue.write { db in
+            return try await write(fallback: false) { db in
                 try Self.saveMessage(db, message, countsAsUnread: countsAsUnread)
             }
         } catch {
@@ -381,7 +430,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func markRead(conversationId: String) async {
         do {
-            try await dbQueue.write { db in
+            try await write(fallback: ()) { db in
                 try db.execute(sql: "UPDATE conversations SET unreadCount = 0 WHERE id = ?", arguments: [conversationId])
             }
         } catch {
@@ -391,7 +440,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func messages(in conversationId: String, limit: Int = 200) async -> [ChatMessage] {
         do {
-            return try await dbQueue.read { db in
+            return try await read(fallback: []) { db in
                 try ChatMessage.fetchAll(db, sql: """
                     SELECT * FROM (
                         SELECT * FROM messages
@@ -414,7 +463,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func messageCount(in conversationId: String) async -> Int {
         do {
-            return try await dbQueue.read { db in
+            return try await read(fallback: 0) { db in
                 try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messages WHERE conversationId = ?", arguments: [conversationId]) ?? 0
             }
         } catch {
@@ -425,7 +474,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func message(id: UUID) async -> ChatMessage? {
         do {
-            return try await dbQueue.read { db in
+            return try await read(fallback: nil) { db in
                 try ChatMessage.fetchOne(db, sql: "SELECT * FROM messages WHERE id = ?", arguments: [id.uuidString])
             }
         } catch {
@@ -436,7 +485,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func message(conversationId: String, storeTs: Int64) async -> ChatMessage? {
         do {
-            return try await dbQueue.read { db in
+            return try await read(fallback: nil) { db in
                 try ChatMessage.fetchOne(
                     db,
                     sql: "SELECT * FROM messages WHERE conversationId = ? AND storeTs = ? ORDER BY sentAt DESC, id DESC LIMIT 1",
@@ -451,7 +500,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func updateMessage(id: UUID, transform: @escaping @Sendable (inout ChatMessage) -> Void) async -> Bool {
         do {
-            return try await dbQueue.write { db in
+            return try await write(fallback: false) { db in
                 guard var msg = try ChatMessage.fetchOne(db, sql: "SELECT * FROM messages WHERE id = ?", arguments: [id.uuidString]) else {
                     return false
                 }
@@ -467,7 +516,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func deleteMessage(id: UUID) async -> ChatMessage? {
         do {
-            return try await dbQueue.write { db in
+            return try await write(fallback: nil) { db in
                 guard let msg = try ChatMessage.fetchOne(db, sql: "SELECT * FROM messages WHERE id = ?", arguments: [id.uuidString]) else {
                     return nil
                 }
@@ -482,7 +531,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func deleteMessage(conversationId: String, storeTs: Int64) async -> ChatMessage? {
         do {
-            return try await dbQueue.write { db in
+            return try await write(fallback: nil) { db in
                 guard let msg = try ChatMessage.fetchOne(
                     db,
                     sql: "SELECT * FROM messages WHERE conversationId = ? AND storeTs = ? ORDER BY sentAt DESC, id DESC LIMIT 1",
@@ -572,7 +621,7 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func totalMessageCount() async -> Int {
         do {
-            return try await dbQueue.read { db in
+            return try await read(fallback: 0) { db in
                 try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messages") ?? 0
             }
         } catch {
@@ -591,12 +640,19 @@ public actor SQLiteMessageStore: MessageStoring {
     }
 
     public func clearAllDataChecked() async throws {
-        try await dbQueue.write { db in
+        // The VACUUM below reaches the queue directly, because it must not be
+        // transactional and so cannot go through the write helper. That makes a
+        // closed store fatal rather than skipped, so it is refused up front with
+        // an error a caller can act on.
+        guard !isClosed else {
+            throw SignalError.storage("the presentation store is closed")
+        }
+        try await write(fallback: ()) { db in
             try db.execute(sql: "DELETE FROM messages")
             try db.execute(sql: "DELETE FROM conversations")
         }
-        // Keep the open GRDB queue, but reclaim pages and verify that the
-        // presentation tables are empty before logout reports success.
+        // Reclaim pages and verify that the presentation tables are empty before
+        // logout reports success.
         try await dbQueue.writeWithoutTransaction { db in
             try db.execute(sql: "VACUUM")
             let messages = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messages") ?? 0
@@ -605,15 +661,17 @@ public actor SQLiteMessageStore: MessageStoring {
                 throw SignalError.storage("presentation store wipe verification failed")
             }
         }
-        // Keep the encrypted queue alive for callers that inspect the store
-        // after a routine wipe. The authoritative logout path uses destroy()
-        // below when it can safely close the connection first.
     }
 
     /// Terminal presentation-store wipe used by authoritative logout. The
     /// actor is not reusable after this method succeeds.
     public func destroy() async throws {
+        // Wipe first, while the connection is still fully usable.
         try await clearAllDataChecked()
+        // Refuse further work before the handle goes away. Everything between
+        // this line and `close()` is skipped rather than faulting, and so is
+        // everything after it: the queue is what gets dereferenced, not the file.
+        isClosed = true
         try dbQueue.close()
         try removeIfPresent(path)
         try removeIfPresent(URL(fileURLWithPath: path.path + "-wal"))
