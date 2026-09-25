@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CUZTOM_SIGNAL_CORE_ABI_VERSION 2u
+#define CUZTOM_SIGNAL_CORE_ABI_VERSION 3u
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,6 +72,17 @@ uint64_t core_cmd_call_start(const char *thread, const char *media_type);
 int32_t core_cmd_call_accept(uint64_t call_id);
 int32_t core_cmd_call_hangup(void);
 int32_t core_cmd_call_set_muted(int32_t muted);
+
+/* Deliver an SFU HTTP response that the host performed for RingRTC.
+ * RingRTC raises SFU requests as `http_request` events and stalls until this
+ * is called with the matching request id. A `status` of 0 reports that the
+ * request could not be performed at all, which RingRTC treats differently from
+ * an HTTP error status. Returns 0 on success, -1 on error. */
+int32_t core_cmd_http_response(
+    uint32_t request_id,
+    uint32_t status,
+    const uint8_t *body,
+    size_t body_len);
 int32_t core_cmd_send_call_offer(const char *call_id, const char *to,
                                  const char *media_type, const char *sdp);
 int32_t core_cmd_send_call_answer(const char *call_id, const char *sdp);

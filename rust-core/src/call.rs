@@ -390,7 +390,53 @@ impl GroupUpdateHandler for CuztomGroupHandler {
 
 struct CuztomHttpDelegate;
 impl http::Delegate for CuztomHttpDelegate {
-    fn send_request(&self, _request_id: u32, _request: http::Request) {}
+    /// RingRTC needs an HTTP transport to talk to the SFU, and there is none in
+    /// this core. The request is handed to the host instead, which performs it
+    /// and feeds the answer back through `deliver_http_response`.
+    ///
+    /// Requests carry SFU authorization, so bodies are base64-encoded for the
+    /// JSON event. The event is dropped rather than blocking RingRTC if the
+    /// host is not draining it: a dropped request surfaces as a join timeout,
+    /// never as a silently unauthenticated request.
+    fn send_request(&self, request_id: u32, request: http::Request) {
+        use base64::Engine as _;
+        let method = format!("{:?}", request.method).to_uppercase();
+        let body = request
+            .body
+            .as_ref()
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
+        if let Some(tx) = event_tx() {
+            let _ = tx.try_send(
+                serde_json::json!({
+                    "type": "http_request",
+                    "id": request_id,
+                    "method": method,
+                    "url": request.url,
+                    "headers": request.headers,
+                    "body_b64": body,
+                })
+                .to_string(),
+            );
+        }
+    }
+}
+
+/// Hand an SFU response back to RingRTC.
+///
+/// `None` reports a transport failure, which RingRTC distinguishes from an
+/// HTTP error status.
+pub fn deliver_http_response(
+    request_id: u32,
+    status: Option<u16>,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    let manager = manager().ok_or_else(|| "call stack not initialized".to_string())?;
+    let response = status.map(|code| http::Response { status: code.into(), body });
+    let mut guard = manager
+        .lock()
+        .map_err(|_| "call manager lock poisoned".to_string())?;
+    guard.received_http_response(request_id, response);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

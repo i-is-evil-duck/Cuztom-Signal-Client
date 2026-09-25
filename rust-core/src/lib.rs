@@ -266,6 +266,14 @@ enum Command {
         muted: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Deliver an SFU HTTP response that the host performed on RingRTC's
+    /// behalf. `status` of `None` reports a transport failure.
+    HttpResponse {
+        request_id: u32,
+        status: Option<u16>,
+        body: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -824,6 +832,10 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::CallSetMuted { muted, reply } => {
                             let result = cmd_call_set_muted(&mut state, muted);
+                            let _ = reply.send(result);
+                        }
+                        Command::HttpResponse { request_id, status, body, reply } => {
+                            let result = cmd_http_response(&state, request_id, status, body);
                             let _ = reply.send(result);
                         }
                         Command::Logout { reply } => {
@@ -2021,6 +2033,24 @@ fn cmd_call_set_muted(state: &WorkerState, muted: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Deliver an SFU response the host performed for RingRTC.
+///
+/// RingRTC has no HTTP transport of its own here, so every SFU request/peek
+/// stalls until this is called. A `status` of `None` means the request could
+/// not be performed at all (DNS, TLS, connectivity), which RingRTC treats
+/// differently from an HTTP error status.
+fn cmd_http_response(
+    state: &WorkerState,
+    request_id: u32,
+    status: Option<u16>,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    if !matches!(state, WorkerState::Linked(_)) {
+        return Err("not linked".to_string());
+    }
+    call::deliver_http_response(request_id, status, body)
+}
+
 /// Legacy SDP-shaped command retained for source compatibility. New clients
 /// use `core_cmd_call_start` and let RingRTC generate the opaque signaling.
 async fn cmd_send_call_offer(
@@ -2333,7 +2363,11 @@ async fn cmd_fetch_attachment(
 // ---- C ABI ----
 
 /// ABI version consumed by the Swift loader before any other symbol is used.
-pub const CORE_ABI_VERSION: u32 = 2;
+///
+/// 3 adds `core_cmd_http_response`, which lets the host perform the SFU
+/// requests RingRTC raises. Older dylibs lack that symbol, so the loader
+/// rejects them rather than stalling group calls on unanswered SFU requests.
+pub const CORE_ABI_VERSION: u32 = 3;
 
 #[no_mangle]
 pub extern "C" fn core_abi_version() -> u32 {
@@ -3053,6 +3087,31 @@ pub extern "C" fn core_cmd_call_set_muted(muted: i32) -> i32 {
     }
 }
 
+/// Deliver an SFU HTTP response that the host performed for RingRTC.
+///
+/// RingRTC raises SFU requests as `http_request` events and stalls until this
+/// is called with the matching request id. `status` of 0 reports that the
+/// request could not be performed at all, which RingRTC treats differently
+/// from an HTTP error status. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_http_response(
+    request_id: u32,
+    status: u32,
+    body: *const u8,
+    body_len: usize,
+) -> i32 {
+    let body = if body.is_null() || body_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(body, body_len).to_vec() }
+    };
+    let status = u16::try_from(status).ok();
+    match roundtrip(|reply| Command::HttpResponse { request_id, status, body, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
 /// Send a call offer (SDP). 0 ok, -1 error.
 #[no_mangle]
 pub extern "C" fn core_cmd_send_call_offer(
@@ -3361,7 +3420,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(core_abi_version(), 2);
+        assert_eq!(core_abi_version(), 3);
         assert_eq!(core_abi_version(), CORE_ABI_VERSION);
     }
 

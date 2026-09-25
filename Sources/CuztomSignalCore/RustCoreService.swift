@@ -157,7 +157,7 @@ struct LiveEvent: Decodable {
 /// serialized on `SerialNativeExecutor`; the remaining mutable state is
 /// protected by the lock-backed boxes and state lock declared below.
 public final class RustCoreService: SignalService, @unchecked Sendable {
-    public static let expectedNativeABI: UInt32 = 2
+    public static let expectedNativeABI: UInt32 = 3
     private static let dylibEnvironmentKey = "CUZTOM_SIGNAL_CORE_PATH"
     private static let dylibHashInfoKey = "CuztomSignalCoreSHA256"
     private static let nativeStoreKeychainAccount = "native.signal.sqlcipher.passphrase.v2"
@@ -927,6 +927,108 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
     }
 
+    /// An SFU request RingRTC raised and handed to the host to perform.
+    ///
+    /// RingRTC has no HTTP transport in this core, so every SFU request stalls
+    /// until `deliverHTTPResponse(requestId:status:body:)` is called. A
+    /// `status` of `nil` means the request could not be performed at all.
+    public struct PendingHTTPRequest: Sendable, Equatable {
+        public let requestId: UInt32
+        public let method: String
+        public let url: String
+        public let headers: [String: String]
+        public let body: [UInt8]?
+
+        public init(
+            requestId: UInt32,
+            method: String,
+            url: String,
+            headers: [String: String],
+            body: [UInt8]?
+        ) {
+            self.requestId = requestId
+            self.method = method
+            self.url = url
+            self.headers = headers
+            self.body = body
+        }
+    }
+
+    /// Hand an SFU response back to RingRTC.
+    ///
+    /// This is deliberately not session-token gated: an SFU request is issued
+    /// by RingRTC, not by a caller, and a stale request id is simply ignored by
+    /// RingRTC. The host still has to be the one that performed the request.
+    public func deliverHTTPResponse(requestId: UInt32, status: Int?, body: [UInt8]) async throws {
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token, allowStale: true, lifecycleOwned: false) { sym in
+            let rc = body.withUnsafeBufferPointer { buffer in
+                // A null pointer with length 0 is the documented way to say
+                // "no body", so an empty response passes nil through.
+                guard let base = buffer.baseAddress else {
+                    return sym.httpResponse(
+                        requestId,
+                        status.map { UInt32($0) } ?? 0,
+                        nil,
+                        0
+                    )
+                }
+                return sym.httpResponse(
+                    requestId,
+                    status.map { UInt32($0) } ?? 0,
+                    base,
+                    buffer.count
+                )
+            }
+            guard rc == 0 else {
+                throw SignalError.network("SFU response rejected: \(Self.lastError(sym))")
+            }
+        }
+    }
+
+    /// Wire shape of the native `http_request` event.
+    private struct PendingHTTPEvent: Decodable {
+        let id: UInt32
+        let method: String
+        let url: String
+        let headers: [String: String]?
+        let bodyB64: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id, method, url, headers
+            case bodyB64 = "body_b64"
+        }
+
+        /// `nil` when the event is missing something the host needs, so a
+        /// malformed event is dropped instead of producing a broken request.
+        func pendingRequest() -> PendingHTTPRequest? {
+            guard !method.isEmpty, !url.isEmpty,
+                  let scheme = URL(string: url)?.scheme?.lowercased(),
+                  scheme == "https" else { return nil }
+            var body: [UInt8]?
+            if let bodyB64, !bodyB64.isEmpty {
+                guard let decoded = Data(base64Encoded: bodyB64) else { return nil }
+                body = [UInt8](decoded)
+            }
+            return PendingHTTPRequest(
+                requestId: id,
+                method: method.uppercased(),
+                url: url,
+                headers: headers ?? [:],
+                body: body
+            )
+        }
+    }
+
+    /// Decode an `http_request` event. Exposed for tests only; the production
+    /// path is `drainEvents`, which additionally guards on the session epoch.
+    static func decodePendingHTTPEventForTesting(_ data: Data) -> PendingHTTPRequest? {
+        guard let event = try? JSONDecoder().decode(PendingHTTPEvent.self, from: data) else {
+            return nil
+        }
+        return event.pendingRequest()
+    }
+
     /// Send a pre-built call signal (base64-encoded protobuf CallMessage) to a thread.
     public func sendCallSignalRaw(thread: String, callMessageBase64: String) async throws {
         let token = try sessionEpoch.capture()
@@ -1330,6 +1432,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let callAccept: @convention(c) (UInt64) -> Int32
         let callHangup: @convention(c) () -> Int32
         let callSetMuted: @convention(c) (Int32) -> Int32
+        let httpResponse: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         // Call signaling integration
         let sendCallSignal: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let buildCallOffer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -1353,6 +1456,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private var _onSyncEvent: ((String) -> Void)?
     private var _onCallSignal: ((CallSignal) -> Void)?
     private var _onCallState: ((CallStateEvent) -> Void)?
+    private var _onHTTPRequest: ((PendingHTTPRequest) -> Void)?
     private var _onReaction: ((String, Int64, String, Bool, String) -> Void)?
     private var _onReceipt: ((String, String, [Int64]) -> Void)?
     private var _onReceiptScoped: ((String?, String, String, [Int64]) -> Void)?
@@ -1377,6 +1481,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     public var onCallState: ((CallStateEvent) -> Void)? {
         get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onCallState }
         set { callbackLock.lock(); _onCallState = newValue; callbackLock.unlock() }
+    }
+    /// An SFU request that RingRTC raised and is blocked on. The host performs
+    /// it and responds with `deliverHTTPResponse(requestId:status:body:)`.
+    public var onHTTPRequest: ((PendingHTTPRequest) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onHTTPRequest }
+        set { callbackLock.lock(); _onHTTPRequest = newValue; callbackLock.unlock() }
     }
 
     /// Live reaction: (thread, target store-ts, emoji, remove, sender name).
@@ -1426,6 +1536,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         _onSyncEvent = nil
         _onCallSignal = nil
         _onCallState = nil
+        _onHTTPRequest = nil
         _onReaction = nil
         _onReceipt = nil
         _onReceiptScoped = nil
@@ -1641,6 +1752,16 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 if let state = try? JSONDecoder().decode(CallStateEvent.self, from: data),
                    sessionEpoch.isCurrent(token) {
                     onCallState?(state)
+                }
+                continue
+            }
+            if event.type == "http_request" {
+                // RingRTC raised an SFU request and is now blocked on it. The
+                // host performs it and calls back with the response.
+                if let request = try? JSONDecoder().decode(PendingHTTPEvent.self, from: data),
+                   sessionEpoch.isCurrent(token),
+                   let pending = request.pendingRequest() {
+                    onHTTPRequest?(pending)
                 }
                 continue
             }
@@ -1929,6 +2050,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cac = dlsym(handle, "core_cmd_call_accept"),
               let cah = dlsym(handle, "core_cmd_call_hangup"),
               let csm = dlsym(handle, "core_cmd_call_set_muted"),
+              let chr = dlsym(handle, "core_cmd_http_response"),
               let scs = dlsym(handle, "core_cmd_send_call_signal"),
               let bco = dlsym(handle, "core_cmd_build_call_offer"),
               let bca = dlsym(handle, "core_cmd_build_call_answer"),
@@ -1971,6 +2093,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             callAccept: unsafeBitCast(cac, to: (@convention(c) (UInt64) -> Int32).self),
             callHangup: unsafeBitCast(cah, to: (@convention(c) () -> Int32).self),
             callSetMuted: unsafeBitCast(csm, to: (@convention(c) (Int32) -> Int32).self),
+            httpResponse: unsafeBitCast(chr, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             sendCallSignal: unsafeBitCast(scs, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             buildCallOffer: unsafeBitCast(bco, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             buildCallAnswer: unsafeBitCast(bca, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),

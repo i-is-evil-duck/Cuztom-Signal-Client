@@ -130,18 +130,25 @@ The split follows where the constraints actually fall. ZK group cryptography
 and Signal account auth cannot be done in Swift, so they stay in Rust; the CDN
 hop and all lifecycle/UI work are better in Swift.
 
-| # | Increment | Where | Independently verifiable? |
-|---|---|---|---|
-| 1 | Group id + member identities + proof auth string | Rust | **Done** — `group_calls.rs`, 6 offline tests |
-| 2 | Authenticated credential fetch | presage patch → Rust FFI | Needs a vendored presage (decision below) |
-| 3 | CDN token fetch (`GET /v2/groups/token`) | Swift | Yes, with a mock `URLProtocol` |
-| 4 | RingRTC HTTP delegate + SFU response FFI | Rust | Yes, with an injected synthetic response |
-| 5 | Group-call lifecycle + opaque signaling transport | Rust | Yes, with a fake SFU client |
-| 6 | `GroupCallController` + UI | Swift | Yes, against the fake bridge |
+| # | Increment | Where | Independently verifiable? | Status |
+|---|---|---|---|---|
+| 1 | Group id + member identities + proof auth string | Rust | **Done** — 6 offline tests | ✅ |
+| 2 | Authenticated credential fetch | presage patch → Rust FFI | Needs a vendored presage (decision below) | ⛔ blocked |
+| 3 | CDN token fetch (`GET /v2/groups/token`) | Swift | Mock transport | **Done** — 13 tests | ✅ |
+| 4 | SFU request/response bridge | Rust + Swift | Injected synthetic response | **Done** — ABI 3, 6 tests | ✅ |
+| 5 | Group-call lifecycle + opaque signaling transport | Rust | Fake SFU client | Not started | ⬜ |
+| 6 | `GroupCallController` + UI | Swift | Against the fake bridge | Not started | ⬜ |
 
-Increment 3 exists early on purpose: a wrong basic-auth header is invisible
-until a real call connects, so it is the piece most worth proving with tests
-before anything else is built on top of it.
+Increments 3 and 4 come early on purpose: a wrong basic-auth header or a
+stalled SFU request is invisible until a real call connects, so both are the
+pieces most worth proving with tests before anything is built on top of them.
+
+### ABI 3
+
+`core_cmd_http_response` is new in ABI 3. Older dylibs lack the symbol, so the
+Swift loader rejects them at `core_abi_version` instead of loading a core that
+would leave every SFU request unanswered. A pre-ABI-3 bundle therefore fails
+loudly at startup rather than hanging on join.
 
 ### Open decision: how to carry the presage patch
 

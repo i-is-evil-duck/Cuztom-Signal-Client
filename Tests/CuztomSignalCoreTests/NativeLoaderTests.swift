@@ -10,5 +10,7 @@ import Testing
         + "/rust-core/target/debug/libcuztom_signal_core.dylib"
     #expect(!paths.contains(inferredRelease))
     #expect(!paths.contains(inferredDebug))
-    #expect(RustCoreService.expectedNativeABI == 2)
+    // ABI 3 added core_cmd_http_response, which the SFU bridge needs. A dylib
+    // older than that must fail to load rather than stall group calls.
+    #expect(RustCoreService.expectedNativeABI == 3)
 }
