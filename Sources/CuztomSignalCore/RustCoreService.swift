@@ -157,7 +157,7 @@ struct LiveEvent: Decodable {
 /// serialized on `SerialNativeExecutor`; the remaining mutable state is
 /// protected by the lock-backed boxes and state lock declared below.
 public final class RustCoreService: SignalService, @unchecked Sendable {
-    public static let expectedNativeABI: UInt32 = 3
+    public static let expectedNativeABI: UInt32 = 4
     /// The production Signal SFU. Group calls use it unless a staging build
     /// explicitly overrides it, and it is never inferred from the environment.
     public static let defaultSFUURL = "https://sfu.voip.signal.org"
@@ -987,6 +987,168 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
     }
 
+    /// A group member as the SFU identifies them.
+    public struct GroupMember: Sendable, Equatable {
+        /// Raw 16-byte service id.
+        public let userId: [UInt8]
+        /// This group's encrypted-UID ciphertext for the same member.
+        public let memberId: [UInt8]
+    }
+
+    /// Derive the ZK group identifier for a group master key.
+    ///
+    /// A group thread id is `group:<master key hex>`, and RingRTC is keyed on
+    /// the derived identifier rather than the key, so the host needs this to
+    /// start a call at all. Pure and offline.
+    public func groupCallGroupId(masterKeyHex: String) async throws -> String {
+        let key = masterKeyHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let result = key.withCString { masterKey in
+                sym.groupCallGroupId(masterKey)
+            }
+            guard let pointer = result else {
+                throw SignalError.network(
+                    "group id derivation failed: \(Self.lastError(sym))"
+                )
+            }
+            defer { sym.freeString(pointer) }
+            return String(cString: pointer)
+        }
+    }
+
+    /// Build the member identities the SFU needs to attribute call traffic.
+    ///
+    /// Without a roster the SFU cannot map the opaque participant ids it
+    /// reports back to group members, so a call connects but nobody can be
+    /// identified. One invalid service id fails the whole request rather than
+    /// producing a partial roster that misattributes traffic silently.
+    public func groupCallMemberIdentities(
+        masterKeyHex: String,
+        memberAciUUIDs: [String]
+    ) async throws -> [GroupMember] {
+        let key = masterKeyHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let payload = try JSONEncoder().encode(memberAciUUIDs)
+        let json = String(decoding: payload, as: UTF8.self)
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let result = key.withCString { masterKey in
+                json.withCString { members in
+                    sym.groupCallMemberIdentities(masterKey, members)
+                }
+            }
+            guard let pointer = result else {
+                throw SignalError.network(
+                    "group member identities failed: \(Self.lastError(sym))"
+                )
+            }
+            defer { sym.freeString(pointer) }
+            return try Self.decodeGroupMembers(String(cString: pointer))
+        }
+    }
+
+    /// Wire shape of a member identity. Kept strict for the same reason the
+    /// credential response is: an unrecognised entry is rejected rather than
+    /// partially read into a roster.
+    private struct GroupMemberPayload: Decodable {
+        let userId: String
+        let memberId: String
+    }
+
+    static func decodeGroupMembers(_ json: String) throws -> [GroupMember] {
+        guard let data = json.data(using: .utf8) else {
+            throw SignalError.storage("group member response was not UTF-8")
+        }
+        let payloads: [GroupMemberPayload]
+        do {
+            payloads = try JSONDecoder().decode([GroupMemberPayload].self, from: data)
+        } catch {
+            throw SignalError.storage("group member response was malformed")
+        }
+        return try payloads.map { payload in
+            guard let userId = Self.decodeHex(payload.userId),
+                  let memberId = Self.decodeHex(payload.memberId),
+                  userId.count == 16,
+                  !memberId.isEmpty else {
+                throw SignalError.network("group member identity was malformed")
+            }
+            return GroupMember(userId: userId, memberId: memberId)
+        }
+    }
+
+    static func decodeHex(_ text: String) -> [UInt8]? {
+        guard text.count.isMultiple(of: 2) else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(text.count / 2)
+        var index = text.startIndex
+        while index < text.endIndex {
+            let next = text.index(index, offsetBy: 2)
+            guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        return bytes
+    }
+
+    /// Build the CDN authorization for a group call membership proof.
+    ///
+    /// This is the whole crypto half of a group-call join: it fetches a ZK auth
+    /// credential from the service, binds it to this account and the group, and
+    /// presents it. The result is the `hex(groupPublicParams):hex(presentation)`
+    /// value `GroupCallProofService` redeems at the CDN.
+    ///
+    /// Throws when the account is not linked, the sync loop is not running, the
+    /// group is not one this device belongs to, or the service issued no
+    /// credential for today. There is no fallback: without a real credential
+    /// there is no proof, and the SFU would reject the join with a diagnostic
+    /// that points nowhere near the cause.
+    public func groupCallProofAuthorization(groupIdHex: String) async throws -> String {
+        let bytes = try Self.groupIdBytes(fromHex: groupIdHex)
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let result = bytes.withUnsafeBufferPointer { buffer in
+                sym.groupCallProofAuthorization(buffer.baseAddress, UInt32(buffer.count))
+            }
+            guard let pointer = result else {
+                throw SignalError.network(
+                    "group membership proof unavailable: \(Self.lastError(sym))"
+                )
+            }
+            defer { sym.freeString(pointer) }
+            return String(cString: pointer)
+        }
+    }
+
+    /// Decode a 32-byte group identifier from hex.
+    ///
+    /// The identifier's length is checked here rather than left to the native
+    /// side, so a wrong-length id is a clear Swift error instead of a resolution
+    /// failure that scans every local group before reporting.
+    static func groupIdBytes(fromHex hex: String) throws -> [UInt8] {
+        let normalized = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty,
+              normalized.count.isMultiple(of: 2) else {
+            throw SignalError.network("group id must be hex")
+        }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(normalized.count / 2)
+        var index = normalized.startIndex
+        while index < normalized.endIndex {
+            let next = normalized.index(index, offsetBy: 2)
+            guard let byte = UInt8(normalized[index..<next], radix: 16) else {
+                throw SignalError.network("group id must be hex")
+            }
+            bytes.append(byte)
+            index = next
+        }
+        guard bytes.count == 32 else {
+            throw SignalError.network(
+                "group id must be 32 bytes, got \(bytes.count)"
+            )
+        }
+        return bytes
+    }
+
     /// Wire shape of the credential response. Kept strict: an unrecognised
     /// document is rejected rather than partially interpreted.
     private struct GroupAuthCredentialsPayload: Decodable {
@@ -1755,6 +1917,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let callSetMuted: @convention(c) (Int32) -> Int32
         let httpResponse: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupAuthCredentials: @convention(c) () -> UnsafeMutablePointer<CChar>?
+        let groupCallProofAuthorization: @convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?
+        let groupCallGroupId: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let groupCallMemberIdentities: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let groupCallSetMembershipProof: @convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupCallSetGroupMembers: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32
         let groupCallStart: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64
@@ -2390,6 +2555,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let csm = dlsym(handle, "core_cmd_call_set_muted"),
               let chr = dlsym(handle, "core_cmd_http_response"),
               let cgac = dlsym(handle, "core_cmd_group_auth_credentials"),
+              let cgcpa = dlsym(handle, "core_cmd_group_call_proof_authorization"),
+              let cgcid = dlsym(handle, "core_cmd_group_call_group_id"),
+              let cgcmi = dlsym(handle, "core_cmd_group_call_member_identities"),
               let cgcsm = dlsym(handle, "core_cmd_group_call_set_membership_proof"),
               let cgcs = dlsym(handle, "core_cmd_group_call_set_group_members"),
               let cgcs2 = dlsym(handle, "core_cmd_group_call_start"),
@@ -2440,6 +2608,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             callSetMuted: unsafeBitCast(csm, to: (@convention(c) (Int32) -> Int32).self),
             httpResponse: unsafeBitCast(chr, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupAuthCredentials: unsafeBitCast(cgac, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
+            groupCallProofAuthorization: unsafeBitCast(cgcpa, to: (@convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?).self),
+            groupCallGroupId: unsafeBitCast(cgcid, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            groupCallMemberIdentities: unsafeBitCast(cgcmi, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             groupCallSetMembershipProof: unsafeBitCast(cgcsm, to: (@convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupCallSetGroupMembers: unsafeBitCast(cgcs, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32).self),
             groupCallStart: unsafeBitCast(cgcs2, to: (@convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64).self),

@@ -3558,6 +3558,89 @@ pub extern "C" fn core_cmd_group_call_proof_authorization(group_id: *const u8, g
     }
 }
 
+/// Derive the ZK group identifier for a group master key.
+///
+/// `master_key_hex` is the hex master key a group thread id is built from.
+/// Returns the 32-byte identifier in hex as a malloc'd string, or NULL.
+///
+/// This is a pure, offline derivation. It is separate from
+/// `core_cmd_group_call_start` so the host can learn a group's identifier
+/// without creating a call.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_group_id(master_key_hex: *const c_char) -> *mut c_char {
+    let master_key = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(value) => value,
+        Err(e) => {
+            set_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+    match group_calls::group_id_hex_from_master_key(&master_key) {
+        Ok(hex) => match CString::new(hex) {
+            Ok(value) => value.into_raw(),
+            Err(_) => {
+                set_last_error("derived group id contained NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_last_error(e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Build the RingRTC member identities for a group.
+///
+/// `master_key_hex` identifies the group; `member_acis_json` is a JSON array of
+/// ACI UUID strings. Returns a JSON array of `{"userId":"hex","memberId":"hex"}`
+/// entries, or NULL.
+///
+/// The SFU needs these to map the opaque participant ids in call traffic back to
+/// group members, so a call with no roster cannot attribute who is present. One
+/// invalid service id fails the whole request: a partial roster silently
+/// misattributes traffic rather than failing visibly.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_member_identities(
+    master_key_hex: *const c_char,
+    member_acis_json: *const c_char,
+) -> *mut c_char {
+    let master_key = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(value) => value,
+        Err(e) => {
+            set_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+    let members = match c_str_arg(member_acis_json, "member_acis_json") {
+        Ok(value) => value,
+        Err(e) => {
+            set_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+    let acis: Vec<String> = match serde_json::from_str::<Vec<String>>(&members) {
+        Ok(acis) => acis,
+        Err(e) => {
+            set_last_error(format!("member list is not a JSON array of strings: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    match group_calls::member_identities_json(&master_key, &acis) {
+        Ok(json) => match CString::new(json) {
+            Ok(value) => value.into_raw(),
+            Err(_) => {
+                set_last_error("member identities contained NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_last_error(e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Deliver an SFU HTTP response that the host performed for RingRTC.
 ///
 /// RingRTC raises SFU requests as `http_request` events and stalls until this

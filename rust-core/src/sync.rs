@@ -1033,12 +1033,17 @@ pub fn call_signal_part(
         if data.is_empty() {
             return None;
         }
+        // RingRTC will not create a group client for an inbound signal; it routes
+        // the message to an existing client for that group and drops it
+        // otherwise. The host therefore has to be told which group this is in
+        // order to create a client to receive on.
         return Some(serde_json::json!({
             "type": "group_call_signal",
             "sender": sender,
             "sender_device_id": sender_device_id,
             "message_b64": b64(data),
             "immediate": opaque.urgency.unwrap_or(0) == 1,
+            "group_id": crate::group_calls::group_id_hex_from_ringrtc_signal(data),
             "ts": ts,
         }));
     }

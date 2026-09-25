@@ -86,6 +86,19 @@ char *core_cmd_group_auth_credentials(void);
 char *core_cmd_group_call_proof_authorization(const uint8_t *group_id,
                                              uint32_t group_id_len);
 
+/* Derive the ZK group identifier for a group master key. Returns the 32-byte
+ * identifier in hex, malloc'd, or NULL. Pure and offline; separate from
+ * core_cmd_group_call_start so a host can learn a group's id without a call. */
+char *core_cmd_group_call_group_id(const char *master_key_hex);
+
+/* Build the RingRTC member identities for a group, so the SFU can attribute
+ * call traffic to members. `member_acis_json` is a JSON array of ACI UUIDs.
+ * Returns a JSON array of {"userId":"hex","memberId":"hex"}, malloc'd, or NULL.
+ * One invalid service id fails the whole request: a partial roster misattributes
+ * traffic silently rather than failing visibly. */
+char *core_cmd_group_call_member_identities(const char *master_key_hex,
+                                            const char *member_acis_json);
+
 /* Group call lifecycle. `group_id_hex` is the group's 32-byte ZK identifier in
  * hex; `sfu_url` may be NULL to use the production SFU and is never inferred.
  * group_call_start returns the RingRTC client id plus one, so zero means

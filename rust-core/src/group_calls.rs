@@ -398,6 +398,68 @@ fn proof_randomness() -> RandomnessBytes {
     randomness
 }
 
+/// The ZK group identifier carried inside a RingRTC group call signal, as hex.
+///
+/// RingRTC does not create a group client when signaling arrives: it routes a
+/// message to an existing, active client for that group and otherwise drops it
+/// with "unknown group ID". So the host has to read the group out of the payload
+/// itself before it can create a client to receive on. Signal's own carrier puts
+/// it in `signaling::CallMessage.group_call_message.group_id`.
+///
+/// `None` for a payload that is not group call signaling, or whose group id is
+/// not the expected length.
+pub fn group_id_hex_from_ringrtc_signal(payload: &[u8]) -> Option<String> {
+    use ringrtc::protobuf::{group_call::DeviceToDevice, signaling::CallMessage as SignalCallMessage};
+    use prost::Message as _;
+
+    let message = SignalCallMessage::decode(payload).ok()?;
+    let group_id = message.group_call_message?.group_id?;
+    if group_id.len() != GROUP_CALL_GROUP_ID_LEN {
+        return None;
+    }
+    Some(hex_encode(&group_id))
+}
+
+/// The ZK group identifier for a hex-encoded group master key.
+///
+/// The host has group master keys (they are what a group thread id is made of)
+/// but RingRTC is keyed on the derived identifier, so this bridges the two.
+pub fn group_id_hex_from_master_key(master_key_hex: &str) -> Result<String, GroupCallError> {
+    let normalized = master_key_hex.trim().to_ascii_lowercase();
+    let bytes = hex::decode(&normalized).map_err(|_| GroupCallError::InvalidMasterKey)?;
+    Ok(hex_encode(&group_id_for_master_key(&bytes)?))
+}
+
+/// The RingRTC member identities for a group, as JSON.
+///
+/// The SFU maps the opaque participant id it reports in call traffic back to a
+/// group member through these, so a call with no member list has no roster and
+/// no way to attribute who is speaking. Each entry carries the bare 16-byte
+/// service id and this group's encrypted-UID ciphertext for the same member.
+///
+/// `member_acis` is the group's membership, as ACI UUID strings. An entry that
+/// is not a valid service id fails the whole call rather than being skipped: a
+/// partial roster silently misattributes call traffic.
+pub fn member_identities_json(
+    master_key_hex: &str,
+    member_acis: &[String],
+) -> Result<String, GroupCallError> {
+    let normalized = master_key_hex.trim().to_ascii_lowercase();
+    let bytes = hex::decode(&normalized).map_err(|_| GroupCallError::InvalidMasterKey)?;
+    let identity = GroupCallIdentity::from_master_key(&bytes)?;
+    let members: Vec<serde_json::Value> = member_acis
+        .iter()
+        .map(|aci| {
+            let member = identity.member(aci)?;
+            Ok(serde_json::json!({
+                "userId": hex_encode(&member.user_id),
+                "memberId": hex_encode(&member.member_id),
+            }))
+        })
+        .collect::<Result<_, GroupCallError>>()?;
+    serde_json::to_string(&members).map_err(|_| GroupCallError::Serialization("member identities"))
+}
+
 /// One member's identity as RingRTC's SFU client expects it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMemberIdentity {
@@ -867,9 +929,149 @@ mod tests {
         assert!(matches!(result, Err(GroupCallError::InvalidMasterKey)));
     }
 
+    // ---- host-facing derivations ----
+
     #[test]
-    fn two_presents_of_one_credential_differ() {
-        // Fresh randomness per presentation: reusing one value would let an
+    fn the_group_id_is_readable_out_of_an_inbound_signal() {
+        // RingRTC drops signaling for a group it has no client for, so the host
+        // has to learn the group from the payload to create one.
+        use ringrtc::protobuf::{
+            group_call::DeviceToDevice, signaling::CallMessage as SignalCallMessage,
+        };
+        use prost::Message as _;
+
+        let identity = GroupCallIdentity::from_master_key(&master_key(8)).expect("valid");
+        let expected = hex_encode(identity.group_id());
+        let payload = SignalCallMessage {
+            group_call_message: Some(DeviceToDevice {
+                group_id: Some(identity.group_id().to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            group_id_hex_from_ringrtc_signal(&payload).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn a_signal_with_no_group_id_yields_nothing() {
+        // A 1:1-shaped payload inside the opaque carrier is not a group signal.
+        assert_eq!(group_id_hex_from_ringrtc_signal(&[]), None);
+        assert_eq!(group_id_hex_from_ringrtc_signal(&[0xff, 0xff, 0xff]), None);
+        use ringrtc::protobuf::{
+            group_call::DeviceToDevice, signaling::CallMessage as SignalCallMessage,
+        };
+        use prost::Message as _;
+        let no_group = SignalCallMessage {
+            group_call_message: Some(DeviceToDevice::default()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(group_id_hex_from_ringrtc_signal(&no_group), None);
+    }
+
+    #[test]
+    fn a_wrong_length_group_id_is_not_accepted() {
+        // Accepting a short id would make the host create a client for a room
+        // that cannot exist, and the call would fail with no explanation.
+        use ringrtc::protobuf::{
+            group_call::DeviceToDevice, signaling::CallMessage as SignalCallMessage,
+        };
+        use prost::Message as _;
+        for length in [0usize, 16, 33] {
+            let payload = SignalCallMessage {
+                group_call_message: Some(DeviceToDevice {
+                    group_id: Some(vec![0x11u8; length]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            assert_eq!(group_id_hex_from_ringrtc_signal(&payload), None, "length {length}");
+        }
+    }
+
+    #[test]
+    fn the_group_id_is_reachable_from_a_group_master_key() {
+        // A group thread id is the master key, and RingRTC is keyed on the
+        // derived identifier, so the host has to be able to get from one to the
+        // other without native help of another kind.
+        let key = master_key(3);
+        let hex = hex_encode(&key);
+        let expected = hex_encode(
+            GroupCallIdentity::from_master_key(&key).expect("valid").group_id(),
+        );
+        assert_eq!(group_id_hex_from_master_key(&hex).expect("derives"), expected);
+        assert_eq!(expected.len(), GROUP_CALL_GROUP_ID_LEN * 2);
+        // Case and surrounding whitespace come from wherever the thread id was
+        // read, so they must not change the answer.
+        assert_eq!(
+            group_id_hex_from_master_key(&hex.to_uppercase()).expect("derives"),
+            expected
+        );
+        assert_eq!(group_id_hex_from_master_key(&format!("  {hex}\n")).expect("derives"), expected);
+    }
+
+    #[test]
+    fn a_malformed_group_master_key_has_no_identifier() {
+        // A wrong-length key would otherwise scan the whole group list and
+        // report "no local group matches", which points at the wrong thing.
+        assert!(matches!(
+            group_id_hex_from_master_key("nothex"),
+            Err(GroupCallError::InvalidMasterKey)
+        ));
+        assert!(matches!(
+            group_id_hex_from_master_key("aabb"),
+            Err(GroupCallError::InvalidMasterKey)
+        ));
+    }
+
+    #[test]
+    fn member_identities_are_hex_and_pair_up() {
+        let key = hex_encode(&master_key(4));
+        let json = member_identities_json(&key, &[ACI.to_string(), PNI.to_string()])
+            .expect("builds member identities");
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed.len(), 2);
+        for entry in &parsed {
+            let user_id = entry["userId"].as_str().expect("userId");
+            let member_id = entry["memberId"].as_str().expect("memberId");
+            // 16 bytes of service id, and a variable-length ciphertext that must
+            // not be empty.
+            assert_eq!(user_id.len(), 32, "user id is 16 bytes");
+            assert!(user_id.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(member_id.len() > 0);
+            assert!(member_id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        // Two different members must not share a ciphertext, or the SFU could
+        // not tell them apart.
+        assert_ne!(parsed[0]["memberId"], parsed[1]["memberId"]);
+    }
+
+    #[test]
+    fn an_invalid_member_fails_the_whole_roster() {
+        // A partial roster silently misattributes call traffic, so one bad
+        // service id fails the request instead of being skipped.
+        let key = hex_encode(&master_key(4));
+        assert!(matches!(
+            member_identities_json(&key, &[ACI.to_string(), "not-a-uuid".to_string()]),
+            Err(GroupCallError::InvalidServiceId(_))
+        ));
+    }
+
+    #[test]
+    fn an_empty_group_has_an_empty_roster() {
+        // A group of one is a valid state: the roster is just empty.
+        let key = hex_encode(&master_key(4));
+        let json = member_identities_json(&key, &[]).expect("builds");
+        assert_eq!(json, "[]");
+    }
+
+    #[test]
+    fn two_presents_of_one_credential_differ() {        // Fresh randomness per presentation: reusing one value would let an
         // observer link two calls to the same credential.
         let day = REDEMPTION_DAY;
         let (server_public, json) = issued_credential(ACI, PNI, day);
