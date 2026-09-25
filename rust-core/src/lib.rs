@@ -1193,18 +1193,25 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                     // A message queued during logout belongs to the old
                     // account. Drop it while the current control loop is
                     // absent rather than forwarding it after re-linking.
-                    if pending.session_generation != call::session_generation() {
-                        call::call_message_send_failure(pending.call_id);
+                    if pending.session_generation() != call::session_generation() {
+                        if let Some(call_id) = pending.call_id() {
+                            call::call_message_send_failure(call_id);
+                        }
                         continue;
                     }
                     if let Some(sender) = current_sync_ctrl() {
-                        let call_id = pending.call_id;
+                        // Group signaling has no 1:1 call id to report a
+                        // failure against, so only a contact signal can be
+                        // failed back into RingRTC.
+                        let call_id = pending.call_id();
                         if send_sync_ctrl(&sender, LoopCtrl::TransmitCallSignal { pending }).is_err()
                         {
-                            call::call_message_send_failure(call_id);
+                            if let Some(call_id) = call_id {
+                                call::call_message_send_failure(call_id);
+                            }
                         }
-                    } else {
-                        call::call_message_send_failure(pending.call_id);
+                    } else if let Some(call_id) = pending.call_id() {
+                        call::call_message_send_failure(call_id);
                     }
                 }
             });
@@ -1408,12 +1415,23 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::TransmitCallSignal { pending }) => {
-                                    let id = pending.call_id;
+                                    // Group signals have no 1:1 call to report
+                                    // a send result against, so the callback is
+                                    // only invoked for contact signals.
+                                    let id = pending.call_id();
                                     match call::transmit(&mut manager, pending).await {
-                                        Ok(()) => call::call_message_sent(id),
+                                        Ok(()) => {
+                                            if let Some(id) = id {
+                                                call::call_message_sent(id);
+                                            }
+                                        }
                                         Err(error) => {
-                                            eprintln!("[core] call signaling send failed: {error}");
-                                            call::call_message_send_failure(id);
+                                            if let Some(id) = id {
+                                                eprintln!(
+                                                    "[core] call signaling send failed: {error}"
+                                                );
+                                                call::call_message_send_failure(id);
+                                            }
                                         }
                                     }
                                 }
@@ -1445,9 +1463,20 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                     {
                                         let _ = event_tx.send(rv.to_string());
                                     } else if let Some(rv) = sync::call_signal_part(&c, &names) {
-                                        // Call offer/answer/ICE/hangup/busy. These
-                                        // must reach the call state machine, not the
-                                        // message store.
+                                        // Group call signaling arrives as an
+                                        // opaque payload and is handed to
+                                        // RingRTC as raw bytes; 1:1 offer/answer/
+                                        // ICE/hangup/busy goes through the call
+                                        // state machine. Neither may become a
+                                        // chat row.
+                                        if rv.get("type").and_then(|v| v.as_str())
+                                            == Some("group_call_signal")
+                                        {
+                                            if call::receive_group_call_signal(&rv) {
+                                                let _ = event_tx.send(rv.to_string());
+                                            }
+                                            continue;
+                                        }
                                         eprintln!(
                                             "[core] call signal kind={} thread={} from={}",
                                             rv.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),

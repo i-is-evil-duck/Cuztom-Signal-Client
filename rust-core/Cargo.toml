@@ -30,6 +30,9 @@ url = "2"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
+# Already in the graph through presage/libsignal-service; used directly to build
+# test fixtures with the same timestamp type the content metadata requires.
+chrono = "0.4"
 serde_json = "1"
 base64 = "0.22"
 prost = "0.14"

@@ -800,6 +800,7 @@ name = "cuztom-signal-core"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "futures",
  "hex",
  "libsignal-service",

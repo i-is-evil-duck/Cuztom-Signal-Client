@@ -136,7 +136,7 @@ hop and all lifecycle/UI work are better in Swift.
 | 2 | Authenticated credential fetch | presage patch → Rust FFI | Vendored presage | **Done** — 12 Rust + 6 Swift tests |
 | 3 | CDN token fetch (`GET /v2/groups/token`) | Swift | Mock transport | **Done** — 13 tests | ✅ |
 | 4 | SFU request/response bridge | Rust + Swift | Injected synthetic response | **Done** — ABI 3, 6 tests | ✅ |
-| 5 | Group-call lifecycle + opaque signaling transport | Rust | Fake SFU client | **In progress** — proof trigger + member framing done | 🟡 |
+| 5 | Group-call lifecycle + signaling transport | Rust | Fake SFU client | **Code complete** | ✅ |
 | 6 | `GroupCallController` + UI | Swift | Against the fake bridge | Not started | ⬜ |
 
 Increments 3 and 4 come early on purpose: a wrong basic-auth header or a
@@ -150,27 +150,29 @@ Swift loader rejects them at `core_abi_version` instead of loading a core that
 would leave every SFU request unanswered. A pre-ABI-3 bundle therefore fails
 loudly at startup rather than hanging on join.
 
-### Still to do in increment 5
+### Increment 5: complete
 
-The membership-proof trigger, member framing, and the full lifecycle
-(`start_group_call`, `join`, `leave`, `end`) are in place, and group clients
-are torn down on logout, relink, and reset so no SFU or media state survives
-into a new account. The proof path is complete from RingRTC's request through
-to the token being handed back.
+The membership-proof trigger, member framing, the lifecycle
+(`start_group_call`, `join`, `leave`, `end`), and both signaling directions are
+implemented. Group clients are torn down on logout, relink, and reset so no SFU
+or media state survives into a new account.
 
-Remaining:
-
-- Outbound signaling: `SignalingSender::send_call_message_to_group` still
-  returns "group calls are not supported". It needs the RingRTC bytes wrapped
-  in a Signal `CallMessage.opaque` and sent via presage's
-  `send_message_to_group`, which requires resolving RingRTC's 32-byte group id
-  back to the group master key.
-- Inbound signaling: `sync::call_signal_part` drops a `CallMessage` that
-  carries only `opaque`, so group-call messages never reach
-  `CallManager::received_call_message`.
-
-Without those two directions a call can be created and can obtain a proof, but
-no other client ever learns about it, so nothing connects.
+- **Outbound**: RingRTC's bytes are wrapped in the Signal `CallMessage.opaque`
+  carrier (field 10) and fanned out with presage's `send_message_to_group`.
+  RingRTC names a group by its 32-byte ZK identifier while the store is keyed by
+  master key, so each signal derives every local group's identifier to find the
+  match. Nothing is cached: a stale entry could only fail a send, but not
+  caching removes the question entirely.
+- **Inbound**: `call_signal_part` recognises an opaque-only `CallMessage` and
+  emits a distinct `group_call_signal` event, so a group message can never be
+  read as 1:1 signaling or as a chat row. The raw bytes go to
+  `CallManager::received_call_message` and RingRTC parses the group id itself.
+- Group signals share the 1:1 signal queue, so ordering, backpressure, and the
+  session-generation fence all apply unchanged.
+- `recipients_override` is deliberately ignored: Signal group call signaling is
+  group-wide and RingRTC's own crypto already scopes the payload.
+- Ad-hoc "group rings" remain refused. They need the ZK group send-token flow,
+  which is a different protocol from Signal group calls.
 
 ### Open decision: how to carry the presage patch
 

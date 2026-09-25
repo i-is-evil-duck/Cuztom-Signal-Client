@@ -123,6 +123,70 @@ fn redemption_day_of(redemption_time_ms: u64) -> u64 {
     redemption_time_ms / 86_400_000
 }
 
+/// Wrap RingRTC's encoded `signaling::CallMessage` in the Signal protocol
+/// carrier used for group call signaling.
+///
+/// Signal reserves `CallMessage.opaque` (field 10) for payloads that are opaque
+/// to the protocol layer but interpreted by RingRTC. The urgency maps one-to-one
+/// onto Signal's `Opaque.Urgency`, where a missing value means `DROPPABLE`, so
+/// it is always written explicitly.
+pub fn wrap_group_call_signal(
+    ringrtc_message: &[u8],
+    handle_immediately: bool,
+) -> Result<Vec<u8>, GroupCallError> {
+    use presage::libsignal_service::proto::{
+        call_message::Opaque as ProtoOpaque, CallMessage as ProtoCallMessage,
+    };
+    use prost::Message as _;
+
+    if ringrtc_message.is_empty() {
+        return Err(GroupCallError::Serialization("empty ringrtc payload"));
+    }
+    let proto = ProtoCallMessage {
+        opaque: Some(ProtoOpaque {
+            data: Some(ringrtc_message.to_vec()),
+            urgency: Some(i32::from(handle_immediately)),
+        }),
+        ..Default::default()
+    };
+    Ok(proto.encode_to_vec())
+}
+
+/// Pull RingRTC's payload back out of a Signal `CallMessage`.
+///
+/// Used by the receive path. Returns `None` for a message that carries no
+/// opaque payload, which is how a 1:1 call message is distinguished from a group
+/// call message.
+pub fn unwrap_group_call_signal(
+    signal_proto: &[u8],
+) -> Option<(Vec<u8>, bool)> {
+    use presage::libsignal_service::proto::CallMessage as ProtoCallMessage;
+    use prost::Message as _;
+
+    let proto = ProtoCallMessage::decode(signal_proto).ok()?;
+    let opaque = proto.opaque?;
+    let data = opaque.data?;
+    // Signal's enum: DROPPABLE = 0, HANDLE_IMMEDIATELY = 1. Anything else is
+    // treated as droppable rather than trusted as immediate.
+    let immediate = opaque.urgency.unwrap_or(0) == 1;
+    Some((data, immediate))
+}
+
+/// The ZK group identifier for a 32-byte group master key.
+///
+/// This is the inverse of what RingRTC is given, and is how a signaling
+/// message that names a group by identifier is routed back to the group it
+/// belongs to.
+pub fn group_id_for_master_key(master_key: &[u8]) -> Result<[u8; GROUP_CALL_GROUP_ID_LEN], GroupCallError> {
+    let bytes: [u8; GROUP_MASTER_KEY_LEN] = master_key
+        .try_into()
+        .map_err(|_| GroupCallError::InvalidMasterKey)?;
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(bytes));
+    let mut group_id = [0u8; GROUP_CALL_GROUP_ID_LEN];
+    group_id.copy_from_slice(&secret_params.get_public_params().get_group_identifier());
+    Ok(group_id)
+}
+
 /// The ZK identity a group call is made with, derived from the group master key.
 pub struct GroupCallIdentity {
     secret_params: GroupSecretParams,
@@ -375,5 +439,89 @@ mod tests {
     fn current_day_matches_wall_clock_math() {
         assert_eq!(current_redemption_day(0), 0);
         assert_eq!(current_redemption_day(DAY_MS * 2 / 1000), 2);
+    }
+
+    // ---- identifier -> master key ----
+
+    #[test]
+    fn group_id_round_trips_through_the_master_key() {
+        // Signaling names a group by identifier but the store keys it by master
+        // key, so the two must be the same value.
+        let key = master_key(9);
+        let identity = GroupCallIdentity::from_master_key(&key).expect("valid key");
+        let derived = group_id_for_master_key(&key).expect("valid key");
+        assert_eq!(derived, *identity.group_id());
+    }
+
+    #[test]
+    fn different_groups_resolve_to_different_identifiers() {
+        assert_ne!(
+            group_id_for_master_key(&master_key(1)).expect("valid"),
+            group_id_for_master_key(&master_key(2)).expect("valid"),
+        );
+    }
+
+    #[test]
+    fn identifier_lookup_rejects_malformed_master_keys() {
+        assert!(matches!(
+            group_id_for_master_key(&[0u8; 31]),
+            Err(GroupCallError::InvalidMasterKey)
+        ));
+    }
+
+    // ---- opaque signaling carrier ----
+
+    /// `CallMessage.opaque` is field 10, wire type 2, so its tag byte is
+    /// `(10 << 3) | 2` = 0x52. Getting this wrong produces a message that
+    /// decodes cleanly here and is ignored by every other Signal client.
+    const OPAQUE_FIELD_TAG: u8 = (10 << 3) | 2;
+
+    #[test]
+    fn group_signal_uses_the_opaque_carrier_field() {
+        let payload = [0xde, 0xad, 0xbe, 0xef];
+        let encoded = wrap_group_call_signal(&payload, true).expect("wraps");
+        assert_eq!(encoded.first().copied(), Some(OPAQUE_FIELD_TAG));
+        let (data, immediate) = unwrap_group_call_signal(&encoded).expect("unwraps");
+        assert_eq!(data, payload);
+        assert!(immediate);
+    }
+
+    #[test]
+    fn group_signal_round_trips_droppable_urgency() {
+        let payload = vec![0x01, 0x02, 0x03];
+        let encoded = wrap_group_call_signal(&payload, false).expect("wraps");
+        let (data, immediate) = unwrap_group_call_signal(&encoded).expect("unwraps");
+        assert_eq!(data, payload);
+        assert!(!immediate, "droppable must not be read as immediate");
+    }
+
+    #[test]
+    fn a_message_with_no_opaque_payload_is_not_a_group_signal() {
+        // This is how a 1:1 call message is told apart from a group call
+        // message on the receive path: a 1:1 message carries an offer or
+        // answer and no opaque payload, so it unwraps to nothing.
+        use presage::libsignal_service::proto::CallMessage as ProtoCallMessage;
+        use prost::Message as _;
+
+        let no_opaque = ProtoCallMessage {
+            destination_device_id: Some(1),
+            ..Default::default()
+        };
+        assert!(unwrap_group_call_signal(&no_opaque.encode_to_vec()).is_none());
+        // An empty message has no opaque field either.
+        assert!(unwrap_group_call_signal(&[]).is_none());
+    }
+
+    #[test]
+    fn an_empty_ringrtc_payload_is_refused() {
+        assert!(matches!(
+            wrap_group_call_signal(&[], true),
+            Err(GroupCallError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn garbage_is_not_decoded_as_a_group_signal() {
+        assert!(unwrap_group_call_signal(&[0xff, 0xff, 0xff, 0xff]).is_none());
     }
 }

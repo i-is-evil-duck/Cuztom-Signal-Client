@@ -60,11 +60,42 @@ use crate::sync::StoredManager;
 // ---------------------------------------------------------------------------
 
 /// A Signal `CallMessage` waiting to be sent through libsignal.
-pub struct PendingCallSignal {
-    pub session_generation: u64,
-    pub thread: String,
-    pub call_id: u64,
-    pub proto: Vec<u8>,
+///
+/// Group call signaling rides in the same queue as 1:1 signaling so ordering
+/// and backpressure are shared, and so a group signal cannot bypass the session
+/// generation check that fences an account boundary.
+pub enum PendingCallSignal {
+    Contact {
+        session_generation: u64,
+        thread: String,
+        call_id: u64,
+        proto: Vec<u8>,
+    },
+    /// `group_id` is RingRTC's 32-byte ZK group identifier, which is resolved
+    /// to the group master key when the signal is actually sent.
+    Group {
+        session_generation: u64,
+        group_id: Vec<u8>,
+        proto: Vec<u8>,
+    },
+}
+
+impl PendingCallSignal {
+    pub fn session_generation(&self) -> u64 {
+        match self {
+            PendingCallSignal::Contact { session_generation, .. } => *session_generation,
+            PendingCallSignal::Group { session_generation, .. } => *session_generation,
+        }
+    }
+
+    /// The 1:1 call this signal belongs to, if any. Group signals have no
+    /// single call to report a send failure against.
+    pub fn call_id(&self) -> Option<u64> {
+        match self {
+            PendingCallSignal::Contact { call_id, .. } => Some(*call_id),
+            PendingCallSignal::Group { .. } => None,
+        }
+    }
 }
 
 /// A deferred RingRTC action. The state callback cannot call `proceed`
@@ -241,7 +272,7 @@ impl SignalingSender for CuztomSignalingSender {
         let Some(tx) = signal_tx() else {
             return Err(std::io::Error::other("call signaling is not initialized").into());
         };
-        tx.try_send(PendingCallSignal {
+        tx.try_send(PendingCallSignal::Contact {
             session_generation: session_generation(),
             thread: recipient_id.to_string(),
             call_id: call_id.as_u64(),
@@ -262,17 +293,53 @@ impl SignalingSender for CuztomSignalingSender {
         _message: Vec<u8>,
         _urgency: SignalingMessageUrgency,
     ) -> ringrtc::common::Result<()> {
-        Err(std::io::Error::other("group calls are not supported").into())
+        // 1:1 signaling is produced by the offer/answer/ice mapping above, so
+        // a group call reaching this method means RingRTC wanted a targeted
+        // send we do not perform. Refusing is safer than guessing a recipient.
+        Err(std::io::Error::other("targeted group call send is not supported").into())
     }
 
+    /// Send a group call signaling message to every member of the group.
+    ///
+    /// `message` is RingRTC's encoded `signaling::CallMessage`, which is opaque
+    /// to Signal. It is wrapped in the Signal protocol's `CallMessage.opaque`
+    /// field — the carrier the group-call signaling actually uses — and queued
+    /// for the core loop, which owns the live manager.
+    ///
+    /// `recipients_override` is deliberately ignored: Signal group call
+    /// signaling is group-wide, and the encrypted payload is already scoped to
+    /// the intended recipients inside RingRTC's own crypto.
     fn send_call_message_to_group(
         &self,
-        _group_id: Vec<u8>,
-        _message: Vec<u8>,
-        _urgency: SignalingMessageUrgency,
+        group_id: Vec<u8>,
+        message: Vec<u8>,
+        urgency: SignalingMessageUrgency,
         _recipients_override: HashSet<Vec<u8>>,
     ) -> ringrtc::common::Result<()> {
-        Err(std::io::Error::other("group calls are not supported").into())
+        if group_id.is_empty() {
+            return Err(std::io::Error::other("group call signal had no group id").into());
+        }
+        let proto = crate::group_calls::wrap_group_call_signal(
+            &message,
+            matches!(urgency, SignalingMessageUrgency::HandleImmediately),
+        )
+        .map_err(|e| std::io::Error::other(format!("group call signal: {e}")))?;
+
+        let Some(tx) = signal_tx() else {
+            return Err(std::io::Error::other("call signaling is not initialized").into());
+        };
+        tx.try_send(PendingCallSignal::Group {
+            session_generation: session_generation(),
+            group_id,
+            proto,
+        })
+        .map_err(|error| {
+            std::io::Error::other(match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => "call signaling queue is full",
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => "call signaling receiver is closed",
+            })
+        })?;
+        Ok(())
     }
 
     fn send_call_message_to_adhoc_group(
@@ -282,7 +349,9 @@ impl SignalingSender for CuztomSignalingSender {
         _expiration: u64,
         _recipients_to_endorsements: std::collections::HashMap<Vec<u8>, Vec<u8>>,
     ) -> ringrtc::common::Result<()> {
-        Err(std::io::Error::other("group calls are not supported").into())
+        // Ad-hoc "group rings" need the ZK group send-token flow, which is a
+        // different protocol from Signal group calls. Not implemented.
+        Err(std::io::Error::other("ad-hoc group rings are not supported").into())
     }
 }
 
@@ -1472,9 +1541,107 @@ pub async fn send_call_signal(
 }
 
 pub async fn transmit(manager: &mut StoredManager, pending: PendingCallSignal) -> Result<(), String> {
-    if pending.session_generation != session_generation() {
+    let generation = match &pending {
+        PendingCallSignal::Contact { session_generation, .. } => *session_generation,
+        PendingCallSignal::Group { session_generation, .. } => *session_generation,
+    };
+    if generation != session_generation() {
         return Err("stale call session".to_string());
     }
-    send_call_signal(manager, &pending.thread, &base64::engine::general_purpose::STANDARD.encode(pending.proto))
+    match pending {
+        PendingCallSignal::Contact { thread, proto, .. } => {
+            send_call_signal(manager, &thread, &base64::engine::general_purpose::STANDARD.encode(proto))
+                .await
+        }
+        PendingCallSignal::Group { group_id, proto, .. } => {
+            send_group_call_signal(manager, &group_id, proto).await
+        }
+    }
+}
+
+/// Hand an inbound group call signal to RingRTC.
+///
+/// Unlike 1:1 signaling, the payload is opaque to Signal: RingRTC parses the
+/// group id and the device-to-device message itself. The bytes passed here are
+/// the inner payload rather than the whole `CallMessage`, because that is what
+/// `CallManager::received_call_message` expects.
+pub fn receive_group_call_signal(event: &serde_json::Value) -> bool {
+    let sender = event.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+    if sender.is_empty() {
+        return false;
+    }
+    let sender_device = event
+        .get("sender_device_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let encoded = match event.get("message_b64").and_then(|v| v.as_str()) {
+        Some(value) => value,
+        None => return false,
+    };
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        _ => return false,
+    };
+    let sender_service = match crate::sync::parse_service_id(sender) {
+        Ok(service_id) => service_id,
+        Err(_) => return false,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Clamp the age so a clock skew cannot produce a negative delta, which
+    // RingRTC would treat as an invalid message.
+    let message_age = now_ms.saturating_sub(
+        event.get("ts").and_then(|v| v.as_u64()).unwrap_or(now_ms),
+    );
+    let mut guard = match manager().and_then(|m| m.lock().ok()) {
+        Some(guard) => guard,
+        None => return false,
+    };
+    // RingRTC identifies a caller by the raw service-id bytes, matching the
+    // format it is given for 1:1 signaling elsewhere in this file.
+    let sender_uuid = match sender_service {
+        ServiceId::Aci(aci) => aci.service_id_fixed_width_binary().to_vec(),
+        ServiceId::Pni(pni) => pni.service_id_fixed_width_binary().to_vec(),
+    };
+    let _ = guard.received_call_message(
+        sender_uuid,
+        sender_device as DeviceId,
+        local_device_id(),
+        bytes,
+        std::time::Duration::from_millis(message_age),
+    );
+    true
+}
+
+/// Send a group call signal to every member of the group.
+async fn send_group_call_signal(
+    manager: &mut StoredManager,
+    group_id: &[u8],
+    proto: Vec<u8>,
+) -> Result<(), String> {
+    let master_key = crate::sync::group_master_key_for_id(manager, group_id).await?;
+    // presage panics on a master key that is not 32 bytes, so the length is
+    // checked here rather than discovered as an abort.
+    if master_key.len() != 32 {
+        return Err(format!(
+            "group master key was {} bytes, expected 32",
+            master_key.len()
+        ));
+    }
+    let message = ProtoCallMessage::decode(proto.as_slice())
+        .map_err(|e| format!("group call message protobuf: {e}"))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    manager
+        .send_message_to_group(
+            &master_key,
+            ContentBody::CallMessage(message),
+            timestamp,
+        )
         .await
+        .map_err(|e| format!("group call send: {e}"))
 }

@@ -20,6 +20,7 @@ use presage::libsignal_service::protocol::{Aci, Pni, ServiceId};
 use presage::manager::Registered;
 use presage::model::messages::Received;
 use presage::store::{ContentsStore, StateStore, Thread};
+
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 
@@ -39,7 +40,7 @@ fn service_uuid(sid: &ServiceId) -> String {
     }
 }
 
-fn parse_service_id(value: &str) -> Result<ServiceId, String> {
+pub(crate) fn parse_service_id(value: &str) -> Result<ServiceId, String> {
     let (is_pni, bare) = value
         .strip_prefix("PNI:")
         .map(|v| (true, v))
@@ -620,8 +621,40 @@ pub async fn load_names(store: &SqliteStore) -> HashMap<String, String> {
     map
 }
 
-async fn group_member_profile_key(manager: &StoredManager, aci: Aci) -> Option<ProfileKey> {
-    let groups = manager.store().groups().await.ok()?;
+/// Find the group master key for a ZK group identifier.
+///
+/// Group call signaling names a group by its 32-byte identifier, but the local
+/// store and the send path are both keyed by master key. Each known group's
+/// identifier is derived and compared; no result is cached, so a stale entry
+/// can never route a signal to the wrong group.
+pub async fn group_master_key_for_id(
+    manager: &StoredManager,
+    group_id: &[u8],
+) -> Result<[u8; 32], String> {
+    if group_id.is_empty() {
+        return Err("group call signal had no group id".to_string());
+    }
+    let groups = manager
+        .store()
+        .groups()
+        .await
+        .map_err(|e| format!("group lookup: {e}"))?;
+    for entry in groups {
+        let Ok((master_key, _)) = entry else { continue };
+        let bytes: [u8; 32] = match master_key.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let derived = crate::group_calls::group_id_for_master_key(&bytes)
+            .map_err(|e| format!("group id derivation: {e}"))?;
+        if derived.as_slice() == group_id {
+            return Ok(bytes);
+        }
+    }
+    Err("no local group matches that identifier".to_string())
+}
+
+async fn group_member_profile_key(manager: &StoredManager, aci: Aci) -> Option<ProfileKey> {    let groups = manager.store().groups().await.ok()?;
     for entry in groups {
         let Ok((_, group)) = entry else { continue };
         if let Some(member) = group.members.iter().find(|member| member.aci == aci) {
@@ -990,6 +1023,25 @@ pub fn call_signal_part(
 
     use base64::Engine as _;
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    // Group call signaling is an opaque payload inside a CallMessage with no
+    // offer/answer/ice/hangup/busy field. It is a distinct event rather than a
+    // 1:1 "kind" because RingRTC has to be handed the raw bytes, and a group
+    // call message must never be rendered as a chat row or as 1:1 signaling.
+    if let Some(opaque) = &call.opaque {
+        let data = opaque.data.as_ref()?;
+        if data.is_empty() {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "type": "group_call_signal",
+            "sender": sender,
+            "sender_device_id": sender_device_id,
+            "message_b64": b64(data),
+            "immediate": opaque.urgency.unwrap_or(0) == 1,
+            "ts": ts,
+        }));
+    }
 
     // Signal may put several ICE candidates in one CallMessage. Keep the
     // first value in `opaque` for compatibility and expose the complete list
@@ -1533,6 +1585,80 @@ mod tests {
         };
         assert!(has_chat_content("", &[pointer], false));
         assert!(has_chat_content("hello", &[], false));
+    }
+
+    /// Build a `Content` carrying a `CallMessage` with only an opaque payload,
+    /// which is how group call signaling arrives.
+    fn group_call_content(opaque: Option<Vec<u8>>, urgency: Option<i32>) -> Content {
+        use libsignal_service::proto::{
+            call_message::Opaque, CallMessage as ProtoCallMessage,
+        };
+        let message = ProtoCallMessage {
+            opaque: opaque.map(|data| Opaque { data: Some(data), urgency }),
+            ..Default::default()
+        };
+        let ts = chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+            .expect("valid timestamp");
+        Content {
+            metadata: libsignal_service::content::Metadata {
+                sender: ServiceId::Aci(
+                    uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111")
+                        .expect("sender uuid")
+                        .into(),
+                ),
+                destination: ServiceId::Aci(
+                    uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222")
+                        .expect("destination uuid")
+                        .into(),
+                ),
+                sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                    .expect("device id in range"),
+                pni_verified: None,
+                client_timestamp: ts,
+                server_timestamp: ts,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            },
+            body: ContentBody::CallMessage(message),
+        }
+    }
+
+    #[test]
+    fn a_group_call_signal_is_its_own_event_not_1_1_signaling() {
+        // Group signaling must not be read as a 1:1 offer/answer/ICE: those go
+        // through a different handler with different expectations.
+        let event = call_signal_part(
+            &group_call_content(Some(vec![0x01, 0x02]), Some(1)),
+            &HashMap::new(),
+        )
+        .expect("group call signal produces an event");
+        assert_eq!(event.get("type").and_then(|v| v.as_str()), Some("group_call_signal"));
+        assert!(
+            event.get("kind").is_none(),
+            "a group signal must not claim a 1:1 kind"
+        );
+        assert!(event.get("message_b64").is_some());
+        assert_eq!(event.get("immediate").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn group_signal_urgency_defaults_to_droppable() {
+        // Signal documents a missing urgency as DROPPABLE, so an absent value
+        // must not be read as "handle immediately".
+        let event = call_signal_part(
+            &group_call_content(Some(vec![0x01]), None),
+            &HashMap::new(),
+        )
+        .expect("group call signal produces an event");
+        assert_eq!(event.get("immediate").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn an_empty_group_payload_produces_no_event() {
+        assert!(call_signal_part(&group_call_content(Some(Vec::new()), Some(1)), &HashMap::new()).is_none());
+        assert!(call_signal_part(&group_call_content(None, Some(1)), &HashMap::new()).is_none());
     }
 
     #[test]
