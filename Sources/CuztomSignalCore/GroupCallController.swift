@@ -335,6 +335,16 @@ public final class GroupCallController: ObservableObject {
         let groupIdHex = try await bridge.groupCallGroupId(masterKeyHex: key)
         Log.info("[group-call] step=group-id-derived group=\(groupIdHex.prefix(8))…")
         let members = roster.members(masterKeyHex: key)
+        if members.isEmpty {
+            // A group of one is legal, so this is not refused outright. But an
+            // empty roster on a group that has members means the roster was
+            // never read, and the SFU cannot attribute anyone in a call like
+            // that: it connects and then nobody can be identified. Saying so
+            // beats a call that looks alive and is useless.
+            Log.error(
+                "[group-call] roster for this group is empty; the call will connect with nobody identifiable"
+            )
+        }
         let resolvedTitle = title ?? roster.title(masterKeyHex: key)
         let handle = try await bridge.startGroupCall(groupIdHex: groupIdHex, sfuURL: sfuURL)
         Log.info("[group-call] step=client-created client=\(handle.clientId)")

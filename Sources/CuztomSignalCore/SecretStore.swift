@@ -44,6 +44,29 @@ public struct KeychainSecretStore: SecretStoring {
     private static let resolved = NSLock()
     nonisolated(unsafe) private static var cache: [String: Data] = [:]
 
+    /// Counts every Keychain operation in this process.
+    ///
+    /// An item created under a different code signature makes macOS show an
+    /// authorization prompt, and the prompt count is the number that matters to
+    /// the user. It cannot be derived from the code, only observed, so every
+    /// operation is numbered in the log.
+    private static let operationCounter = NSLock()
+    nonisolated(unsafe) private static var operationCount = 0
+
+    static func noteOperation(_ kind: String, key: String) {
+        operationCounter.lock()
+        operationCount += 1
+        let index = operationCount
+        operationCounter.unlock()
+        Log.info("[keychain] op=\(index) \(kind) account=\(key)")
+    }
+
+    static func resetOperationCount() {
+        operationCounter.lock()
+        operationCount = 0
+        operationCounter.unlock()
+    }
+
     public init(service: String = "top.furryfemboys.cuztom-signal") {
         self.service = service
     }
@@ -64,6 +87,7 @@ public struct KeychainSecretStore: SecretStoring {
     /// genuinely missing item from a locked/inaccessible Keychain. Callers
     /// must never generate replacement encryption material on the latter.
     public func loadStrict(key: String) throws -> Data? {
+        Self.noteOperation("read", key: key)
         let cacheKey = "\(service)/\(key)"
         Self.resolved.lock()
         if let cached = Self.cache[cacheKey] {
@@ -81,6 +105,7 @@ public struct KeychainSecretStore: SecretStoring {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
+        Log.info("[keychain] read \(key) -> OSStatus \(status)")
         switch status {
         case errSecSuccess:
             guard let data = item as? Data else {
@@ -152,7 +177,9 @@ public struct KeychainSecretStore: SecretStoring {
             kSecValueData as String: value,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         ]
+        Self.noteOperation("add", key: key)
         let status = SecItemAdd(query as CFDictionary, nil)
+        Log.info("[keychain] add \(key) -> OSStatus \(status)")
         switch status {
         case errSecSuccess:
             return nil
@@ -205,6 +232,7 @@ public struct KeychainSecretStore: SecretStoring {
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
         ]
+        Self.noteOperation("delete", key: key)
         let status = SecItemDelete(query as CFDictionary)
         // Forget the cached copy first: leaving it would let the rest of this
         // process keep opening a database with a key that no longer exists.

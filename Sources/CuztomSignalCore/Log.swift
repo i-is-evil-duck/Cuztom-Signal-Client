@@ -5,6 +5,14 @@ import Foundation
 public enum Log {
     public static let fileURL: URL = {
         let base = (try? FileManager.default.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false)) ?? FileManager.default.temporaryDirectory
+        // A test run and a running app both log here by default, which makes the
+        // log useless for diagnosing the app: the test suite reads and creates
+        // its own Keychain accounts and buries the real entries. `CUZTOM_LOG_PATH`
+        // points a run somewhere else.
+        if let override = ProcessInfo.processInfo.environment["CUZTOM_LOG_PATH"],
+           !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
         return base.appendingPathComponent("Logs/CuztomSignal/app.log")
     }()
 

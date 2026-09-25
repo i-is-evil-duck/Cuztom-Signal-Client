@@ -129,6 +129,40 @@ struct MessageListView: View {
     @Environment(ChatViewModel.self) private var vm
     @State private var loadingMore = false
     @State private var dropActive = false
+    /// Whether the viewport is resting at the newest message.
+    ///
+    /// Tracked so a new incoming message only scrolls the list when the user is
+    /// already at the bottom. Following unconditionally pulled the view away
+    /// from older messages someone was reading.
+    @State private var isNearBottom = true
+
+    /// Fetch one more page of older history, keeping the reader in place.
+    ///
+    /// Older rows are *prepended*, so without correction the content under the
+    /// viewport shifts down by the height of the new rows and the reader is
+    /// dropped further into the past by exactly the amount they just loaded. The
+    /// message that was at the top is captured first and scrolled back to
+    /// afterwards, so loading older history does not move what they were
+    /// reading.
+    ///
+    /// Re-entrancy and exhaustion are checked here as well as at the call sites,
+    /// because the top sentinel can appear more than once while a page is still
+    /// in flight: a second request would fetch the same rows and report
+    /// progress that did not happen.
+    private func loadOlder(proxy: ScrollViewProxy) {
+        guard !loadingMore, !vm.historyExhausted else { return }
+        let anchorID = vm.messages.first?.id
+        loadingMore = true
+        Task {
+            await vm.loadMore()
+            loadingMore = false
+            if let anchorID, vm.messages.contains(where: { $0.id == anchorID }) {
+                // No animation: an animated correction is visible as the list
+                // lurching, which is worse than the shift it prevents.
+                proxy.scrollTo(anchorID, anchor: .top)
+            }
+        }
+    }
 
     var body: some View {
         @Bindable var vm = vm
@@ -206,24 +240,6 @@ struct MessageListView: View {
                         .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
-                if vm.selectedId != nil {
-                    if vm.historyExhausted {
-                        Text("No older messages — history starts when this device was linked.")
-                            .font(.caption).foregroundStyle(.secondary)
-                            .padding(.top, 8)
-                    } else {
-                        Button(loadingMore ? "Loading…" : "Load older messages") {
-                            loadingMore = true
-                            Task {
-                                await vm.loadMore()
-                                loadingMore = false
-                            }
-                        }
-                        .font(.caption)
-                        .padding(.top, 8)
-                        .disabled(loadingMore)
-                    }
-                }
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
@@ -235,6 +251,47 @@ struct MessageListView: View {
                             // another. That mismatch is what trapped when
                             // switching chats mid-scroll.
                             let snapshot = vm.messages
+
+                            // The top of the history. Its appearance while the
+                            // viewport is not at the bottom means the user
+                            // scrolled up to read, which is the cue to fetch
+                            // another page. A `LazyVStack` only realizes this
+                            // view when it is actually near the viewport, so it
+                            // does not fire for a long list on open.
+                            Color.clear
+                                .frame(height: 1)
+                                .id("message-top")
+                                .onAppear {
+                                    // `isNearBottom` is the guard that matters: on
+                                    // open, a list short enough to fit also has
+                                    // its top on screen, and that is not a
+                                    // request for more history.
+                                    guard !isNearBottom else { return }
+                                    loadOlder(proxy: proxy)
+                                }
+
+                            if vm.historyExhausted {
+                                Text("No older messages — history starts when this device was linked.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                    .padding(.top, 4)
+                            } else if loadingMore {
+                                HStack {
+                                    ProgressView().controlSize(.small)
+                                    Text("Loading older messages…")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 6)
+                            } else {
+                                // Kept as well as the scroll trigger: a chat
+                                // whose visible history already fits on screen
+                                // cannot be scrolled up, so it would otherwise be
+                                // impossible to reach anything older.
+                                Button("Load older messages") { loadOlder(proxy: proxy) }
+                                    .font(.caption)
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.secondary)
+                            }
+
                             ForEach(Array(snapshot.enumerated()), id: \.element.id) { index, msg in
                                 MessageRow(
                                     msg: msg,
@@ -248,19 +305,30 @@ struct MessageListView: View {
                                     }
                                 )
                             }
+
+                            // The bottom of the history. Visible means the
+                            // viewport is resting at the newest message, which is
+                            // the condition for following new ones.
                             Color.clear
                                 .frame(height: 1)
                                 .id("message-bottom")
+                                .onAppear { isNearBottom = true }
+                                .onDisappear { isNearBottom = false }
                         }
                         .padding()
                     }
-                    .onAppear {
-                        proxy.scrollTo("message-bottom", anchor: .bottom)
-                    }
+                    // Start at the newest message. This replaced an
+                    // `onAppear` scroll-to-bottom, which rendered the list at
+                    // the top first and then jumped down, so opening a chat
+                    // looked like it loaded from the top and scrolled. The
+                    // anchor applies before the first frame, so there is no
+                    // visible jump.
+                    .defaultScrollAnchor(.bottom)
                     .onChange(of: vm.messages.map(\.id)) { _, _ in
-                        // Covers both locally sent messages and live inbound
-                        // messages without changing the user's scroll position
-                        // while they are reading older history.
+                        // Only follow new messages when the user is already at
+                        // the bottom. Scrolling unconditionally yanked the view
+                        // away from whatever they were reading.
+                        guard isNearBottom else { return }
                         withAnimation(.easeOut(duration: 0.2)) {
                             proxy.scrollTo("message-bottom", anchor: .bottom)
                         }

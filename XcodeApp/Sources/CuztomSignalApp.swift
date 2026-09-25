@@ -90,7 +90,14 @@ enum LinkPhase: Equatable {
 final class ChatViewModel {
     private var controller: ChatController?
     private let callController = CallController.shared
-    private let groupCallController = GroupCallController.shared
+    /// Built per session rather than using `GroupCallController.shared`.
+    ///
+    /// The shared instance is constructed with an `EmptyGroupRoster`, so a
+    /// controller that is not given the real roster silently reports an empty
+    /// membership and can never resolve an inbound group's id. That is exactly
+    /// what happened: calls placed with no roster at all, and inbound calls
+    /// discarded as unresolvable.
+    private var groupCallController: GroupCallController?
     private var groupRoster: NativeGroupRoster?
 
     /// The group call in progress, or nil. Kept as a plain mirror of the
@@ -313,15 +320,19 @@ final class ChatViewModel {
         // store, so they are configured together.
         let roster = NativeGroupRoster(service: live)
         groupRoster = roster
-        groupCallController.configure(with: live)
+        // The controller must hold the same roster the view model primes, or a
+        // call is placed with no members and inbound groups stay unresolvable.
+        let groupCalls = GroupCallController(roster: roster)
+        groupCallController = groupCalls
+        groupCalls.configure(with: live)
         // An inbound group call names a group by identifier, and one for a group
         // this device is not in cannot be joined, so the map is what decides
         // whether a ringing call is answerable at all.
         live.onGroupCallSignal = { [weak self] signal in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                await self.groupCallController.receive(event: signal)
-                self.groupCall = self.groupCallController.current
+                guard let self, let groupCalls = self.groupCallController else { return }
+                await groupCalls.receive(event: signal)
+                self.groupCall = groupCalls.current
                 self.sync()
             }
         }
@@ -609,13 +620,16 @@ func sendTyping(started: Bool) async {
               let conv = conversations.first(where: { $0.id == id }),
               conv.peer.isGroup,
               let masterKey = ThreadID.parse(id).groupMasterKey else { return }
-        guard let roster = groupRoster else {
+        guard let roster = groupRoster, let groupCalls = groupCallController else {
             sendError = "Group calls are not ready yet"
             return
         }
         do {
+            // Prime the roster first: without it the SFU cannot attribute
+            // anyone in the call, which looks like a broken call rather than a
+            // missing step.
             _ = try await roster.load(masterKeyHex: masterKey)
-            groupCall = try await groupCallController.startCall(
+            groupCall = try await groupCalls.startCall(
                 masterKeyHex: masterKey,
                 title: conv.title
             )
@@ -627,7 +641,7 @@ func sendTyping(started: Bool) async {
 
     /// End the group call in progress.
     func endGroupCall() async {
-        await groupCallController.end()
+        await groupCallController?.end()
         groupCall = nil
         sync()
     }
@@ -867,8 +881,10 @@ func sendTyping(started: Bool) async {
         // A group call must not survive an account boundary: native clients are
         // torn down on logout, so a live handle would be refused and the UI
         // would show a call that no longer exists.
-        await groupCallController.resetAndAwait()
+        await groupCallController?.resetAndAwait()
+        groupCallController = nil
         groupRoster?.reset()
+        groupRoster = nil
         groupCall = nil
         notifiedCallIDs.removeAll()
         NotificationManager.shared.cancelAll()

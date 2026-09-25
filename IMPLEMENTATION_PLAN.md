@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 152/152 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 161/161 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 52/52 passed |

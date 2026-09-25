@@ -805,10 +805,16 @@ pub async fn prepare_group_call_proof(
         .as_secs();
     let day = crate::group_calls::current_redemption_day(now);
     eprintln!("[core] group call proof: requesting ZK auth credentials");
-    let (body, server_params) = manager
-        .group_auth_credentials_raw(day, day + 1)
-        .await
-        .map_err(|e| format!("group credential request: {e}"))?;
+    // A request that never answers would otherwise stall the whole join with no
+    // diagnostic at all, which is indistinguishable from a network problem. The
+    // credential is short-lived, so waiting longer than this cannot help.
+    let (body, server_params) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        manager.group_auth_credentials_raw(day, day + 1),
+    )
+    .await
+    .map_err(|_| "group credential request timed out".to_string())?
+    .map_err(|e| format!("group credential request: {e}"))?;
     // The credential body is secret, so only its shape is reported.
     eprintln!(
         "[core] group call proof: credential response {} bytes",

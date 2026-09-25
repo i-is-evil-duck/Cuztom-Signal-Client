@@ -9,6 +9,90 @@ import Testing
 ///
 /// These read the checked-in files rather than the constants, so bumping one and
 /// forgetting the others is caught here.
+/// The app's own group-call wiring.
+///
+/// The shared `GroupCallController` is built with an `EmptyGroupRoster`, so a
+/// controller that is never given the real roster silently reports an empty
+/// membership and cannot resolve an inbound group's id. That shipped once: calls
+/// were placed with `members-built count=0` and inbound calls were discarded as
+/// unresolvable, both of which look like a broken SFU rather than a wiring gap.
+@Suite("App group call wiring")
+struct GroupCallWiringTests {
+    private static func appSource(_ name: String) throws -> String {
+        try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("XcodeApp/Sources/\(name)"),
+            encoding: .utf8
+        )
+    }
+
+    @Test func theAppDoesNotUseTheRosterlessSharedController() throws {
+        let source = try Self.appSource("CuztomSignalApp.swift")
+        // Match a *use* rather than the bare name: prose in a comment may
+        // mention the shared controller while explaining why it is not used.
+        let usesShared = source
+            .split(separator: "\n")
+            .contains { line in
+                let code = line.drop { $0 == " " || $0 == "\t" }
+                return !code.hasPrefix("//")
+                    && code.contains("= GroupCallController.shared")
+            }
+        #expect(
+            !usesShared,
+            "the shared controller has an empty roster and cannot place or receive a group call"
+        )
+    }
+
+    @Test func theAppGivesTheControllerItsRealRoster() throws {
+        let source = try Self.appSource("CuztomSignalApp.swift")
+        #expect(
+            source.contains("GroupCallController(roster: roster)"),
+            "the controller must be built with the same roster the view model primes"
+        )
+    }
+
+    @Test func theEagerIdMapLoadIsGone() throws {
+        // The map lives behind the sync loop's live manager, which is not running
+        // when the app configures. Loading it there failed every launch and left
+        // inbound calls unresolvable for the rest of the process.
+        let source = try Self.appSource("CuztomSignalApp.swift")
+        let rosterSource = try Self.appSource("NativeGroupRoster.swift")
+        #expect(
+            !source.contains("loadGroupIdMap()"),
+            "the id map must be loaded on first use, not at configure time"
+        )
+        #expect(
+            rosterSource.contains("func masterKeyHex(forGroupIdHex groupIdHex: String) async"),
+            "the roster must resolve ids lazily"
+        )
+    }
+
+    @Test func anEmptyRosterIsReportedRatherThanSilentlyAccepted() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/CuztomSignalCore/GroupCallController.swift"),
+            encoding: .utf8
+        )
+        #expect(
+            source.contains("roster for this group is empty"),
+            "an unreadable roster must be reported; the call connects with nobody identifiable"
+        )
+    }
+}
+
+/// The C ABI is a contract across three places: the C header, the Rust
+/// `CORE_ABI_VERSION`, and the Swift loader that refuses a mismatched dylib.
+/// Drift between them does not fail to build; it fails at `dlopen` on a user's
+/// machine with a log line about an ABI number.
+///
+/// These read the checked-in files rather than the constants, so bumping one and
+/// forgetting the others is caught here.
 @Suite("Native ABI contract")
 struct NativeABIContractTests {
     private static func repositoryRoot() -> URL {
