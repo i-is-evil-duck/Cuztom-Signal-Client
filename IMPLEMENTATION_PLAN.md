@@ -375,8 +375,8 @@ changing behavior.
       baseline is cleaned up.
 - [x] Add an ABI/version symbol exposed by the Rust library.
 - [x] Add a versioned C header and a parity check for every exported ABI symbol.
-- [ ] Fix current compiler warnings, especially the AppKit actor warning and
-      ignored Swift operation results.
+- [x] Fix the current AppKit actor-isolation warning in the emoji picker.
+- [ ] Audit and explicitly handle remaining ignored Swift operation results.
 - [x] Make the native integration test fail when CI supplies a native path;
       local runs without a built dylib may still skip explicitly.
 

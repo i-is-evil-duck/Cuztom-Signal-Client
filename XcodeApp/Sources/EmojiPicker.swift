@@ -40,6 +40,7 @@ struct AppleEmojiCatcher: NSViewRepresentable {
         Coordinator(onPick: onPick)
     }
 
+    @MainActor
     final class Coordinator: NSObject {
         var onPick: (String) -> Void
         init(onPick: @escaping (String) -> Void) {
