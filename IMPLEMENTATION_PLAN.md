@@ -1,6 +1,6 @@
 # Cuztom Signal Implementation Plan
 
-_Last updated: 2026-09-24_
+_Last updated: 2026-09-25_
 
 ## 1. Purpose and current assessment
 
@@ -271,7 +271,7 @@ cache used for live/sent attachments, with validation and eviction.
 **Status:** Implemented with file-existence validation and persisted lookup
 aliases; account-scoped eviction/quotas remain part of the broader cache work.
 
-#### P1 tranche completed 2026-09-24
+#### P1 tranche completed 2026-09-25
 
 - [x] Default link previews to off; fetch only approved public HTTPS pages,
   reject unsafe redirects, avoid remote image fetches, and cap response size.
