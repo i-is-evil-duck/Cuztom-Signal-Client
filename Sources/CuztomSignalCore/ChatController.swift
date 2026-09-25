@@ -116,7 +116,7 @@ public final class ChatController: @unchecked Sendable {
                 live.onReceipt = { [weak self] sender, kind, stamps in
                     Task { @MainActor [weak self] in
                         guard let self, self.lifecycleGeneration == callbackLifecycle else { return }
-                        await self.applyReceipt(kind: kind, timestamps: stamps, senderName: sender)
+                        await self.applyReceipt(kind: kind, timestamps: stamps, senderID: sender)
                     }
                 }
                 live.onReceiptScoped = { [weak self] thread, sender, kind, stamps in
@@ -125,8 +125,8 @@ public final class ChatController: @unchecked Sendable {
                         await self.applyReceipt(
                             kind: kind,
                             timestamps: stamps,
-                            senderName: sender,
-                            thread: thread
+                            thread: thread,
+                            senderID: sender
                         )
                     }
                 }
@@ -300,10 +300,12 @@ public final class ChatController: @unchecked Sendable {
     public func applyReceipt(
         kind: String,
         timestamps: [Int64],
-        senderName: String,
-        thread: String? = nil
+        senderName: String? = nil,
+        thread: String? = nil,
+        senderID: String? = nil
     ) async {
         var touched: String?
+        let participantID = senderID ?? senderName ?? "?"
         let lists: [(String, [ChatMessage])]
         if let thread {
             lists = [(thread, await store.messages(in: thread, limit: Int.max))]
@@ -316,9 +318,9 @@ public final class ChatController: @unchecked Sendable {
                 if timestamps.contains(ms) || (m.storeTs.map { timestamps.contains($0) } ?? false) {
                     await store.updateMessage(id: m.id) { msg in
                         if kind == "read" {
-                            if !msg.readBy.contains(senderName) { msg.readBy.append(senderName) }
+                            if !msg.readBy.contains(participantID) { msg.readBy.append(participantID) }
                         } else {
-                            if !msg.deliveredTo.contains(senderName) { msg.deliveredTo.append(senderName) }
+                            if !msg.deliveredTo.contains(participantID) { msg.deliveredTo.append(participantID) }
                         }
                     }
                     touched = thread

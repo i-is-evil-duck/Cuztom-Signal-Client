@@ -122,7 +122,7 @@ and downloaded media. User data and the local app bundle are gitignored.
 - `cargo check`: passed.
 - `cargo test --lib`: 8 tests passed.
 - `cargo build --release`: passed.
-- Full Xcode `swift test`: 49 tests passed.
+- Full Xcode `swift test`: 50 tests passed.
 - Manual verification: fresh QR link/resume, contacts/groups, name resolution,
   duplicate cleanup, message routing, and native 1:1 voice calling.
 

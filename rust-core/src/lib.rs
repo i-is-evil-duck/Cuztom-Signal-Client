@@ -1020,7 +1020,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
         .ok_or_else(|| "not linked".to_string())?;
     let mut manager = match linked.manager.take() {
         Some(manager) => manager,
-        None => Manager::load_registered(store)
+        None => Manager::load_registered(store.clone())
             .await
             .map_err(|e| format!("reload manager: {e}"))?,
     };
@@ -1281,7 +1281,14 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                     // Reactions, receipts, edits, deletes, typing,
                                     // and calls travel as message envelopes; emit
                                     // them as events, never as chat rows.
-                                    if let Some(rv) = sync::receipt_part(&c, &names) {
+                                    if let Some(rv) = sync::receipt_part_scoped(
+                                        &store,
+                                        &c,
+                                        &self_aci,
+                                        &names,
+                                    )
+                                    .await
+                                    {
                                         let _ = event_tx.send(rv.to_string());
                                     } else if let Some(rv) = sync::call_signal_part(&c, &names) {
                                         // Call offer/answer/ICE/hangup/busy. These

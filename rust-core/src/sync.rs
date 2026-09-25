@@ -721,7 +721,7 @@ pub async fn whoami(store: &SqliteStore) -> Result<String, String> {
 pub fn received_event(r: &Received, self_aci: &str, names: &HashMap<String, String>) -> Option<String> {
     let v = match r {
         Received::Content(c) => {
-            if let Some(event) = receipt_part(c, names) {
+            if let Some(event) = receipt_part(c, names, self_aci) {
                 return Some(event.to_string());
             }
             if let Some(event) = call_signal_part(c, names) {
@@ -1046,10 +1046,14 @@ pub fn call_signal_part(
     }))
 }
 
-/// Read/delivery receipt → {"type":"receipt","sender","sender_name",
-/// "kind":"read"|"delivered","timestamps":[…]}. Timestamps are sender (store)
-/// clocks of the messages being acked.
-pub fn receipt_part(content: &Content, names: &HashMap<String, String>) -> Option<serde_json::Value> {
+/// Read/delivery receipt → {"type":"receipt","thread","sender",
+/// "sender_name","kind":"read"|"delivered","timestamps":[…]}. Timestamps are
+/// store clocks of the messages being acknowledged.
+pub fn receipt_part(
+    content: &Content,
+    names: &HashMap<String, String>,
+    self_aci: &str,
+) -> Option<serde_json::Value> {
     let receipt = match &content.body {
         ContentBody::ReceiptMessage(r) => r,
         _ => return None,
@@ -1061,16 +1065,81 @@ pub fn receipt_part(content: &Content, names: &HashMap<String, String>) -> Optio
         _ => return None,
     };
     let sender = service_uuid(&content.metadata.sender);
+    let thread = thread_of_content_for(content, self_aci);
     Some(serde_json::json!({
         "type": "receipt",
-        // Receipt envelopes do not carry a reliable thread discriminator;
-        // leave it null rather than misrouting a group receipt as a contact.
-        "thread": serde_json::Value::Null,
+        "thread": thread,
         "sender": sender,
         "sender_name": display_name(names, &sender),
         "kind": kind,
         "timestamps": receipt.timestamp,
+        "ambiguous": false,
     }))
+}
+
+/// Resolve receipt scope against the native store. ReceiptMessage itself has
+/// no thread field; matching its target timestamps is the only reliable way
+/// to distinguish colliding 1:1/group conversations.
+pub async fn receipt_part_scoped(
+    store: &SqliteStore,
+    content: &Content,
+    self_aci: &str,
+    names: &HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    let mut event = receipt_part(content, names, self_aci)?;
+    let receipt = match &content.body {
+        ContentBody::ReceiptMessage(receipt) => receipt,
+        _ => return None,
+    };
+    let timestamps: std::collections::HashSet<u64> = receipt.timestamp.iter().copied().collect();
+    if timestamps.is_empty() {
+        return Some(event);
+    }
+
+    let mut threads: Vec<Thread> = store
+        .contacts()
+        .await
+        .ok()?
+        .filter_map(|contact| contact.ok())
+        .map(|contact| Thread::Contact(ServiceId::Aci(Aci::from(contact.uuid))))
+        .collect();
+    threads.extend(
+        store
+            .groups()
+            .await
+            .ok()?
+            .filter_map(|group| group.ok())
+            .map(|(key, _)| Thread::Group(key)),
+    );
+
+    let mut matches = std::collections::HashSet::new();
+    for thread in threads {
+        let thread_id = match &thread {
+            Thread::Contact(sid) => format!("contact:{}", service_uuid(sid)),
+            Thread::Group(key) => format!("group:{}", hex::encode(key)),
+        };
+        let rows = match store.messages(&thread, ..).await {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        for row in rows.filter_map(|row| row.ok()) {
+            let store_ts = content_store_timestamp(&row);
+            let protocol_ts = content_protocol_timestamp(&row);
+            if timestamps.contains(&store_ts) || timestamps.contains(&protocol_ts) {
+                matches.insert(thread_id.clone());
+            }
+        }
+    }
+
+    if matches.len() == 1 {
+        event["thread"] = serde_json::json!(matches.into_iter().next().unwrap());
+    } else if matches.len() > 1 {
+        // Never let the Swift fallback scan every conversation and apply a
+        // colliding timestamp to the wrong peer.
+        event["thread"] = serde_json::Value::Null;
+        event["ambiguous"] = serde_json::json!(true);
+    }
+    Some(event)
 }
 
 fn thread_of_content_for(content: &Content, self_aci: &str) -> Option<String> {

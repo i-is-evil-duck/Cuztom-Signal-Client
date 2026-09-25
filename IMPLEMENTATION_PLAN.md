@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 49/49 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 50/50 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 8/8 passed |
@@ -252,6 +252,10 @@ is treated as an ACI/PNI identifier.
 **Required fix:** Include thread and stable sender service ID in receipt
 events/models, and use a separate display-name lookup for presentation.
 
+**Status:** Implemented by resolving receipt target timestamps against the
+native store before delivery, retaining the stable sender service ID, and
+dropping ambiguous receipts instead of applying them to every conversation.
+
 #### P1-8: Manual attachment paths are not persisted across relaunches
 
 `RustCoreService.bindLocalPath()` only updates the in-memory `localPaths` map.
@@ -274,6 +278,8 @@ aliases; account-scoped eviction/quotas remain part of the broader cache work.
 - [x] Redact notification content by default and clear bounded diagnostics on
   successful logout.
 - [x] Persist manual attachment paths and hydrate them after service restart.
+- [x] Resolve receipt scope from native target timestamps, retain stable sender
+      IDs, and drop ambiguous cross-conversation acknowledgements.
 
 ### P2 — reliability, UX, and maintainability
 

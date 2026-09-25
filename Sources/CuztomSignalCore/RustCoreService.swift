@@ -116,6 +116,7 @@ struct LiveEvent: Decodable {
     // receipt
     var kind: String?
     var timestamps: [Int64]?
+    var ambiguous: Bool?
     // typing
     var started: Bool?
     var typingSender: String?
@@ -124,6 +125,7 @@ struct LiveEvent: Decodable {
 
     private enum CodingKeys: String, CodingKey {
         case type, message, thread, emoji, remove, sender, kind, timestamps, body
+        case ambiguous
         case targetSts = "target_sts"
         case senderName = "sender_name"
         case started
@@ -1304,7 +1306,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                     onTyping?(thread, event.senderName ?? sender, started)
                 }
             case "receipt":
-                if let kind = event.kind, let stamps = event.timestamps {
+                if event.ambiguous == true {
+                    Log.error("receipt dropped: target timestamp matched multiple conversations")
+                } else if let kind = event.kind, let stamps = event.timestamps {
                     let sender = event.sender ?? event.senderName ?? "?"
                     if let scoped = onReceiptScoped {
                         scoped(event.thread, sender, kind, stamps)
