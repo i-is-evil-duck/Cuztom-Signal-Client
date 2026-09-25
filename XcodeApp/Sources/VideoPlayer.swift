@@ -64,7 +64,7 @@ struct VideoThumbnail: View {
                         Rectangle().fill(Color.gray.opacity(0.2))
                     }
                 }
-                .frame(width: 280, height: 164)
+                .frame(width: 340, height: 200)
                 .cornerRadius(6)
                 .clipped()
                 Image(systemName: "play.circle.fill")

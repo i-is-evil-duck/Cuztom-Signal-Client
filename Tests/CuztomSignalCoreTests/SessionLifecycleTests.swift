@@ -120,16 +120,43 @@ private final class LockedFlag: @unchecked Sendable {
     #expect(try await operation.value == 7)
 }
 
+/// A manually released latch.
+///
+/// Gate-ordering tests used to hold the first operation open with a 50 ms
+/// sleep and then assert on what the waiter had *not* done yet. That made
+/// them wall-clock dependent: on a loaded machine the sleep expired first and
+/// the assertions failed for reasons unrelated to the gate. The holder is now
+/// parked until the test explicitly releases it, so the ordering is enforced
+/// by the test rather than by timing.
+private actor TestLatch {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters = []
+        for continuation in pending { continuation.resume() }
+    }
+}
+
 @Test func asyncLifecycleGateSerializesTransitions() async throws {
     let gate = AsyncOperationGate()
+    let holder = TestLatch()
     let firstEntered = LockedFlag()
-    let secondSubmitted = LockedFlag()
     let secondEntered = LockedFlag()
 
     let first = Task {
         try await gate.run {
             firstEntered.set()
-            try await Task.sleep(nanoseconds: 50_000_000)
+            await holder.wait()
             return 1
         }
     }
@@ -138,17 +165,18 @@ private final class LockedFlag: @unchecked Sendable {
     }
 
     let second = Task {
-        secondSubmitted.set()
-        return try await gate.run {
+        try await gate.run {
             secondEntered.set()
             return 2
         }
     }
-    while !secondSubmitted.value {
-        try await Task.sleep(nanoseconds: 1_000_000)
-    }
+
+    // The first operation cannot finish until the latch opens, so the waiter
+    // provably cannot have been admitted here.
+    for _ in 0..<20 { await Task.yield() }
     #expect(!secondEntered.value)
 
+    await holder.open()
     #expect(try await first.value == 1)
     #expect(try await second.value == 2)
     #expect(secondEntered.value)
@@ -156,12 +184,15 @@ private final class LockedFlag: @unchecked Sendable {
 
 @Test func asyncGateDoesNotDeadlockCanceledWaiter() async throws {
     let gate = AsyncOperationGate()
+    let holder = TestLatch()
     let firstEntered = LockedFlag()
     let secondSubmitted = LockedFlag()
+    let secondEntered = LockedFlag()
+
     let first = Task {
         try await gate.run {
             firstEntered.set()
-            try await Task.sleep(nanoseconds: 50_000_000)
+            await holder.wait()
         }
     }
     while !firstEntered.value {
@@ -169,12 +200,16 @@ private final class LockedFlag: @unchecked Sendable {
     }
     let second = Task {
         secondSubmitted.set()
-        try await gate.run {}
+        try await gate.run { secondEntered.set() }
     }
     while !secondSubmitted.value {
         try await Task.sleep(nanoseconds: 1_000_000)
     }
+    // Cancel while the holder is provably still open, then release it: the
+    // waiter must be rejected rather than admitted after the fact.
     second.cancel()
+    await holder.open()
+
     do {
         try await second.value
         Issue.record("expected canceled gate waiter to fail")
@@ -182,6 +217,7 @@ private final class LockedFlag: @unchecked Sendable {
         // expected
     }
     try await first.value
+    #expect(!secondEntered.value, "a canceled waiter must not run its operation")
 }
 
 @Test func failedNativeTeardownPoisonsServiceAgainstRelink() async {

@@ -449,13 +449,56 @@ private struct ReactionSummary: Identifiable {
     var id: String { emoji }
 }
 
-/// Reports the width a message bubble's content wants. Each `MessageRow`
-/// observes the value produced by its own subtree, so rows measure
-/// independently.
-private struct MessageContentWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat { 0 }
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+/// Sizes a bubble to hug its content between a minimum and a maximum.
+///
+/// A plain `.frame(maxWidth:)` cannot do this: it is greedy and expands to the
+/// proposed width, which made every bubble render at the maximum. Measuring the
+/// content with a preference key instead collapses into a feedback loop — the
+/// content is measured *after* it has been clamped, so it reports the clamped
+/// width and can never grow again (every bubble locks to the minimum and media
+/// gets flattened).
+///
+/// Asking the subview for its ideal size and then re-proposing the clamped
+/// width gives both required behaviours: short content hugs, long content
+/// wraps exactly at the maximum, and images render at their natural size.
+private struct ClampedBubbleLayout: Layout {
+    let minWidth: CGFloat
+    let maxWidth: CGFloat
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let width = clampedWidth(for: content)
+        // Re-propose the clamped width so text wraps there and resizable media
+        // resolves its height from the aspect ratio.
+        let fitted = content.sizeThatFits(
+            ProposedViewSize(width: width, height: proposal.height)
+        )
+        return CGSize(width: width, height: proposal.height ?? fitted.height)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        guard let content = subviews.first else { return }
+        let width = clampedWidth(for: content)
+        content.place(
+            at: bounds.origin,
+            anchor: .topLeading,
+            proposal: ProposedViewSize(width: width, height: bounds.height)
+        )
+    }
+
+    private func clampedWidth(for content: LayoutSubview) -> CGFloat {
+        let ideal = content.sizeThatFits(.unspecified).width
+        guard ideal.isFinite, ideal > 0 else { return minWidth }
+        return min(max(ideal, minWidth), maxWidth)
     }
 }
 
@@ -467,36 +510,25 @@ struct MessageRow: View {
 
     private let quickEmojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
 
-    /// Bubbles hug their content between these bounds. A plain
-    /// `.frame(maxWidth:)` is greedy: it expands to the proposed width, which
-    /// made every bubble — including a one-character message and every
-    /// attachment — render at the full maximum. Measuring the content and
-    /// clamping it keeps short text narrow, lets media sit at its own size,
-    /// and still wraps long text at the maximum.
-    private let minBubbleWidth: CGFloat = 64
+    /// Bubbles hug their content between these bounds. See
+    /// `ClampedBubbleLayout` for why this cannot be done with `.frame`.
+    private let minBubbleWidth: CGFloat = 72
     private let maxBubbleWidth: CGFloat = 460
     /// Receipt lists name every reader, so cap them well below the bubble
     /// maximum; otherwise they alone stretch the bubble to full width.
-    private let receiptLineWidth: CGFloat = 320
-
-    @State private var contentWidth: CGFloat = 0
+    private let receiptLineWidth: CGFloat = 300
 
     private var isGroupMessage: Bool {
         msg.author.groupId != nil
     }
 
-    private var bubbleWidth: CGFloat {
-        guard contentWidth > 0 else { return minBubbleWidth }
-        return min(max(contentWidth, minBubbleWidth), maxBubbleWidth)
-    }
-
-    private var bubbleAlignment: Alignment {
-        msg.direction == .outgoing ? .trailing : .leading
-    }
-
     var body: some View {
         HStack {
             if msg.direction == .outgoing { Spacer() }
+            ClampedBubbleLayout(
+                minWidth: minBubbleWidth,
+                maxWidth: maxBubbleWidth
+            ) {
             VStack(alignment: .leading, spacing: 4) {
                 // Sender name/initials for group messages (incoming only)
                 if isGroupMessage && msg.direction == .incoming && showsSender {
@@ -598,16 +630,8 @@ struct MessageRow: View {
                     .buttonStyle(.plain)
                 }
             }
-            .background {
-                // Measure before clamping: the background is sized by the
-                // content's own layout, so this reports the width the content
-                // actually wants, not the clamped bubble width.
-                GeometryReader { proxy in
-                    Color.clear.preference(key: MessageContentWidthKey.self, value: proxy.size.width)
-                }
-            }
-            .frame(width: bubbleWidth, alignment: .leading)
             .padding(8)
+            }
             .background(msg.direction == .outgoing ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .contextMenu {
@@ -637,11 +661,6 @@ struct MessageRow: View {
                 }
             }
             if msg.direction == .incoming { Spacer() }
-        }
-        .onPreferenceChange(MessageContentWidthKey.self) { width in
-            // Only react to real changes; the clamp is applied on read so the
-            // value itself can stay unclamped.
-            if abs(width - contentWidth) > 0.5 { contentWidth = width }
         }
     }
 
@@ -719,7 +738,7 @@ struct AttachmentRow: View {
             if isGIF, let url = existingURL,
                let image = AttachmentImageLoader.load(from: url) {
                 AnimatedGIFView(image: image)
-                    .frame(width: 280, height: 180)
+                    .frame(width: 340, height: 240)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .accessibilityIdentifier("attachment-gif")
                     .onTapGesture {
@@ -730,7 +749,7 @@ struct AttachmentRow: View {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: 280, maxHeight: 220)
+                    .frame(maxWidth: 340, maxHeight: 300)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .accessibilityIdentifier("attachment-image")
                     .onTapGesture {
