@@ -174,6 +174,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// is already account-specific; hashing it avoids putting raw paths in
     /// cache filenames or persisted JSON.
     private let cacheNamespace: String
+    private let sessionEpoch = SessionEpoch()
     private let initLock = NSLock()
     private var didInit = false
     private var linked = false
@@ -903,6 +904,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// and pump events into `incomingMessages()`. Throws only if the loop
     /// itself won't start; a failed contact-sync request is non-fatal.
     public func startLiveSync() async throws {
+        let eventEpoch = sessionEpoch.invalidate()
         let sym = try await initCore()
         if sym.requestContacts() != 0 {
             // Non-fatal: contacts may already be synced from a previous run.
@@ -914,7 +916,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         pumpTask?.cancel()
         pumpTask = Task { [weak self] in
             while !Task.isCancelled {
-                self?.drainEvents()
+                guard let self, self.sessionEpoch.isCurrent(eventEpoch) else { return }
+                self.drainEvents(epoch: eventEpoch)
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
@@ -956,6 +959,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// Wipe the session (keys + registration). Next `beginLinking` shows a
     /// fresh QR. Local history cache is dropped with it.
     public func logout() async throws {
+        _ = sessionEpoch.invalidate()
         let sym = try await initCore()
         guard sym.logout() == 0 else {
             throw SignalError.network("logout failed: \(lastError(sym))")
@@ -980,6 +984,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// then remove account-bound Swift caches. The native worker acknowledges
     /// shutdown before its SQLite handle is released.
     public func clearAllData() async throws {
+        _ = sessionEpoch.invalidate()
         let sym = try await initCore()
         detachCallbacks()
         let pump = pumpTask
@@ -1338,9 +1343,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         return data
     }
 
-    private func drainEvents() {
-        guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else { return }
-        while let ptr = sym.pollEvent() {
+    private func drainEvents(epoch: UInt64) {
+        guard sessionEpoch.isCurrent(epoch),
+              let handle = libraryHandle,
+              let sym = Self.resolve(in: handle) else { return }
+        while sessionEpoch.isCurrent(epoch), let ptr = sym.pollEvent() {
             defer { sym.freeString(ptr) }
             let text = String(cString: ptr)
             guard let data = text.data(using: .utf8),

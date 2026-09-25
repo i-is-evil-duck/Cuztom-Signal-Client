@@ -74,6 +74,15 @@ import Testing
     #expect(history.count == 1)
 }
 
+@Test func sessionEpochInvalidatesOldWork() {
+    let epoch = SessionEpoch()
+    let first = epoch.invalidate()
+    #expect(epoch.isCurrent(first))
+    let second = epoch.invalidate()
+    #expect(second > first)
+    #expect(!epoch.isCurrent(first))
+}
+
 @Test func secretStoreRoundTrips() async throws {
     let store = InMemorySecretStore()
     try await store.save(key: "identity", value: Data("secret".utf8))

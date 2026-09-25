@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 55/55 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 56/56 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 11/11 passed |
@@ -444,8 +444,10 @@ metadata survives replay.
 - [ ] Move blocking FFI calls to a controlled background executor.
 - [x] Enforce one native worker/account per process.
 - [x] Reject initialization with a different database path while linked.
-- [ ] Add account/session epochs to all events, call signals, call actions,
-      Swift tasks, and cache keys.
+- [x] Add a lock-backed service session epoch and invalidate the native event
+      pump before logout/wipe/relink.
+- [ ] Propagate account/session epochs through every remaining FFI call,
+      call signal/action, Swift task, and cache key.
 - [x] Drain or invalidate queued RingRTC signals/actions during logout before
       allowing relink.
 - [ ] Guard call startup so rapid taps cannot create duplicate native calls.
