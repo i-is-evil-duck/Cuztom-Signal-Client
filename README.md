@@ -107,6 +107,12 @@ Important implementation areas:
 - `Sources/CuztomSignalCore/CallController.swift` — Swift call state machine,
   tracked accept/end/mute tasks, and the `CallNativeControlling` seam that lets
   call actions be tested without booting RingRTC.
+- `Sources/CuztomSignalCore/AudioOutputRouter.swift` — CoreAudio output routing
+  for the call speaker toggle.
+- `Sources/CuztomSignalCore/GroupCallProofService.swift` — group-call
+  membership-proof redemption at the CDN. Partial: it takes the authorization
+  value from the native core, but nothing supplies that yet, so no group call
+  can complete. See `CALLS_PLAN.md`.
 
 ## Build and test
 
@@ -158,7 +164,7 @@ friction (see Milestone 7).
 
 | Area | Status |
 |---|---|
-| Swift core tests | **78 passed** with full Xcode |
+| Swift core tests | **91 passed** with full Xcode |
 | Rust library tests | **11 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |
