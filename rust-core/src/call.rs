@@ -797,24 +797,36 @@ pub async fn prepare_group_call_proof(
     our_aci: &str,
 ) -> Result<String, String> {
     eprintln!("[core] group call proof: resolving group id to a local group");
-    let master_key = crate::sync::group_master_key_for_id(manager, group_id).await?;
+    let master_key = crate::sync::group_master_key_for_id(manager, group_id)
+        .await
+        .map_err(|e| {
+            eprintln!("[core] group call proof: {e}");
+            e
+        })?;
     let aci = crate::sync::parse_service_id(our_aci)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs();
     let day = crate::group_calls::current_redemption_day(now);
+    let (start_secs, end_secs) = crate::group_calls::credential_window_seconds(day);
     eprintln!("[core] group call proof: requesting ZK auth credentials");
     // A request that never answers would otherwise stall the whole join with no
     // diagnostic at all, which is indistinguishable from a network problem. The
     // credential is short-lived, so waiting longer than this cannot help.
     let (body, server_params) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        manager.group_auth_credentials_raw(day, day + 1),
+        std::time::Duration::from_secs(20),
+        manager.group_auth_credentials_raw(start_secs, end_secs),
     )
     .await
-    .map_err(|_| "group credential request timed out".to_string())?
-    .map_err(|e| format!("group credential request: {e}"))?;
+    .map_err(|_| {
+        eprintln!("[core] group call proof: credential request timed out after 20s");
+        "group credential request timed out".to_string()
+    })?
+    .map_err(|e| {
+        eprintln!("[core] group call proof: credential request error: {e}");
+        format!("group credential request: {e}")
+    })?;
     // The credential body is secret, so only its shape is reported.
     eprintln!(
         "[core] group call proof: credential response {} bytes",
@@ -1673,7 +1685,12 @@ async fn send_group_call_signal(
     proto: Vec<u8>,
 ) -> Result<(), String> {
     eprintln!("[core] group call proof: resolving group id to a local group");
-    let master_key = crate::sync::group_master_key_for_id(manager, group_id).await?;
+    let master_key = crate::sync::group_master_key_for_id(manager, group_id)
+        .await
+        .map_err(|e| {
+            eprintln!("[core] group call proof: {e}");
+            e
+        })?;
     // presage panics on a master key that is not 32 bytes, so the length is
     // checked here rather than discovered as an abort.
     if master_key.len() != 32 {

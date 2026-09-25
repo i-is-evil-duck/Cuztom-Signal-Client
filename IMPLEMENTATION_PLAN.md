@@ -37,7 +37,7 @@ The following checks were run during the latest review:
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 161/161 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
-| `cargo test --all-targets` | 52/52 passed |
+| `cargo test --all-targets` | 55/55 passed |
 | `cargo check --all-targets` | Passed with warnings |
 | `cargo build --release` | Passed with warnings |
 | `cargo clippy --all-targets -- -D warnings` | Not run: Clippy component unavailable |

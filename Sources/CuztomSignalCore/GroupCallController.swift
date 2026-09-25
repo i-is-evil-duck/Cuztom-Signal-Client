@@ -501,6 +501,7 @@ public final class GroupCallController: ObservableObject {
             applyState(update.state ?? update.reason ?? "")
         case .ended:
             self.session = session
+            Log.info("[group-call] native end: \(Self.endReasonPhrase(update.reason))")
             endFromNative(reason: update.reason)
         case .reactions, .raisedHands, .speechEvent, .remoteMute, .observedRemoteMute:
             // Reactions and speaking indicators need a participant roster
@@ -545,6 +546,12 @@ public final class GroupCallController: ObservableObject {
         } catch {
             fail("Could not join the call: \(Self.describe(error))")
         }
+    }
+
+    /// The reason a call reached its end, as a short phrase for the log.
+    static func endReasonPhrase(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "unspecified" }
+        return raw
     }
 
     private func presentGroupMembers(clientId: UInt32) async {
@@ -622,6 +629,7 @@ public final class GroupCallController: ObservableObject {
     }
 
     private func applyState(_ raw: String) {
+        Log.info("[group-call] state: \(raw)")
         guard var state = current, let phase = Self.phase(forNativeState: raw) else { return }
         state.phase = phase
         if phase == .connected { state.failure = nil }
@@ -640,7 +648,14 @@ public final class GroupCallController: ObservableObject {
     }
 
     private func fail(_ message: String) {
-        guard var state = current else { return }
+        // Logged unconditionally. A failure that only changes the banner leaves
+        // nothing in the log, which is how a call can sit in "connecting" with
+        // no evidence anywhere of why it stopped.
+        Log.error("[group-call] failed: \(message)")
+        guard var state = current else {
+            Log.error("[group-call] failed with no active call to report it on")
+            return
+        }
         state.phase = .failed
         state.failure = message
         current = state

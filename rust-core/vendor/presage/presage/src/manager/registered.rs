@@ -381,8 +381,9 @@ impl<S: Store> Manager<S, Registered> {
     /// server parameters have to come from the service.
     ///
     /// The endpoint is `GET /v1/certificate/auth/group` with
-    /// `zkcCredential=true`. `start_day`/`end_day` are day numbers since the
-    /// Unix epoch, matching Signal's redemption-day addressing.
+    /// `zkcCredential=true`. `start_secs`/`end_secs` are a half-open window in
+    /// *seconds* since the Unix epoch, which is what the parameter names mean.
+    /// Passing a day index here asks the service for a window in 1970.
     ///
     /// The credential body is returned unparsed on purpose: the response shape
     /// belongs to the calling protocol rather than to presage, so it is decoded
@@ -394,8 +395,8 @@ impl<S: Store> Manager<S, Registered> {
     /// the only place they are needed.
     pub async fn group_auth_credentials_raw(
         &self,
-        start_day: u64,
-        end_day: u64,
+        start_secs: u64,
+        end_secs: u64,
     ) -> Result<(String, libsignal_service::zkgroup::server_params::ServerPublicParams), Error<S::Error>> {
         use libsignal_service::configuration::Endpoint;
         use libsignal_service::prelude::ServiceError;
@@ -405,21 +406,37 @@ impl<S: Store> Manager<S, Registered> {
             self.state.service_configuration().zkgroup_server_public_params;
         let service = self.identified_push_service();
         let path = format!(
-            "/v1/certificate/auth/group?redemptionStartSeconds={start_day}&redemptionEndSeconds={end_day}&zkcCredential=true"
+            "/v1/certificate/auth/group?redemptionStartSeconds={start_secs}&redemptionEndSeconds={end_secs}&zkcCredential=true"
         );
-        let response = service
+        // The request URL is logged because a wrong or doubled path is
+        // otherwise indistinguishable from an unresponsive server: both present
+        // as a hang. It carries day numbers and no secrets.
+        let request = service
             .request(
                 reqwest::Method::GET,
                 Endpoint::service(path),
                 HttpAuthOverride::NoOverride,
-            )?
-            .send()
-            .await
+            )
             .map_err(|e| Error::IoError(std::io::Error::other(e)))?;
+        // `build()` consumes the builder, so this is a throwaway copy purely for
+        // the log line.
+        let logged = request
+            .try_clone()
+            .and_then(|clone| clone.build().ok())
+            .map(|built| built.url().to_string());
+        match logged {
+            Some(url) => eprintln!("[core] group credential GET {url}"),
+            None => eprintln!("[core] group credential request URL could not be built"),
+        }
+        let response = request.send().await.map_err(|e| {
+            eprintln!("[core] group credential request failed to send: {e}");
+            Error::IoError(std::io::Error::other(e))
+        })?;
         let status = response.status();
         if !status.is_success() {
             // The body is deliberately dropped: it can echo request material,
             // and the status is what a caller acts on.
+            eprintln!("[core] group credential request rejected: HTTP {status}");
             return Err(ServiceError::UnhandledResponseCode {
                 status,
                 body: String::new(),

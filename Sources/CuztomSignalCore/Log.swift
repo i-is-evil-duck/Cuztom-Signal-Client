@@ -91,7 +91,11 @@ public enum Log {
 
     private static func write(_ level: String, _ message: String) {
         let line = "\(dateFmt.string(from: Date())) [\(level)] \(redact(message))\n"
-        print("[CuztomSignal] \(line)", terminator: "")
+        // Deliberately not also printed to stdout. The app redirects stdout and
+        // stderr into this same file so that native output — Rust `eprintln!`
+        // and panic messages — is not lost, so printing here would write every
+        // line twice. The duplicate copies made counts taken from this log
+        // wrong, which matters when the log is the evidence for a bug.
         queue.async {
             do {
                 let dir = fileURL.deletingLastPathComponent()
@@ -111,7 +115,12 @@ public enum Log {
                     try handle.write(contentsOf: data)
                 }
             } catch {
-                print("[CuztomSignal] log write failed: \(error)")
+                // The file handle is gone, so there is nowhere to write this.
+                // stderr is redirected into the log file too, so this still
+                // lands in the diagnostics rather than vanishing.
+                FileHandle.standardError.write(
+                    Data("[CuztomSignal] log write failed: \(error)\n".utf8)
+                )
             }
         }
     }

@@ -101,6 +101,31 @@ pub fn current_redemption_day(now_secs: u64) -> u64 {
     now_secs / 86_400
 }
 
+/// Seconds since the Unix epoch at which a redemption day begins.
+///
+/// The credential endpoint takes a *window in seconds*
+/// (`redemptionStartSeconds`/`redemptionEndSeconds`), not a day index. Passing a
+/// day number there asks for a window in 1970, which yields no credential and
+/// leaves the join unable to proceed.
+///
+/// Saturating rather than wrapping: a start past the end of the window would
+/// ask for a range that cannot exist, and refusing that is clearer than
+/// silently asking for the wrong one.
+pub fn redemption_day_start_seconds(day: u64) -> u64 {
+    day.saturating_mul(86_400)
+}
+
+/// The `[start, end)` window to request credentials for, in seconds.
+///
+/// The end is the start of the following day rather than the last instant of
+/// this one, because the service treats these as a half-open range and a
+/// credential for the next day is not usable yet.
+pub fn credential_window_seconds(day: u64) -> (u64, u64) {
+    let start = redemption_day_start_seconds(day);
+    let end = redemption_day_start_seconds(day.saturating_add(1));
+    (start, end)
+}
+
 /// One server-issued ZK auth credential.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ZkAuthCredential {
@@ -623,6 +648,42 @@ mod tests {
                 "expected {bad} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn the_credential_window_is_requested_in_seconds_not_days() {
+        // The parameters are `redemptionStartSeconds`/`redemptionEndSeconds`.
+        // A day index there asks the service for a window in 1970, which returns
+        // no credential and leaves the join unable to proceed.
+        let (start, end) = credential_window_seconds(19_675);
+        assert_eq!(start, 19_675 * 86_400);
+        assert_eq!(end, 19_676 * 86_400);
+        // Well past 1970, and one day wide.
+        assert!(start > 1_600_000_000, "start must be a real timestamp");
+        assert_eq!(end - start, 86_400);
+        // The window must be derived from the day, not the other way round: a
+        // start that falls on a day boundary is what the response's
+        // `redemptionTime` is measured against.
+        assert_eq!(start / 86_400, 19_675);
+    }
+
+    #[test]
+    fn the_window_covers_todays_credential_and_not_tomorrows() {
+        // Half-open, so a credential for the next day is never requested. It
+        // is not usable yet and presenting it would be rejected.
+        let now_secs = 19_675 * 86_400 + 3_600;
+        let day = current_redemption_day(now_secs);
+        let (start, end) = credential_window_seconds(day);
+        assert!(now_secs >= start, "today's credential is inside the window");
+        assert!(now_secs < end);
+    }
+
+    #[test]
+    fn an_absurd_day_saturates_rather_than_wrapping() {
+        // Wrapping would produce a start *before* the end, asking for a window
+        // that cannot exist.
+        let (start, end) = credential_window_seconds(u64::MAX);
+        assert!(start <= end, "the window must stay ordered");
     }
 
     #[test]
