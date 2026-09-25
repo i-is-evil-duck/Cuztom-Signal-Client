@@ -40,6 +40,8 @@ virtual audio device.
   with notification settings and duplicate suppression.
 - Idempotent logout/data wipe covering Rust state, Swift SQLite state, UUID and
   path maps, downloaded media, and keychain-backed session material.
+- Process-wide serial native FFI/lifecycle coordination with token-bound
+  session fences, cancellation-safe queued work, and cross-instance wipe poison.
 - Native RingRTC-backed 1:1 voice calls with ICE/DTLS, microphone capture,
   mute, hangup, incoming/outgoing state, and elapsed time UI.
 
@@ -78,8 +80,15 @@ SwiftUI Views (XcodeApp/Sources)
 
 Important implementation areas:
 
-- `Sources/CuztomSignalCore/RustCoreService.swift` — FFI seam, roster/message
-  mapping, UUID/path caches, attachments, sync callbacks, and data wipe.
+- `Sources/CuztomSignalCore/RustCoreService.swift` — token-bound FFI seam,
+  roster/message mapping, UUID/path caches, attachments, sync callbacks, and
+  data wipe.
+- `Sources/CuztomSignalCore/SerialNativeExecutor.swift` — process-wide serial
+  queue for blocking native Signal/RingRTC calls and teardown ordering.
+- `Sources/CuztomSignalCore/AsyncOperationGate.swift` and
+  `NativeProcessState.swift` — process-wide lifecycle serialization,
+  shared database-path session epochs, and cross-instance wipe-poison
+  protection.
 - `rust-core/src/sync.rs` — message normalization, stable timestamps, control
   envelope filtering, attachment metadata, profile/group-member resolution,
   and send helpers.
@@ -124,7 +133,7 @@ then ad-hoc sign the bundle.
 
 | Area | Status |
 |---|---|
-| Swift core tests | **56 passed** with full Xcode |
+| Swift core tests | **65 passed** with full Xcode |
 | Rust library tests | **11 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |

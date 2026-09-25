@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 56/56 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 65/65 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 11/11 passed |
@@ -73,14 +73,17 @@ selection changes, and local mutations.
 
 #### P0-2: `RustCoreService` is unsynchronized and the native core is process-global
 
-The Swift service is a regular class marked `@unchecked Sendable`, with
-unsynchronized mutable caches and initialization state. Its event pump,
-profile lookups, sends, attachments, refreshes, and logout paths can run
-concurrently.
+The Swift service is still a regular class marked `@unchecked Sendable`; its
+mutable Swift caches and initialization state are not yet actor-isolated. The
+account cache maps are now protected by a recursive state lock, while native
+command/poll FFI is serialized through a process-wide executor and every service
+FFI operation carries a session token checked before and after native work. The
+remaining risk is lifecycle/task ownership and state reads outside the new
+boundary, not unserialized native calls.
 
-The Rust worker is stored in a process-wide `OnceLock`. Multiple Swift service
-instances with different database paths can silently reuse the first native
-account.
+The Rust worker remains process-wide. The native core continues to reject
+conflicting database paths while linked, but the Swift service should still
+eventually become an actor/private executor to remove the remaining cache races.
 
 **Impact:** Dictionary races, lost cache writes, duplicate initialization,
 wrong-account operations, and corrupted UUID/path mappings.
@@ -107,6 +110,11 @@ survive, and stale tasks can update a newly linked account.
 and await all tasks, quiesce the native receive loop, close stores, clear
 account-bound caches and key material, verify deletion, and refuse to relink
 after a failed wipe.
+
+**Current status:** The native wipe now runs behind the serial executor, the
+event pump is cancelled and awaited, failed teardown poisons the service, and
+cache/key removal remains fail-closed. Full controller task ownership and
+account-switch integration coverage are still open.
 
 #### P0-4: SQLite paging and unread state are incorrect
 
@@ -439,15 +447,23 @@ metadata survives replay.
 
 **Goal:** Prevent cross-account leakage and make logout/retry reliable.
 
-- [ ] Convert `RustCoreService` to an actor or serialize all mutable state on a
-      private executor.
-- [ ] Move blocking FFI calls to a controlled background executor.
+- [ ] Convert `RustCoreService` to an actor or finish serializing the remaining
+      mutable Swift state; account caches are now lock-protected, but
+      lifecycle/task ownership still needs actorization.
+- [x] Move native command, initialization, polling, and call FFI calls to a
+      process-wide serial background executor; keep the synchronous loader as
+      a compatibility seam.
 - [x] Enforce one native worker/account per process.
 - [x] Reject initialization with a different database path while linked.
 - [x] Add a lock-backed service session epoch and invalidate the native event
       pump before logout/wipe/relink.
-- [ ] Propagate account/session epochs through every remaining FFI call,
-      call signal/action, Swift task, and cache key.
+- [x] Serialize lifecycle transitions with an async gate; a concurrent
+      begin/relink cannot overtake teardown.
+- [x] Share the session epoch and lifecycle gate by canonical database path
+      across service instances; suspend and poison failed teardown until
+      explicit relink.
+- [x] Route command/event/call FFI operations through token-bound session
+      checks and a process-wide serial background executor.
 - [x] Drain or invalidate queued RingRTC signals/actions during logout before
       allowing relink.
 - [ ] Guard call startup so rapid taps cannot create duplicate native calls.
@@ -461,8 +477,12 @@ metadata survives replay.
 - [x] Reset `didInit`, `selfAci`, path maps, UUID maps, resolver state, and
       pending composer/call state.
 - [x] Clear pending files and drafts on account switch.
-- [ ] Add tests for logout failure, relink, account switching, task
-      cancellation, and queued native work.
+- [x] Add regression coverage for epoch retirement, queued/in-flight native
+      cancellation semantics, lifecycle-gate ordering, idempotent unlinked
+      logout, explicit relink gating, failed native/presentation teardown
+      poisoning, and cross-instance refusal.
+- [ ] Add full controller/native integration coverage for logout failure,
+      account switching, task cancellation, and queued call actions.
 
 **Exit criteria:** Logging out cannot resume the old account, and no callback
 or task from account A can update account B.

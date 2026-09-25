@@ -199,7 +199,16 @@ public final class CallController: ObservableObject {
         )
         let rustMedia = mediaType == .video ? "video" : "audio"
         let nativeID = try await rust.startCall(thread: conversationId, mediaType: rustMedia)
+        guard startGeneration == callLifecycleGeneration else {
+            // The native command may have completed after logout/reset. Do
+            // not repopulate Swift mappings; teardown will reconcile RingRTC.
+            try? await rust.hangupCall()
+            throw CallError.signalingFailed("call start cancelled")
+        }
         try? await rust.setCallMuted(false)
+        guard startGeneration == callLifecycleGeneration else {
+            throw CallError.signalingFailed("call start cancelled")
+        }
         nativeIDByRecord[record.id] = nativeID
         recordIDByNativeID[nativeID] = record.id
         finishedNativeIDs.remove(nativeID)

@@ -67,15 +67,19 @@ public final class ChatController: @unchecked Sendable {
     /// Step 1: fetch the provisioning QR. Returns false on error.
     /// An existing session (`alreadyLinked`) resumes without a QR.
     public func begin(deviceName: String = "CuztomMac") async -> Bool {
+        let lifecycle = lifecycleGeneration
         lastError = nil
         do {
-            linkQR = try await service.beginLinking(deviceName: deviceName)
+            let qr = try await service.beginLinking(deviceName: deviceName)
+            guard lifecycle == lifecycleGeneration else { return false }
+            linkQR = qr
             connection = .linking
             notifyStateChange()
             observeConnection()
             Log.info("provisioning QR ready")
             return true
         } catch SignalError.alreadyLinked {
+            guard lifecycle == lifecycleGeneration else { return false }
             linkQR = nil
             connection = .syncing
             notifyStateChange()
@@ -83,6 +87,7 @@ public final class ChatController: @unchecked Sendable {
             Log.info("resuming existing session (no QR)")
             return true
         } catch {
+            guard lifecycle == lifecycleGeneration else { return false }
             lastError = String(describing: error)
             connection = .offline
             notifyStateChange()
@@ -94,8 +99,10 @@ public final class ChatController: @unchecked Sendable {
     /// Step 2: wait for the phone scan, then sync. Returns false on error.
     /// Split from `begin()` so UI can paint the QR while this runs.
     public func finish() async -> Bool {
+        let lifecycle = lifecycleGeneration
         do {
             try await service.waitForLink()
+            guard lifecycle == lifecycleGeneration else { return false }
             connection = .syncing
             notifyStateChange()
             // Live backend: pull contact sync + start the receive loop.
@@ -162,17 +169,21 @@ public final class ChatController: @unchecked Sendable {
                 }
                 do {
                     try await live.startLiveSync()
+                    guard lifecycle == lifecycleGeneration else { return false }
                     Log.info("live sync started")
                     if let me = try? await live.whoami() {
+                        guard lifecycle == lifecycleGeneration else { return false }
                         selfAci = me.aci
                         live.selfAci = me.aci
                     }
                 } catch {
+                    guard lifecycle == lifecycleGeneration else { return false }
                     lastError = String(describing: error)
                     Log.error("live sync failed: \(error)")
                 }
             }
             try await refresh()
+            guard lifecycle == lifecycleGeneration else { return false }
             connection = .connected
             notifyStateChange()
             startWatching()
@@ -184,6 +195,7 @@ public final class ChatController: @unchecked Sendable {
             }
             return true
         } catch {
+            guard lifecycle == lifecycleGeneration else { return false }
             lastError = String(describing: error)
             connection = .offline
             notifyStateChange()
@@ -713,10 +725,15 @@ public final class ChatController: @unchecked Sendable {
         // account's conversations, unread counts, or message UUIDs. The
         // encrypted presentation store uses its terminal path so its file and
         // database-scoped Keychain key can be removed after the queue closes.
-        if let sqliteStore = store as? SQLiteMessageStore {
-            try await sqliteStore.destroy()
-        } else {
-            try await store.clearAllDataChecked()
+        do {
+            if let sqliteStore = store as? SQLiteMessageStore {
+                try await sqliteStore.destroy()
+            } else {
+                try await store.clearAllDataChecked()
+            }
+        } catch {
+            (service as? RustCoreService)?.poisonAfterPresentationFailure()
+            throw error
         }
         selfAci = nil
         lastSentThread = nil

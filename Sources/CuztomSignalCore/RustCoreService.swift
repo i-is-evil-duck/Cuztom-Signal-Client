@@ -153,7 +153,9 @@ struct LiveEvent: Decodable {
 ///   `core_free_string(*mut c_char)`
 ///
 /// The library is loaded lazily with `dlopen` so the Swift package still
-/// builds/tests on machines without Rust.
+/// builds/tests on machines without Rust. Native command and poll work is
+/// serialized on `SerialNativeExecutor`; the remaining mutable Swift state is
+/// tracked separately until the service actorization follow-up.
 public final class RustCoreService: SignalService, @unchecked Sendable {
     public static let expectedNativeABI: UInt32 = 2
     private static let dylibEnvironmentKey = "CUZTOM_SIGNAL_CORE_PATH"
@@ -174,12 +176,21 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// is already account-specific; hashing it avoids putting raw paths in
     /// cache filenames or persisted JSON.
     private let cacheNamespace: String
-    private let sessionEpoch = SessionEpoch()
+    private let processState = NativeProcessState.shared
+    private let sessionEpoch: SessionEpoch
+    private let nativeExecutor = SerialNativeExecutor.shared
+    private let lifecycleGate = NativeProcessState.shared.lifecycleGate
     private let initLock = NSLock()
+    private let stateLock = NSRecursiveLock()
+    private let libraryLoadLock = NSLock()
     private var didInit = false
     private var linked = false
     /// Own ACI (resolved after linking via whoami) for identifying our own messages.
-    public var selfAci: String?
+    private var _selfAci: String?
+    public var selfAci: String? {
+        get { withStateLock { _selfAci } }
+        set { withStateLock { _selfAci = newValue } }
+    }
     /// Last roster snapshot, keyed by stable wire key (dedupe across refresh).
     private var messageCache: [String: RosterPayload.Message] = [:]
     /// Wire key -> UUID mapping, persisted to prevent duplicate messages on re-sync.
@@ -201,6 +212,28 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// re-seeds don't re-download (or re-prompt) every restart.
     private var pathCache: [String: String] = [:]
 
+    private func withStateLock<T>(_ body: () throws -> T) rethrows -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return try body()
+    }
+
+    private var linkedState: Bool {
+        withStateLock { linked }
+    }
+
+    private func setLinkedState(_ value: Bool) {
+        withStateLock { linked = value }
+    }
+
+    private var initializedState: Bool {
+        withStateLock { didInit }
+    }
+
+    private func setInitializedState(_ value: Bool) {
+        withStateLock { didInit = value }
+    }
+
     private var pathCacheURL: URL {
         cacheDirectoryURL.appendingPathComponent("attachment_paths.json")
     }
@@ -210,42 +243,52 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     private func loadPathCache() {
-        // The old un-namespaced map is intentionally not imported: it cannot
-        // be proven to belong to this account after a relink/account switch.
-        guard let data = try? Data(contentsOf: pathCacheURL),
-              let map = try? JSONDecoder().decode([String: String].self, from: data) else { return }
-        // Prune entries whose files vanished (cache eviction, reinstalls) and
-        // reject paths outside the app-owned media cache.
-        pathCache = map.filter { Self.isAllowedCachedPath($0.value) }
+        withStateLock {
+            // The old un-namespaced map is intentionally not imported: it
+            // cannot be proven to belong to this account after a relink.
+            guard let data = try? Data(contentsOf: pathCacheURL),
+                  let map = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+            // Prune entries whose files vanished (cache eviction, reinstalls)
+            // and reject paths outside the app-owned media cache.
+            pathCache = map.filter { Self.isAllowedCachedPath($0.value) }
+        }
     }
 
     private func savePathCache() {
-        guard let data = try? JSONEncoder().encode(pathCache) else { return }
-        try? FileManager.default.createDirectory(at: cacheDirectoryURL, withIntermediateDirectories: true)
-        Self.protectFile(at: cacheDirectoryURL.path)
-        try? data.write(to: pathCacheURL, options: .atomic)
-        Self.protectFile(at: pathCacheURL.path)
+        withStateLock {
+            guard let data = try? JSONEncoder().encode(pathCache) else { return }
+            try? FileManager.default.createDirectory(at: cacheDirectoryURL, withIntermediateDirectories: true)
+            Self.protectFile(at: cacheDirectoryURL.path)
+            try? data.write(to: pathCacheURL, options: .atomic)
+            Self.protectFile(at: pathCacheURL.path)
+        }
     }
 
     private func rememberPath(key: String, path: String) {
-        pathCache[key] = path
-        savePathCache()
-        Self.protectFile(at: path)
+        withStateLock {
+            pathCache[key] = path
+            savePathCache()
+            Self.protectFile(at: path)
+        }
     }
 
     private func loadUUIDCache() {
-        guard let data = try? Data(contentsOf: uuidCacheURL),
-              let map = try? JSONDecoder().decode([String: String].self, from: data) else { return }
-        uuidCache = map.compactMapValues { UUID(uuidString: $0) }
+        withStateLock {
+            guard let data = try? Data(contentsOf: uuidCacheURL),
+                  let map = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+            uuidCache = map.compactMapValues { UUID(uuidString: $0) }
+        }
     }
 
     private func saveUUIDCache() {
-        let stringMap = uuidCache.mapValues { $0.uuidString }
-        guard let data = try? JSONEncoder().encode(stringMap) else { return }
-        try? FileManager.default.createDirectory(at: cacheDirectoryURL, withIntermediateDirectories: true)
-        Self.protectFile(at: cacheDirectoryURL.path)
-        try? data.write(to: uuidCacheURL, options: .atomic)
-        Self.protectFile(at: uuidCacheURL.path)
+        withStateLock {
+            let stringMap = uuidCache.mapValues { $0.uuidString }
+            guard let data = try? JSONEncoder().encode(stringMap) else { return }
+            try? FileManager.default.createDirectory(at: cacheDirectoryURL, withIntermediateDirectories: true)
+            Self.protectFile(at: cacheDirectoryURL.path)
+            try? data.write(to: uuidCacheURL, options: .atomic)
+            Self.protectFile(at: uuidCacheURL.path)
+        }
     }
 
     /// Local override for on-demand downloads, keyed by message and
@@ -258,67 +301,71 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     public func bindLocalPath(thread: String, ts: Int64, index: Int = 0, path: String) {
-        let standardized = URL(fileURLWithPath: path).standardizedFileURL
-        guard Self.isAllowedCachedPath(standardized.path) else { return }
-        let localKey = localPathKey(thread: thread, ts: ts, index: index)
-        localPaths[localKey] = standardized.path
-        // `bindLocalPath` is the authoritative path returned by an on-demand
-        // download. Persist the same lookup aliases used by roster hydration;
-        // otherwise a relaunch loses the manual download and shows Download
-        // again even though the file still exists in the cache.
-        rememberPath(key: localKey, path: standardized.path)
-        rememberPath(key: "\(thread)/\(ts)/self/\(index)", path: standardized.path)
-        if let selfAci, !selfAci.isEmpty {
-            rememberPath(key: "\(thread)/\(ts)/\(selfAci)/\(index)", path: standardized.path)
+        withStateLock {
+            let standardized = URL(fileURLWithPath: path).standardizedFileURL
+            guard Self.isAllowedCachedPath(standardized.path) else { return }
+            let localKey = localPathKey(thread: thread, ts: ts, index: index)
+            localPaths[localKey] = standardized.path
+            // `bindLocalPath` is the authoritative path returned by an on-demand
+            // download. Persist the same lookup aliases used by roster hydration;
+            // otherwise a relaunch loses the manual download and shows Download
+            // again even though the file still exists in the cache.
+            rememberPath(key: localKey, path: standardized.path)
+            rememberPath(key: "\(thread)/\(ts)/self/\(index)", path: standardized.path)
+            if let selfAci, !selfAci.isEmpty {
+                rememberPath(key: "\(thread)/\(ts)/\(selfAci)/\(index)", path: standardized.path)
+            }
         }
     }
 
     /// Cache a sent attachment locally so it renders immediately and persists across restarts.
     /// Returns the cached file URL.
     public func cacheSentAttachment(thread: String, ts: Int64, sourceURL: URL, filename: String) -> URL {
-        // Create cache directory
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("CuztomSignal/attachments", isDirectory: true)
-        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        withStateLock {
+            // Create cache directory
+            let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+                .appendingPathComponent("CuztomSignal/attachments", isDirectory: true)
+            try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
 
-        // Generate stable cache filename: thread-sanitized-ts-index-filename
-        let safeThread = thread.replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
-        let safeFilename = URL(fileURLWithPath: filename).lastPathComponent
-            .replacingOccurrences(of: "/", with: "_")
-        let cacheFilename = "\(safeThread)-\(ts)-0-\(safeFilename)"
-        let cacheURL = cacheDir.appendingPathComponent(cacheFilename)
+            // Generate stable cache filename: thread-sanitized-ts-index-filename
+            let safeThread = thread.replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
+            let safeFilename = URL(fileURLWithPath: filename).lastPathComponent
+                .replacingOccurrences(of: "/", with: "_")
+            let cacheFilename = "\(safeThread)-\(ts)-0-\(safeFilename)"
+            let cacheURL = cacheDir.appendingPathComponent(cacheFilename)
 
-        // Copy file to cache (use security-scoped access if needed)
-        let scoped = sourceURL.startAccessingSecurityScopedResource()
-        defer { if scoped { sourceURL.stopAccessingSecurityScopedResource() } }
+            // Copy file to cache (use security-scoped access if needed)
+            let scoped = sourceURL.startAccessingSecurityScopedResource()
+            defer { if scoped { sourceURL.stopAccessingSecurityScopedResource() } }
 
-        try? FileManager.default.removeItem(at: cacheURL)
-        if FileManager.default.fileExists(atPath: sourceURL.path) {
-            try? FileManager.default.copyItem(at: sourceURL, to: cacheURL)
-        } else if let data = try? Data(contentsOf: sourceURL) {
-            try? data.write(to: cacheURL)
+            try? FileManager.default.removeItem(at: cacheURL)
+            if FileManager.default.fileExists(atPath: sourceURL.path) {
+                try? FileManager.default.copyItem(at: sourceURL, to: cacheURL)
+            } else if let data = try? Data(contentsOf: sourceURL) {
+                try? data.write(to: cacheURL)
+            }
+            Self.protectFile(at: cacheURL.path)
+
+            // Register using the same sender identity that roster messages use.
+            // Older builds used the literal "self"; retain that alias so already
+            // cached outgoing attachments remain discoverable.
+            let sender = selfAci ?? "self"
+            let messageKey = "\(thread)/\(ts)/\(sender)"
+            let cacheKey = "\(messageKey)/0"
+            rememberPath(key: cacheKey, path: cacheURL.path)
+            rememberPath(key: "\(thread)/\(ts)/self/0", path: cacheURL.path)
+            localPaths[localPathKey(thread: thread, ts: ts, index: 0)] = cacheURL.path
+
+            // Also register with ThreadID-derived key for consistency.
+            let threadComponents = ThreadID.parse(thread)
+            if let groupKey = threadComponents.groupMasterKey {
+                let groupCacheKey = "group:\(groupKey)/\(ts)/\(sender)/0"
+                rememberPath(key: groupCacheKey, path: cacheURL.path)
+            }
+
+            Log.info("cached sent attachment: \(cacheURL.path)")
+            return cacheURL
         }
-        Self.protectFile(at: cacheURL.path)
-
-        // Register using the same sender identity that roster messages use.
-        // Older builds used the literal "self"; retain that alias so already
-        // cached outgoing attachments remain discoverable.
-        let sender = selfAci ?? "self"
-        let messageKey = "\(thread)/\(ts)/\(sender)"
-        let cacheKey = "\(messageKey)/0"
-        rememberPath(key: cacheKey, path: cacheURL.path)
-        rememberPath(key: "\(thread)/\(ts)/self/0", path: cacheURL.path)
-        localPaths[localPathKey(thread: thread, ts: ts, index: 0)] = cacheURL.path
-
-        // Also register with ThreadID-derived key for consistency.
-        let threadComponents = ThreadID.parse(thread)
-        if let groupKey = threadComponents.groupMasterKey {
-            let groupCacheKey = "group:\(groupKey)/\(ts)/\(sender)/0"
-            rememberPath(key: groupCacheKey, path: cacheURL.path)
-        }
-
-        Log.info("cached sent attachment: \(cacheURL.path)")
-        return cacheURL
     }
 
     public init(libraryPath: String? = nil, dbPath: String? = nil) {
@@ -326,17 +373,15 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         self.explicitPath = libraryPath
         self.dbPath = dbPath ?? Self.defaultDBPath()
         self.cacheNamespace = Self.cacheNamespace(for: self.dbPath)
+        self.sessionEpoch = NativeProcessState.shared.sessionEpoch(databasePath: self.dbPath)
         var sc: AsyncStream<ConnectionState>.Continuation!
         self.connectionState = AsyncStream { sc = $0 }
         self.stateContinuation = sc
         var ic: AsyncStream<ChatMessage>.Continuation!
         self.incoming = AsyncStream { ic = $0 }
         self.incomingContinuation = ic
-        if let path = libraryPath {
-            if let handle = Self.openLibrary(at: path), Self.validateLoadedLibrary(handle, at: path) {
-                libraryHandle = handle
-                self.libraryPath = path
-            }
+        if libraryPath != nil {
+            _ = loadLibrary()
         }
         loadPathCache()
         loadUUIDCache()
@@ -401,15 +446,36 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         return paths
     }
 
-    public var isLibraryLoaded: Bool { libraryHandle != nil }
+    public var isLibraryLoaded: Bool {
+        libraryLoadLock.lock()
+        defer { libraryLoadLock.unlock() }
+        return libraryHandle != nil
+    }
 
     @discardableResult
     public func loadLibrary() -> Bool {
+        do {
+            return try nativeExecutor.runSync { [self] in
+                loadLibraryOnNativeQueue()
+            }
+        } catch {
+            return false
+        }
+    }
+
+    private func loadLibraryOnNativeQueue() -> Bool {
+        libraryLoadLock.lock()
+        defer { libraryLoadLock.unlock() }
         if libraryHandle != nil { return true }
         // An explicit path is strict: a missing file means "not available",
         // never silently fall back to a different build (test determinism).
-        if explicitPath != nil { return false }
-        for path in Self.defaultSearchPaths() {
+        let paths: [String]
+        if let explicitPath {
+            paths = [explicitPath]
+        } else {
+            paths = Self.defaultSearchPaths()
+        }
+        for path in paths {
             guard let handle = Self.openLibrary(at: path) else { continue }
             if Self.validateLoadedLibrary(handle, at: path) {
                 libraryHandle = handle
@@ -424,32 +490,73 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     public func beginLinking(deviceName: String) async throws -> LinkQR {
-        let sym = try await initCore()
-        // Resume path: a session from a previous launch is already live —
-        // the caller treats `alreadyLinked` as "skip the QR, just sync".
-        if sym.isLinked() == 1 {
-            linked = true
+        try await lifecycleGate.run { [self] in
+            try await beginLinkingInternal(deviceName: deviceName)
+        }
+    }
+
+    private func beginLinkingInternal(deviceName: String) async throws -> LinkQR {
+        // A suspended service starts a new generation; an active session is
+        // first probed without invalidating its event pump.
+        let probeToken = try sessionEpoch.resumeIfNeeded()
+        let alreadyLinked = try await withCore(token: probeToken, lifecycleOwned: true) { sym in
+            try Self.isLinked(sym)
+        }
+        if alreadyLinked {
+            setLinkedState(true)
+            throw SignalError.alreadyLinked
+        }
+
+        // Starting fresh provisioning is a real account transition. Rotate
+        // before begin_link so no pre-link task can publish into the new QR
+        // session, and stop the old pump before native teardown/replacement.
+        let token = try sessionEpoch.rotate()
+        let oldPump = pumpTask
+        pumpTask = nil
+        oldPump?.cancel()
+        await oldPump?.value
+
+        let url: String? = try await withCore(token: token, lifecycleOwned: true) { sym in
+            // Recheck after the rotation in case another native actor linked
+            // the worker while the probe was in flight.
+            if try Self.isLinked(sym) { return nil }
+            var ptr: UnsafeMutablePointer<CChar>?
+            deviceName.withCString { ptr = sym.beginLink($0) }
+            guard let ptr else {
+                throw SignalError.network("begin_link failed: \(Self.lastError(sym))")
+            }
+            let value = String(cString: ptr)
+            sym.freeString(ptr)
+            return value
+        }
+        guard let url else {
+            setLinkedState(true)
             throw SignalError.alreadyLinked
         }
         stateContinuation.yield(.linking)
-        let url: String = try callString(sym.beginLink, deviceName, what: "begin_link")
-        linked = false
+        setLinkedState(false)
         return LinkQR(payload: url)
     }
 
     public func waitForLink() async throws {
-        let sym = try await initCore()
+        let token = try sessionEpoch.capture()
         // Phone scan can take minutes; poll the worker until it resolves.
         let deadline = Date().addingTimeInterval(300)
         while Date() < deadline {
-            let rc = sym.pollLink()
-            if rc == 1 {
-                linked = true
-                stateContinuation.yield(.connected)
-                return
+            try Task.checkCancellation()
+            let rc: Int32 = try await withCore(token: token) { sym in
+                let rc = sym.pollLink()
+                if rc < 0 {
+                    throw SignalError.network("link failed: \(Self.lastError(sym))")
+                }
+                return rc
             }
-            if rc < 0 {
-                throw SignalError.network("link failed: \(lastError(sym))")
+            if rc == 1 {
+                try sessionEpoch.withCurrent(token) {
+                    setLinkedState(true)
+                    stateContinuation.yield(.connected)
+                }
+                return
             }
             try await Task.sleep(nanoseconds: 500_000_000)
         }
@@ -457,66 +564,99 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     public func fetchConversations() async throws -> [Conversation] {
-        guard linked || isLinkedNow() else { throw SignalError.notLinked }
-        let payload = try JSONDecoder().decode(RosterPayload.self, from: try await rosterData())
-        return applyRoster(payload)
+        let token = try sessionEpoch.capture()
+        if !linkedState {
+            let nativeLinked = try await isLinkedNow(token: token)
+            guard nativeLinked else { throw SignalError.notLinked }
+        }
+        let payload = try JSONDecoder().decode(RosterPayload.self, from: try await rosterData(token: token))
+        try sessionEpoch.require(token)
+        return try sessionEpoch.withCurrent(token) { applyRoster(payload) }
     }
 
     /// Get raw roster data for contact resolver population
     public func getRosterData() async throws -> RosterPayload {
-        guard linked || isLinkedNow() else { throw SignalError.notLinked }
-        return try JSONDecoder().decode(RosterPayload.self, from: try await rosterData())
+        let token = try sessionEpoch.capture()
+        if !linkedState {
+            let nativeLinked = try await isLinkedNow(token: token)
+            guard nativeLinked else { throw SignalError.notLinked }
+        }
+        let payload = try JSONDecoder().decode(RosterPayload.self, from: try await rosterData(token: token))
+        try sessionEpoch.require(token)
+        return payload
     }
 
     public func fetchMessages(conversationId: String, limit: Int) async throws -> [ChatMessage] {
-        guard linked || isLinkedNow() else { throw SignalError.notLinked }
+        let token = try sessionEpoch.capture()
+        if !linkedState {
+            let nativeLinked = try await isLinkedNow(token: token)
+            guard nativeLinked else { throw SignalError.notLinked }
+        }
         let requestedLimit = max(0, limit)
         // Merge the seed roster with older pages until `limit` is satisfied.
         // `sts` (store clock) is the ONLY correct paging basis — the SQLite
         // range runs over the client timestamp, not the server one.
         // History only goes back to link time: Signal never syncs older
         // messages to a new linked device (protocol limitation, not a bug).
-        var cached = threadCache(conversationId)
+        var cached = try sessionEpoch.withCurrent(token) { threadCache(conversationId) }
         if cached.count < requestedLimit {
             let oldest = cached.map(\.sts).filter { $0 > 0 }.min()
             let before: UInt64 = oldest.map { UInt64(bitPattern: $0) } ?? UInt64.max
             do {
-                let page = try await threadPage(conversationId, limit: requestedLimit, before: before)
+                let page = try await threadPage(token: token, conversationId, limit: requestedLimit, before: before)
                 Log.info("thread page \(conversationId): \(page.count) rows before \(before)")
-                for m in page { messageCache[m.key] = m }
+                try sessionEpoch.withCurrent(token) {
+                    withStateLock {
+                        for m in page { messageCache[m.key] = m }
+                    }
+                }
                 cached = threadCache(conversationId)
             } catch {
                 Log.error("thread page failed: \(error)")
                 throw error
             }
         }
-        return Array(cached.suffix(requestedLimit)).map { chatMessage($0) }
+        return try sessionEpoch.withCurrent(token) {
+            let current = threadCache(conversationId)
+            return Array(current.suffix(requestedLimit)).map { chatMessage($0) }
+        }
     }
 
     private func threadCache(_ conversationId: String) -> [RosterPayload.Message] {
-        messageCache.values
-            .filter { $0.thread == conversationId }
-            .sorted {
-                let left = $0.sts == 0 ? $0.ts : $0.sts
-                let right = $1.sts == 0 ? $1.ts : $1.sts
-                return left == right ? $0.ts < $1.ts : left < right
-            }
+        withStateLock {
+            messageCache.values
+                .filter { $0.thread == conversationId }
+                .sorted {
+                    let left = $0.sts == 0 ? $0.ts : $0.sts
+                    let right = $1.sts == 0 ? $1.ts : $1.sts
+                    return left == right ? $0.ts < $1.ts : left < right
+                }
+        }
     }
 
     private struct ThreadPage: Decodable {
         var messages: [RosterPayload.Message]
     }
 
-    private func threadPage(_ thread: String, limit: Int, before: UInt64) async throws -> [RosterPayload.Message] {
-        let sym = try await initCore()
-        var ptr: UnsafeMutablePointer<CChar>? = nil
-        thread.withCString { t in
-            ptr = sym.threadPage(t, UInt64(limit), before)
-        }
-        guard let ptr else { throw SignalError.network("thread page failed: \(lastError(sym))") }
-        defer { sym.freeString(ptr) }
-        guard let data = String(cString: ptr).data(using: .utf8) else {
-            throw SignalError.storage("thread page is not UTF-8")
+    private func threadPage(
+        token: SessionToken,
+        _ thread: String,
+        limit: Int,
+        before: UInt64
+    ) async throws -> [RosterPayload.Message] {
+        let data: Data = try await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            thread.withCString { t in
+                ptr = sym.threadPage(t, UInt64(limit), before)
+            }
+            guard let ptr else {
+                throw SignalError.network("thread page failed: \(Self.lastError(sym))")
+            }
+            defer { sym.freeString(ptr) }
+            guard let data = String(cString: ptr).data(using: .utf8) else {
+                throw SignalError.storage("thread page is not UTF-8")
+            }
+            return data
         }
         return try JSONDecoder().decode(ThreadPage.self, from: data).messages
     }
@@ -524,173 +664,223 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// On-demand attachment download for roster-seeded (metadata-only) rows.
     /// `ts` is the store-clock timestamp (see `ChatMessage.storeTs`).
     public func fetchAttachment(thread: String, ts: Int64, index: Int) async throws -> URL {
-        let sym = try await initCore()
-        var ptr: UnsafeMutablePointer<CChar>? = nil
-        thread.withCString { t in
-            ptr = sym.fetchAttachment(t, UInt64(bitPattern: ts), UInt64(index))
+        let token = try sessionEpoch.capture()
+        let path: String = try await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            thread.withCString { t in
+                ptr = sym.fetchAttachment(t, UInt64(bitPattern: ts), UInt64(index))
+            }
+            guard let ptr else {
+                throw SignalError.network("attachment fetch failed: \(Self.lastError(sym))")
+            }
+            defer { sym.freeString(ptr) }
+            return String(cString: ptr)
         }
-        guard let ptr else {
-            throw SignalError.network("attachment fetch failed: \(lastError(sym))")
-        }
-        defer { sym.freeString(ptr) }
-        return URL(fileURLWithPath: String(cString: ptr))
+        return URL(fileURLWithPath: path)
     }
 
     /// Upload a local file and send it. Returns (sent ts, filename, mime, size).
     public func sendAttachment(thread: String, path: String, caption: String) async throws -> (ts: Int64, name: String, mime: String, size: Int) {
-        let sym = try await initCore()
-        var ts: Int64 = -1
-        thread.withCString { t in
-            path.withCString { p in
-                caption.withCString { c in
-                    ts = sym.sendAttachment(t, p, c)
+        let token = try sessionEpoch.capture()
+        let ts: Int64 = try await withCore(token: token) { sym in
+            var ts: Int64 = -1
+            thread.withCString { t in
+                path.withCString { p in
+                    caption.withCString { c in
+                        ts = sym.sendAttachment(t, p, c)
+                    }
                 }
             }
+            guard ts >= 0 else {
+                throw SignalError.network("attachment send failed: \(Self.lastError(sym))")
+            }
+            return ts
         }
-        guard ts >= 0 else { throw SignalError.network("attachment send failed: \(lastError(sym))") }
+        try sessionEpoch.require(token)
         let url = URL(fileURLWithPath: path)
         return (ts, url.lastPathComponent, mimeFor(url: url), fileSize(url: url))
     }
 
     /// Reply quoting (`qTs` store-clock, `qAuthor` service id, `qBody`).
     public func sendReply(thread: String, body: String, qTs: Int64, qAuthor: String, qBody: String) async throws -> Int64 {
-        let sym = try await initCore()
-        var ts: Int64 = -1
-        thread.withCString { t in
-            body.withCString { b in
-                qAuthor.withCString { a in
-                    qBody.withCString { q in
-                        ts = sym.sendReply(t, b, UInt64(bitPattern: qTs), a, q)
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            var ts: Int64 = -1
+            thread.withCString { t in
+                body.withCString { b in
+                    qAuthor.withCString { a in
+                        qBody.withCString { q in
+                            ts = sym.sendReply(t, b, UInt64(bitPattern: qTs), a, q)
+                        }
                     }
                 }
             }
+            guard ts >= 0 else {
+                throw SignalError.network("reply failed: \(Self.lastError(sym))")
+            }
+            return ts
         }
-        guard ts >= 0 else { throw SignalError.network("reply failed: \(lastError(sym))") }
-        return ts
     }
 
     /// Delete-for-everyone tombstone. Local removal is separate.
     public func sendDeleteTombstone(thread: String, targetTs: Int64) async throws {
-        let sym = try await initCore()
-        var ts: Int64 = -1
-        thread.withCString { t in
-            ts = sym.sendDelete(t, UInt64(bitPattern: targetTs))
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let ts = thread.withCString { t in
+                sym.sendDelete(t, UInt64(bitPattern: targetTs))
+            }
+            guard ts >= 0 else {
+                throw SignalError.network("delete send failed: \(Self.lastError(sym))")
+            }
         }
-        guard ts >= 0 else { throw SignalError.network("delete send failed: \(lastError(sym))") }
     }
 
     /// Local-only store removal. Returns true when a row existed.
     public func deleteLocal(thread: String, sts: Int64) async throws -> Bool {
-        let sym = try await initCore()
-        var rc: Int32 = -1
-        thread.withCString { t in
-            rc = sym.deleteLocal(t, UInt64(bitPattern: sts))
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let rc = thread.withCString { t in
+                sym.deleteLocal(t, UInt64(bitPattern: sts))
+            }
+            guard rc >= 0 else {
+                throw SignalError.network("local delete failed: \(Self.lastError(sym))")
+            }
+            return rc == 1
         }
-        guard rc >= 0 else { throw SignalError.network("local delete failed: \(lastError(sym))") }
-        return rc == 1
     }
 
     /// Toggle/add `emoji` reaction on the message at `targetSts`.
     public func sendReaction(thread: String, targetSts: Int64, author: String, emoji: String, remove: Bool) async throws {
-        let sym = try await initCore()
-        var ts: Int64 = -1
-        thread.withCString { t in
-            author.withCString { a in
-                emoji.withCString { e in
-                    ts = sym.sendReaction(t, UInt64(bitPattern: targetSts), a, e, remove ? 1 : 0)
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let ts = thread.withCString { t in
+                author.withCString { a in
+                    emoji.withCString { e in
+                        sym.sendReaction(t, UInt64(bitPattern: targetSts), a, e, remove ? 1 : 0)
+                    }
                 }
             }
+            guard ts >= 0 else {
+                throw SignalError.network("reaction failed: \(Self.lastError(sym))")
+            }
         }
-        guard ts >= 0 else { throw SignalError.network("reaction failed: \(lastError(sym))") }
     }
 
     /// Send a read/delivery receipt for the given message timestamps (store clocks).
     /// `kind` is "read" or "delivered".
     public func sendReceipt(thread: String, timestamps: [Int64], kind: String) async throws {
-        let sym = try await initCore()
+        let token = try sessionEpoch.capture()
         let tsArray = timestamps.map { UInt64(bitPattern: $0) }
-        let rc = thread.withCString { t in
-            kind.withCString { k in
-                sym.sendReceipt(t, tsArray, UInt64(tsArray.count), k)
+        try await withCore(token: token) { sym in
+            let rc = thread.withCString { t in
+                kind.withCString { k in
+                    sym.sendReceipt(t, tsArray, UInt64(tsArray.count), k)
+                }
+            }
+            guard rc == 0 else {
+                throw SignalError.network("send receipt failed: \(Self.lastError(sym))")
             }
         }
-        guard rc == 0 else { throw SignalError.network("send receipt failed: \(lastError(sym))") }
     }
 
     // MARK: - M3: Message Edits & Typing
 
     /// Send a message edit (replaces content). Returns sent timestamp (ms).
     public func sendMessageEdit(thread: String, targetTs: Int64, newBody: String) async throws -> Int64 {
-        let sym = try await initCore()
-        var ts: Int64 = -1
-        thread.withCString { t in
-            newBody.withCString { b in
-                ts = sym.sendMessageEdit(t, UInt64(bitPattern: targetTs), b)
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            var ts: Int64 = -1
+            thread.withCString { t in
+                newBody.withCString { b in
+                    ts = sym.sendMessageEdit(t, UInt64(bitPattern: targetTs), b)
+                }
             }
+            guard ts >= 0 else {
+                throw SignalError.network("send message edit failed: \(Self.lastError(sym))")
+            }
+            return ts
         }
-        guard ts >= 0 else { throw SignalError.network("send message edit failed: \(lastError(sym))") }
-        return ts
     }
 
     /// Send a typing indicator.
     public func sendTyping(thread: String, started: Bool) async throws {
-        let sym = try await initCore()
-        let rc = thread.withCString { t in
-            sym.sendTyping(t, started ? 1 : 0)
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = thread.withCString { t in
+                sym.sendTyping(t, started ? 1 : 0)
+            }
+            guard rc == 0 else {
+                throw SignalError.network("send typing failed: \(Self.lastError(sym))")
+            }
         }
-        guard rc == 0 else { throw SignalError.network("send typing failed: \(lastError(sym))") }
     }
 
     // MARK: - M4: Call Signaling
 
     /// Send a call offer (SDP) to start a call.
     public func sendCallOffer(callId: String, to: String, mediaType: String, sdp: String) async throws {
-        let sym = try await initCore()
-        let rc = callId.withCString { c in
-            to.withCString { t in
-                mediaType.withCString { m in
-                    sdp.withCString { s in
-                        sym.sendCallOffer(c, t, m, s)
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = callId.withCString { c in
+                to.withCString { t in
+                    mediaType.withCString { m in
+                        sdp.withCString { s in
+                            sym.sendCallOffer(c, t, m, s)
+                        }
                     }
                 }
             }
+            guard rc == 0 else {
+                throw SignalError.network("send call offer failed: \(Self.lastError(sym))")
+            }
         }
-        guard rc == 0 else { throw SignalError.network("send call offer failed: \(lastError(sym))") }
     }
 
     /// Send a call answer (SDP) to accept a call.
     public func sendCallAnswer(callId: String, sdp: String) async throws {
-        let sym = try await initCore()
-        let rc = callId.withCString { c in
-            sdp.withCString { s in
-                sym.sendCallAnswer(c, s)
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = callId.withCString { c in
+                sdp.withCString { s in
+                    sym.sendCallAnswer(c, s)
+                }
+            }
+            guard rc == 0 else {
+                throw SignalError.network("send call answer failed: \(Self.lastError(sym))")
             }
         }
-        guard rc == 0 else { throw SignalError.network("send call answer failed: \(lastError(sym))") }
     }
 
     /// Send an ICE candidate during call setup.
     public func sendCallIceCandidate(callId: String, candidate: String, sdpMid: String, sdpMLineIndex: UInt32) async throws {
-        let sym = try await initCore()
-        let rc = callId.withCString { c in
-            candidate.withCString { cand in
-                sdpMid.withCString { mid in
-                    sym.sendCallIce(c, cand, mid, sdpMLineIndex)
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = callId.withCString { c in
+                candidate.withCString { cand in
+                    sdpMid.withCString { mid in
+                        sym.sendCallIce(c, cand, mid, sdpMLineIndex)
+                    }
                 }
             }
+            guard rc == 0 else {
+                throw SignalError.network("send call ice failed: \(Self.lastError(sym))")
+            }
         }
-        guard rc == 0 else { throw SignalError.network("send call ice failed: \(lastError(sym))") }
     }
 
     /// Send a call hangup.
     public func sendCallHangup(callId: String, reason: String) async throws {
-        let sym = try await initCore()
-        let rc = callId.withCString { c in
-            reason.withCString { r in
-                sym.sendCallHangup(c, r)
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = callId.withCString { c in
+                reason.withCString { r in
+                    sym.sendCallHangup(c, r)
+                }
+            }
+            guard rc == 0 else {
+                throw SignalError.network("send call hangup failed: \(Self.lastError(sym))")
             }
         }
-        guard rc == 0 else { throw SignalError.network("send call hangup failed: \(lastError(sym))") }
     }
 
     // MARK: - Call Signaling Integration (M4)
@@ -699,201 +889,199 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     /// Start a real 1:1 call. Returns RingRTC's numeric call id.
     public func startCall(thread: String, mediaType: String) async throws -> UInt64 {
-        let sym = try await initCore()
-        var id: UInt64 = .max
-        thread.withCString { t in
-            mediaType.withCString { m in
-                id = sym.callStart(t, m)
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let id = thread.withCString { t in
+                mediaType.withCString { m in
+                    sym.callStart(t, m)
+                }
             }
+            guard id != .max else {
+                throw SignalError.network("start call failed: \(Self.lastError(sym))")
+            }
+            return id
         }
-        guard id != .max else { throw SignalError.network("start call failed: \(lastError(sym))") }
-        return id
     }
 
     /// Accept a native incoming call.
     public func acceptCall(callId: UInt64) async throws {
-        let sym = try await initCore()
-        guard sym.callAccept(callId) == 0 else {
-            throw SignalError.network("accept call failed: \(lastError(sym))")
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            guard sym.callAccept(callId) == 0 else {
+                throw SignalError.network("accept call failed: \(Self.lastError(sym))")
+            }
         }
     }
 
     /// Hang up the native active call.
     public func hangupCall() async throws {
-        let sym = try await initCore()
-        guard sym.callHangup() == 0 else {
-            throw SignalError.network("hangup call failed: \(lastError(sym))")
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            guard sym.callHangup() == 0 else {
+                throw SignalError.network("hangup call failed: \(Self.lastError(sym))")
+            }
         }
     }
 
     /// Mute/unmute the native outgoing audio track.
     public func setCallMuted(_ muted: Bool) async throws {
-        let sym = try await initCore()
-        guard sym.callSetMuted(muted ? 1 : 0) == 0 else {
-            throw SignalError.network("set call mute failed: \(lastError(sym))")
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            guard sym.callSetMuted(muted ? 1 : 0) == 0 else {
+                throw SignalError.network("set call mute failed: \(Self.lastError(sym))")
+            }
         }
     }
 
     /// Send a pre-built call signal (base64-encoded protobuf CallMessage) to a thread.
     public func sendCallSignalRaw(thread: String, callMessageBase64: String) async throws {
-        let sym = try await initCore()
-        let rc = thread.withCString { t in
-            callMessageBase64.withCString { j in
-                sym.sendCallSignal(t, j)
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = thread.withCString { t in
+                callMessageBase64.withCString { j in
+                    sym.sendCallSignal(t, j)
+                }
+            }
+            guard rc == 0 else {
+                throw SignalError.network("send call signal failed: \(Self.lastError(sym))")
             }
         }
-        guard rc == 0 else { throw SignalError.network("send call signal failed: \(lastError(sym))") }
     }
 
     /// Build a call offer protobuf. Returns JSON describing the message.
     public func buildCallOffer(callId: String, mediaType: String, opaque: String) async throws -> String {
-        let sym = try await initCore()
-        return try callString3(sym.buildCallOffer, callId, mediaType, opaque, what: "build call offer")
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            callId.withCString { c in
+                mediaType.withCString { m in
+                    opaque.withCString { o in
+                        ptr = sym.buildCallOffer(c, m, o)
+                    }
+                }
+            }
+            return try Self.copyAndFree(ptr, sym: sym, what: "build call offer")
+        }
     }
 
     /// Build a call answer protobuf. Returns JSON describing the message.
     public func buildCallAnswer(callId: String, opaque: String) async throws -> String {
-        let sym = try await initCore()
-        return try callString2(sym.buildCallAnswer, callId, opaque, what: "build call answer")
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            callId.withCString { c in
+                opaque.withCString { o in
+                    ptr = sym.buildCallAnswer(c, o)
+                }
+            }
+            return try Self.copyAndFree(ptr, sym: sym, what: "build call answer")
+        }
     }
 
     /// Build a call ICE protobuf. Returns JSON describing the message.
     public func buildCallIce(callId: String, opaque: String) async throws -> String {
-        let sym = try await initCore()
-        return try callString2(sym.buildCallIce, callId, opaque, what: "build call ice")
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            callId.withCString { c in
+                opaque.withCString { o in
+                    ptr = sym.buildCallIce(c, o)
+                }
+            }
+            return try Self.copyAndFree(ptr, sym: sym, what: "build call ice")
+        }
     }
 
     /// Build a call hangup protobuf. Returns JSON describing the message.
     public func buildCallHangup(callId: String, hangupType: UInt32, deviceId: UInt32 = 0) async throws -> String {
-        let sym = try await initCore()
-        var ptr: UnsafeMutablePointer<CChar>? = nil
-        callId.withCString { c in
-            ptr = sym.buildCallHangup(c, hangupType, deviceId)
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            callId.withCString { c in
+                ptr = sym.buildCallHangup(c, hangupType, deviceId)
+            }
+            return try Self.copyAndFree(ptr, sym: sym, what: "build call hangup")
         }
-        guard let ptr else { throw SignalError.network("build call hangup failed: \(lastError(sym))") }
-        defer { sym.freeString(ptr) }
-        return String(cString: ptr)
     }
 
     /// Build a call busy protobuf. Returns JSON describing the message.
     public func buildCallBusy(callId: String) async throws -> String {
-        let sym = try await initCore()
-        return try callString1(sym.buildCallBusy, callId, what: "build call busy")
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            callId.withCString { c in
+                ptr = sym.buildCallBusy(c)
+            }
+            return try Self.copyAndFree(ptr, sym: sym, what: "build call busy")
+        }
     }
 
     /// Parse a base64-encoded protobuf CallMessage. Returns JSON describing the parsed signal.
     public func parseCallMessage(base64: String) async throws -> String {
-        let sym = try await initCore()
-        return try callString1(sym.parseCallMessage, base64, what: "parse call message")
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            base64.withCString { b in
+                ptr = sym.parseCallMessage(b)
+            }
+            return try Self.copyAndFree(ptr, sym: sym, what: "parse call message")
+        }
     }
 
     /// Convert an i32 call end reason to a string.
     public func callEndReasonName(_ reason: Int32) async throws -> String {
-        let sym = try await initCore()
-        guard let ptr = sym.callEndReasonToString(reason) else {
-            throw SignalError.network("call end reason lookup failed: \(lastError(sym))")
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let ptr = sym.callEndReasonToString(reason)
+            return try Self.copyAndFree(ptr, sym: sym, what: "call end reason lookup")
         }
-        defer { sym.freeString(ptr) }
-        return String(cString: ptr)
-    }
-
-    private func callString1(
-        _ fn: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?,
-        _ arg: String, what: String
-    ) throws -> String {
-        var ptr: UnsafeMutablePointer<CChar>? = nil
-        arg.withCString { ptr = fn($0) }
-        guard let ptr else {
-            guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else {
-                throw SignalError.crypto("\(what): null without loaded library")
-            }
-            throw SignalError.network("\(what) failed: \(lastError(sym))")
-        }
-        let value = String(cString: ptr)
-        if let handle = libraryHandle, let sym = Self.resolve(in: handle) {
-            sym.freeString(ptr)
-        }
-        return value
-    }
-
-    private func callString2(
-        _ fn: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?,
-        _ a: String, _ b: String, what: String
-    ) throws -> String {
-        var ptr: UnsafeMutablePointer<CChar>? = nil
-        a.withCString { x in
-            b.withCString { y in
-                ptr = fn(x, y)
-            }
-        }
-        guard let ptr else {
-            guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else {
-                throw SignalError.crypto("\(what): null without loaded library")
-            }
-            throw SignalError.network("\(what) failed: \(lastError(sym))")
-        }
-        let value = String(cString: ptr)
-        if let handle = libraryHandle, let sym = Self.resolve(in: handle) {
-            sym.freeString(ptr)
-        }
-        return value
-    }
-
-    private func callString3(
-        _ fn: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?,
-        _ a: String, _ b: String, _ c: String, what: String
-    ) throws -> String {
-        var ptr: UnsafeMutablePointer<CChar>? = nil
-        a.withCString { x in
-            b.withCString { y in
-                c.withCString { z in
-                    ptr = fn(x, y, z)
-                }
-            }
-        }
-        guard let ptr else {
-            guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else {
-                throw SignalError.crypto("\(what): null without loaded library")
-            }
-            throw SignalError.network("\(what) failed: \(lastError(sym))")
-        }
-        let value = String(cString: ptr)
-        if let handle = libraryHandle, let sym = Self.resolve(in: handle) {
-            sym.freeString(ptr)
-        }
-        return value
     }
 
     /// Profile display name for a contact uuid (nil when unavailable).
     public func profileName(uuid: String) async -> String? {
-        guard let sym = try? await initCore() else { return nil }
-        var ptr: UnsafeMutablePointer<CChar>? = nil
-        uuid.withCString { u in
-            ptr = sym.profile(u)
+        let token: SessionToken
+        do {
+            token = try sessionEpoch.capture()
+        } catch {
+            return nil
         }
-        guard let ptr else { return nil }
-        defer { sym.freeString(ptr) }
-        let name = String(cString: ptr)
-        return name.isEmpty ? nil : name
+        let name: String? = try? await withCore(token: token) { sym in
+            var ptr: UnsafeMutablePointer<CChar>?
+            uuid.withCString { u in
+                ptr = sym.profile(u)
+            }
+            guard let ptr else { return nil }
+            defer { sym.freeString(ptr) }
+            let value = String(cString: ptr)
+            return value.isEmpty ? nil : value
+        }
+        return name
     }
 
     public func sendText(_ body: String, to conversationId: String) async throws -> ChatMessage {
-        guard linked || isLinkedNow() else { throw SignalError.notLinked }
-        let sym = try await initCore()
-        var ts: Int64 = -1
-        conversationId.withCString { t in
-            body.withCString { b in
-                ts = sym.send(t, b)
-            }
+        let token = try sessionEpoch.capture()
+        if !linkedState {
+            let nativeLinked = try await isLinkedNow(token: token)
+            guard nativeLinked else { throw SignalError.notLinked }
         }
-        guard ts >= 0 else { throw SignalError.network("send failed: \(lastError(sym))") }
+        let ts: Int64 = try await withCore(token: token) { sym in
+            let ts = conversationId.withCString { t in
+                body.withCString { b in
+                    sym.send(t, b)
+                }
+            }
+            guard ts >= 0 else {
+                throw SignalError.network("send failed: \(Self.lastError(sym))")
+            }
+            return ts
+        }
         let sender = selfAci ?? "self"
         let msg = RosterPayload.Message(
             key: "\(conversationId)/\(ts)/\(sender)",
             thread: conversationId, sender: sender, senderName: "You",
             body: body, ts: ts, outgoing: true
         )
-        return chatMessage(msg)
+        return try sessionEpoch.withCurrent(token) { chatMessage(msg) }
     }
 
     public func incomingMessages() -> AsyncStream<ChatMessage> {
@@ -904,20 +1092,35 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// and pump events into `incomingMessages()`. Throws only if the loop
     /// itself won't start; a failed contact-sync request is non-fatal.
     public func startLiveSync() async throws {
-        let eventEpoch = sessionEpoch.invalidate()
-        let sym = try await initCore()
-        if sym.requestContacts() != 0 {
-            // Non-fatal: contacts may already be synced from a previous run.
-            stateContinuation.yield(.syncing)
+        try await lifecycleGate.run { [self] in
+            try await startLiveSyncInternal()
         }
-        guard sym.startSync() == 0 else {
-            throw SignalError.network("start sync failed: \(lastError(sym))")
+    }
+
+    private func startLiveSyncInternal() async throws {
+        let eventToken = try sessionEpoch.rotate()
+        let oldPump = pumpTask
+        pumpTask = nil
+        oldPump?.cancel()
+        await oldPump?.value
+
+        let contactsAlreadySynced: Bool = try await withCore(token: eventToken, lifecycleOwned: true) { sym in
+            let requestResult = sym.requestContacts()
+            guard sym.startSync() == 0 else {
+                throw SignalError.network("start sync failed: \(Self.lastError(sym))")
+            }
+            return requestResult != 0
         }
-        pumpTask?.cancel()
+        try sessionEpoch.withCurrent(eventToken) {
+            if contactsAlreadySynced {
+                // Non-fatal: contacts may already be synced from a previous run.
+                stateContinuation.yield(.syncing)
+            }
+        }
         pumpTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self, self.sessionEpoch.isCurrent(eventEpoch) else { return }
-                self.drainEvents(epoch: eventEpoch)
+                guard let self, self.sessionEpoch.isCurrent(eventToken) else { return }
+                await self.drainEvents(token: eventToken)
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
@@ -926,8 +1129,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// Offline-safe: opens (or creates) the store and reports whether a
     /// linked session exists. No network traffic. Used by setup/tests.
     public func isLinkedAccount() async throws -> Bool {
-        let sym = try await initCore()
-        return sym.isLinked() == 1
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            try Self.isLinked(sym)
+        }
     }
 
     /// Offline identity (aci + number) from the local store. No network.
@@ -937,78 +1142,137 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     public func whoami() async throws -> WhoAmI {
-        let sym = try await initCore()
-        guard let ptr = sym.whoami() else {
-            throw SignalError.network("whoami failed: \(lastError(sym))")
+        let token = try sessionEpoch.capture()
+        let data: Data = try await withCore(token: token) { sym in
+            guard let ptr = sym.whoami() else {
+                throw SignalError.network("whoami failed: \(Self.lastError(sym))")
+            }
+            defer { sym.freeString(ptr) }
+            guard let data = String(cString: ptr).data(using: .utf8) else {
+                throw SignalError.storage("whoami is not UTF-8")
+            }
+            return data
         }
-        defer { sym.freeString(ptr) }
-        guard let data = String(cString: ptr).data(using: .utf8) else {
-            throw SignalError.storage("whoami is not UTF-8")
-        }
-        return try JSONDecoder().decode(WhoAmI.self, from: data)
+        let identity = try JSONDecoder().decode(WhoAmI.self, from: data)
+        try sessionEpoch.require(token)
+        return identity
     }
 
     /// Ask the phone to (re-)send the contact/group sync.
     public func requestContactSync() async throws {
-        let sym = try await initCore()
-        guard sym.requestContacts() == 0 else {
-            throw SignalError.network("request sync failed: \(lastError(sym))")
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            guard sym.requestContacts() == 0 else {
+                throw SignalError.network("request sync failed: \(Self.lastError(sym))")
+            }
         }
     }
 
-    /// Wipe the session (keys + registration). Next `beginLinking` shows a
-    /// fresh QR. Local history cache is dropped with it.
+    /// Partial session logout (registration/session only). Use
+    /// `clearAllData()` before replacing accounts so native history and media
+    /// cannot survive into the next link.
     public func logout() async throws {
-        _ = sessionEpoch.invalidate()
-        let sym = try await initCore()
-        guard sym.logout() == 0 else {
-            throw SignalError.network("logout failed: \(lastError(sym))")
+        try await lifecycleGate.run { [self] in
+            try await logoutInternal()
         }
+    }
+
+    private func logoutInternal() async throws {
+        var completed = false
+        defer {
+            if !completed {
+                sessionEpoch.poison()
+                processState.markPoisoned(databasePath: dbPath)
+            }
+        }
+        if sessionEpoch.isSuspended || sessionEpoch.isPoisoned {
+            completed = true
+            return
+        }
+        if !linkedState {
+            withStateLock {
+                messageCache = [:]
+                uuidCache = [:]
+                pathCache = [:]
+                localPaths = [:]
+                selfAci = nil
+                _lastRosterSummary = "never"
+            }
+            completed = true
+            return
+        }
+        let teardownToken = sessionEpoch.suspend()
         detachCallbacks()
         let pump = pumpTask
         pumpTask = nil
         pump?.cancel()
         await pump?.value
-        linked = false
-        messageCache = [:]
-        uuidCache = [:]
-        pathCache = [:]
-        localPaths = [:]
-        lastRosterSummary = "never"
+
+        try await withCore(token: teardownToken, allowStale: true, lifecycleOwned: true) { sym in
+            guard sym.logout() == 0 else {
+                throw SignalError.network("logout failed: \(Self.lastError(sym))")
+            }
+        }
+        setLinkedState(false)
+        withStateLock {
+            messageCache = [:]
+            uuidCache = [:]
+            pathCache = [:]
+            localPaths = [:]
+            selfAci = nil
+            _lastRosterSummary = "never"
+        }
         try removeIfPresent(cacheDirectoryURL)
         try removeIfPresent(legacyPathCacheURL)
+        let cachesRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("CuztomSignal", isDirectory: true)
+        if let cachesRoot { try removeIfPresent(cachesRoot) }
         try removeIfPresent(legacyUUIDCacheURL)
+        // A successful ordinary logout permits a later explicit relink. If
+        // any step above failed, the service remains suspended and poisoned
+        // instead of allowing a replacement account to start.
+        _ = try sessionEpoch.resume()
+        completed = true
     }
 
     /// Complete data wipe: stop the native session, delete the native store,
     /// then remove account-bound Swift caches. The native worker acknowledges
-    /// shutdown before its SQLite handle is released.
+    /// shutdown before its SQLite handle is released. The service remains
+    /// suspended until `beginLinking` explicitly starts a replacement account.
     public func clearAllData() async throws {
-        _ = sessionEpoch.invalidate()
-        let sym = try await initCore()
+        try await lifecycleGate.run { [self] in
+            try await clearAllDataInternal()
+        }
+    }
+
+    private func clearAllDataInternal() async throws {
+        var completed = false
+        defer {
+            if !completed {
+                sessionEpoch.poison()
+                processState.markPoisoned(databasePath: dbPath)
+            }
+        }
+        let teardownToken = sessionEpoch.suspend()
         detachCallbacks()
         let pump = pumpTask
         pumpTask = nil
         pump?.cancel()
         await pump?.value
 
-        if let wipe = sym.wipe {
+        _ = try await withCore(
+            token: teardownToken,
+            allowStale: true,
+            lifecycleOwned: true
+        ) { sym -> Void in
+            guard let wipe = sym.wipe else {
+                throw SignalError.unsupported(
+                    "native core lacks acknowledged shutdown/wipe; rebuild rust-core before retrying"
+                )
+            }
             guard wipe() == 0 else {
-                throw SignalError.storage("native data wipe failed: \(lastError(sym))")
+                throw SignalError.storage("native data wipe failed: \(Self.lastError(sym))")
             }
-        } else {
-            // Compatibility path for an older dylib. It still fails closed and
-            // never silently ignores filesystem errors.
-            if linked || sym.isLinked() == 1 {
-                guard sym.logout() == 0 else {
-                    throw SignalError.network("logout failed: \(lastError(sym))")
-                }
-            }
-            let dbURL = URL(fileURLWithPath: dbPath)
-            try removeIfPresent(dbURL)
-            try removeIfPresent(URL(fileURLWithPath: dbPath + "-wal"))
-            try removeIfPresent(URL(fileURLWithPath: dbPath + "-shm"))
-            try removeIfPresent(URL(fileURLWithPath: dbPath + "-journal"))
         }
 
         try removeIfPresent(cacheDirectoryURL)
@@ -1023,15 +1287,27 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         try KeychainSecretStore().deleteStrict(key: Self.nativeStoreKeychainAccount)
         #endif
 
-        didInit = false
-        linked = false
-        messageCache = [:]
-        uuidCache = [:]
-        pathCache = [:]
-        localPaths = [:]
-        lastRosterSummary = "never"
-        selfAci = nil
+        setInitializedState(false)
+        setLinkedState(false)
+        withStateLock {
+            messageCache = [:]
+            uuidCache = [:]
+            pathCache = [:]
+            localPaths = [:]
+            _lastRosterSummary = "never"
+            selfAci = nil
+        }
+        processState.clearPoison(databasePath: dbPath)
+        completed = true
         Log.info("RustCoreService: cleared all data (native DB and Swift caches)")
+    }
+
+    /// Called when the native wipe succeeded but the presentation store could
+    /// not be destroyed. The combined logout must not allow a relink on the
+    /// same native service after that partial failure.
+    func poisonAfterPresentationFailure() {
+        sessionEpoch.poison()
+        processState.markPoisoned(databasePath: dbPath)
     }
 
     private func removeIfPresent(_ url: URL) throws {
@@ -1041,7 +1317,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     // MARK: - private FFI
 
-    private struct Symbols {
+    private struct Symbols: @unchecked Sendable {
         let abiVersion: @convention(c) () -> UInt32
         let initEncrypted: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let beginLink: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -1082,7 +1358,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let profile: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let whoami: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let logout: @convention(c) () -> Int32
-        /// Present in rebuilt native cores; nil is tolerated for older dylibs.
+        /// Required for authoritative data wipe; older dylibs fail closed.
         let wipe: (@convention(c) () -> Int32)?
         let lastError: @convention(c) () -> UnsafePointer<CChar>?
         let freeString: @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
@@ -1176,58 +1452,62 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     /// "12 contacts, 3 groups, 45 msgs @ 22:01" or "never".
-    public private(set) var lastRosterSummary = "never"
+    private var _lastRosterSummary = "never"
+    public var lastRosterSummary: String {
+        withStateLock { _lastRosterSummary }
+    }
 
     /// Fetch + cache the roster snapshot; returns decoded conversations.
     @discardableResult
     public func applyRoster(_ payload: RosterPayload) -> [Conversation] {
-        for m in payload.messages {
-            messageCache[wireKey(for: m)] = m
-        }
-        let fmt = DateFormatter()
-        fmt.dateFormat = "HH:mm:ss"
-        lastRosterSummary = "\(payload.contacts.count) contacts, \(payload.groups.count) groups, \(payload.messages.count) msgs @ \(fmt.string(from: Date()))"
-        var byThread: [String: [RosterPayload.Message]] = [:]
-        for m in messageCache.values {
-            byThread[m.thread, default: []].append(m)
-        }
-        var convs: [Conversation] = []
-        let selfID = payload.thisDevice.aci.lowercased()
-        for c in payload.contacts {
-            let id = ThreadID.contactThreadId(uuid: c.id)
-            let isSelf = c.id.lowercased() == selfID
-            let title: String
-            if isSelf {
-                // Signal's roster includes our own profile as a contact. It is
-                // the Note to Self conversation, not a second contact named
-                // after the profile.
-                title = "Note to Self"
-            } else {
-                title = c.name.isEmpty ? (c.phone.isEmpty ? "Unknown" : c.phone) : c.name
+        withStateLock {
+            for m in payload.messages {
+                messageCache[wireKey(for: m)] = m
             }
-            let recent = (byThread[id] ?? []).sorted { $0.ts < $1.ts }
-            convs.append(Conversation(
-                id: id,
-                title: title,
-                peer: SignalAddress(uuidString: c.id, phone: c.phone.isEmpty ? nil : c.phone, threadId: id),
-                lastMessagePreview: recent.last.map { String($0.body.prefix(120)) },
-                lastActiveAt: recent.last.map { Date(timeIntervalSince1970: Double($0.ts) / 1000) } ?? Date.distantPast,
-                unreadCount: 0
-            ))
+            let fmt = DateFormatter()
+            fmt.dateFormat = "HH:mm:ss"
+            _lastRosterSummary = "\(payload.contacts.count) contacts, \(payload.groups.count) groups, \(payload.messages.count) msgs @ \(fmt.string(from: Date()))"
+            var byThread: [String: [RosterPayload.Message]] = [:]
+            for m in messageCache.values {
+                byThread[m.thread, default: []].append(m)
+            }
+            var convs: [Conversation] = []
+            let selfID = payload.thisDevice.aci.lowercased()
+            for c in payload.contacts {
+                let id = ThreadID.contactThreadId(uuid: c.id)
+                let isSelf = c.id.lowercased() == selfID
+                let title: String
+                if isSelf {
+                    // Signal's roster includes our own profile as a contact. It
+                    // is the Note to Self conversation, not a second contact.
+                    title = "Note to Self"
+                } else {
+                    title = c.name.isEmpty ? (c.phone.isEmpty ? "Unknown" : c.phone) : c.name
+                }
+                let recent = (byThread[id] ?? []).sorted { $0.ts < $1.ts }
+                convs.append(Conversation(
+                    id: id,
+                    title: title,
+                    peer: SignalAddress(uuidString: c.id, phone: c.phone.isEmpty ? nil : c.phone, threadId: id),
+                    lastMessagePreview: recent.last.map { String($0.body.prefix(120)) },
+                    lastActiveAt: recent.last.map { Date(timeIntervalSince1970: Double($0.ts) / 1000) } ?? Date.distantPast,
+                    unreadCount: 0
+                ))
+            }
+            for g in payload.groups {
+                let id = ThreadID.groupThreadId(masterKey: g.id)
+                let recent = (byThread[id] ?? []).sorted { $0.ts < $1.ts }
+                convs.append(Conversation(
+                    id: id,
+                    title: g.title.isEmpty ? "Unnamed group" : g.title,
+                    peer: SignalAddress(groupId: g.id, threadId: id),
+                    lastMessagePreview: recent.last.map { String($0.body.prefix(120)) },
+                    lastActiveAt: recent.last.map { Date(timeIntervalSince1970: Double($0.ts) / 1000) } ?? Date.distantPast,
+                    unreadCount: 0
+                ))
+            }
+            return convs.sorted { $0.lastActiveAt > $1.lastActiveAt }
         }
-        for g in payload.groups {
-            let id = ThreadID.groupThreadId(masterKey: g.id)
-            let recent = (byThread[id] ?? []).sorted { $0.ts < $1.ts }
-            convs.append(Conversation(
-                id: id,
-                title: g.title.isEmpty ? "Unnamed group" : g.title,
-                peer: SignalAddress(groupId: g.id, threadId: id),
-                lastMessagePreview: recent.last.map { String($0.body.prefix(120)) },
-                lastActiveAt: recent.last.map { Date(timeIntervalSince1970: Double($0.ts) / 1000) } ?? Date.distantPast,
-                unreadCount: 0
-            ))
-        }
-        return convs.sorted { $0.lastActiveAt > $1.lastActiveAt }
     }
 
     private func wireKey(for message: RosterPayload.Message) -> String {
@@ -1236,172 +1516,202 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     private func uuidForMessage(_ message: RosterPayload.Message) -> UUID {
-        let key = wireKey(for: message)
-        if let existing = uuidCache[key] {
-            return existing
-        }
-        // Migrate UUIDs written by releases that keyed messages by the
-        // server timestamp. The new key uses the stable client timestamp;
-        // without this alias the first post-upgrade refresh would allocate a
-        // second local ID for every historical message.
-        let legacyKeys = [
-            "\(message.thread)/\(message.ts)/\(message.sender)",
-            "\(message.thread)/\(message.ts)/self"
-        ]
-        if let legacyKey = legacyKeys.first(where: { uuidCache[$0] != nil }),
-           let existing = uuidCache[legacyKey] {
-            uuidCache[key] = existing
-            if message.key != key { uuidCache[message.key] = existing }
+        withStateLock {
+            let key = wireKey(for: message)
+            if let existing = uuidCache[key] {
+                return existing
+            }
+            // Migrate UUIDs written by releases that keyed messages by the
+            // server timestamp. The new key uses the stable client timestamp;
+            // without this alias the first post-upgrade refresh would allocate
+            // a second local ID for every historical message.
+            let legacyKeys = [
+                "\(message.thread)/\(message.ts)/\(message.sender)",
+                "\(message.thread)/\(message.ts)/self"
+            ]
+            if let legacyKey = legacyKeys.first(where: { uuidCache[$0] != nil }),
+               let existing = uuidCache[legacyKey] {
+                uuidCache[key] = existing
+                if message.key != key { uuidCache[message.key] = existing }
+                saveUUIDCache()
+                return existing
+            }
+            let fresh = UUID()
+            uuidCache[key] = fresh
+            if message.key != key { uuidCache[message.key] = fresh }
             saveUUIDCache()
-            return existing
+            return fresh
         }
-        let fresh = UUID()
-        uuidCache[key] = fresh
-        if message.key != key { uuidCache[message.key] = fresh }
-        saveUUIDCache()
-        return fresh
     }
 
     public func chatMessage(_ m: RosterPayload.Message) -> ChatMessage {
-        let id = uuidForMessage(m)
-        let threadComponents = ThreadID.parse(m.thread)
-        let groupMasterKey = threadComponents.groupMasterKey
-        let replyTo = m.replyTo.map {
-            MessageReference(
-                storeTs: $0.targetSts,
-                authorID: $0.author,
-                body: $0.body
+        withStateLock {
+            let id = uuidForMessage(m)
+            let threadComponents = ThreadID.parse(m.thread)
+            let groupMasterKey = threadComponents.groupMasterKey
+            let replyTo = m.replyTo.map {
+                MessageReference(
+                    storeTs: $0.targetSts,
+                    authorID: $0.author,
+                    body: $0.body
+                )
+            }
+            var metas: [AttachmentMeta] = []
+            for (index, a) in m.attachments.enumerated() {
+                // Newest source wins: live/on-demand override, then persisted
+                // cache, then the wire path. Cache keys are per-attachment.
+                let cacheKey = "\(wireKey(for: m))/\(index)"
+                let legacyCacheKey = "\(m.key)/\(index)"
+                let stablePathKey = localPathKey(thread: m.thread, ts: m.sts, index: index)
+                let legacyTsPathKey = localPathKey(thread: m.thread, ts: m.ts, index: index)
+                let candidate = localPaths[stablePathKey]
+                    ?? localPaths[legacyTsPathKey]
+                    ?? pathCache[cacheKey]
+                    ?? pathCache[legacyCacheKey]
+                    ?? pathCache["\(m.thread)/\(m.ts)/\(index)"]
+                    ?? pathCache["\(m.thread)/\(m.ts)/\(m.sender)/\(index)"]
+                    ?? pathCache["\(m.thread)/\(m.ts)/self/\(index)"]
+                    ?? pathCache["\(m.thread)/\(m.sts)/\(index)"]
+                    ?? a.path
+                let resolved: URL? = {
+                    guard let candidate, Self.isAllowedCachedPath(candidate) else { return nil }
+                    return URL(fileURLWithPath: candidate)
+                }()
+                if let resolved {
+                    rememberPath(key: cacheKey, path: resolved.path)
+                }
+                metas.append(AttachmentMeta(
+                    filename: a.name,
+                    mimeType: a.mime,
+                    byteCount: a.size,
+                    localURL: resolved
+                ))
+            }
+
+            return ChatMessage(
+                id: id,
+                conversationId: m.thread,
+                author: SignalAddress(
+                    uuidString: m.outgoing ? (selfAci ?? "self") : m.sender,
+                    groupId: groupMasterKey,
+                    threadId: m.thread,
+                    displayName: m.outgoing ? nil : (
+                        m.senderName.isEmpty
+                            || m.senderName == "Unknown"
+                            || m.senderName == String(m.sender.prefix(8))
+                            ? nil
+                            : m.senderName
+                    )
+                ),
+                body: m.body.isEmpty ? (metas.isEmpty ? "" : "[attachment]") : m.body,
+                direction: m.outgoing ? .outgoing : .incoming,
+                status: m.outgoing ? .sent : .delivered,
+                sentAt: Date(timeIntervalSince1970: Double(m.ts) / 1000),
+                attachments: metas,
+                replyTo: replyTo,
+                storeTs: m.sts,
+                reactions: m.reactions
             )
         }
-        var metas: [AttachmentMeta] = []
-        for (index, a) in m.attachments.enumerated() {
-            // Newest source wins: live/on-demand override, then persisted
-            // cache, then the wire path. Cache keys are per-attachment.
-            let cacheKey = "\(wireKey(for: m))/\(index)"
-            let legacyCacheKey = "\(m.key)/\(index)"
-            let stablePathKey = localPathKey(thread: m.thread, ts: m.sts, index: index)
-            let legacyTsPathKey = localPathKey(thread: m.thread, ts: m.ts, index: index)
-            let candidate = localPaths[stablePathKey]
-                ?? localPaths[legacyTsPathKey]
-                ?? pathCache[cacheKey]
-                ?? pathCache[legacyCacheKey]
-                ?? pathCache["\(m.thread)/\(m.ts)/\(index)"]
-                ?? pathCache["\(m.thread)/\(m.ts)/\(m.sender)/\(index)"]
-                ?? pathCache["\(m.thread)/\(m.ts)/self/\(index)"]
-                ?? pathCache["\(m.thread)/\(m.sts)/\(index)"]
-                ?? a.path
-            let resolved: URL? = {
-                guard let candidate, Self.isAllowedCachedPath(candidate) else { return nil }
-                return URL(fileURLWithPath: candidate)
-            }()
-            if let resolved {
-                rememberPath(key: cacheKey, path: resolved.path)
+    }
+
+    private func rosterData(token: SessionToken) async throws -> Data {
+        try await withCore(token: token) { sym in
+            guard let ptr = sym.roster() else {
+                throw SignalError.network("roster failed: \(Self.lastError(sym))")
             }
-            metas.append(AttachmentMeta(
-                filename: a.name,
-                mimeType: a.mime,
-                byteCount: a.size,
-                localURL: resolved
-            ))
-        }
-
-        return ChatMessage(
-            id: id,
-            conversationId: m.thread,
-            author: SignalAddress(
-                uuidString: m.outgoing ? (selfAci ?? "self") : m.sender,
-                groupId: groupMasterKey,
-                threadId: m.thread,
-                displayName: m.outgoing ? nil : (
-                    m.senderName.isEmpty
-                        || m.senderName == "Unknown"
-                        || m.senderName == String(m.sender.prefix(8))
-                        ? nil
-                        : m.senderName
-                )
-            ),
-            body: m.body.isEmpty ? (metas.isEmpty ? "" : "[attachment]") : m.body,
-            direction: m.outgoing ? .outgoing : .incoming,
-            status: m.outgoing ? .sent : .delivered,
-            sentAt: Date(timeIntervalSince1970: Double(m.ts) / 1000),
-            attachments: metas,
-            replyTo: replyTo,
-            storeTs: m.sts,
-            reactions: m.reactions
-        )
-    }
-
-    private func rosterData() async throws -> Data {
-        let sym = try await initCore()
-        guard let ptr = sym.roster() else {
-            throw SignalError.network("roster failed: \(lastError(sym))")
-        }
-        defer { sym.freeString(ptr) }
-        guard let data = String(cString: ptr).data(using: .utf8) else {
-            throw SignalError.storage("roster is not UTF-8")
-        }
-        return data
-    }
-
-    private func drainEvents(epoch: UInt64) {
-        guard sessionEpoch.isCurrent(epoch),
-              let handle = libraryHandle,
-              let sym = Self.resolve(in: handle) else { return }
-        while sessionEpoch.isCurrent(epoch), let ptr = sym.pollEvent() {
             defer { sym.freeString(ptr) }
-            let text = String(cString: ptr)
+            guard let data = String(cString: ptr).data(using: .utf8) else {
+                throw SignalError.storage("roster is not UTF-8")
+            }
+            return data
+        }
+    }
+
+    private func drainEvents(token: SessionToken) async {
+        while sessionEpoch.isCurrent(token) && !Task.isCancelled {
+            let text: String?
+            do {
+                text = try await withCore(token: token) { sym in
+                    guard let ptr = sym.pollEvent() else { return nil }
+                    defer { sym.freeString(ptr) }
+                    return String(cString: ptr)
+                }
+            } catch {
+                return
+            }
+            guard let text else { return }
             guard let data = text.data(using: .utf8),
-                  let event = try? JSONDecoder().decode(LiveEvent.self, from: data) else { continue }
+                  let event = try? JSONDecoder().decode(LiveEvent.self, from: data),
+                  sessionEpoch.isCurrent(token) else { continue }
+
             if event.type == "call_signal" {
-                if let signal = try? JSONDecoder().decode(CallSignal.self, from: data) {
+                if let signal = try? JSONDecoder().decode(CallSignal.self, from: data),
+                   sessionEpoch.isCurrent(token) {
                     onCallSignal?(signal)
                 }
                 continue
             }
             if event.type == "call_state" {
-                if let state = try? JSONDecoder().decode(CallStateEvent.self, from: data) {
+                if let state = try? JSONDecoder().decode(CallStateEvent.self, from: data),
+                   sessionEpoch.isCurrent(token) {
                     onCallState?(state)
                 }
                 continue
             }
             switch event.type {
             case "message":
-                if let msg = event.message {
-                    messageCache[wireKey(for: msg)] = msg
-                    let cm = chatMessage(msg)
-                    // Persist any attachment paths that came from the live download
-                    // so they survive across restarts and render immediately.
-                    for (idx, att) in msg.attachments.enumerated() {
-                        if let path = att.path, !path.isEmpty {
-                            let cacheKey = "\(wireKey(for: msg))/\(idx)"
-                            rememberPath(key: cacheKey, path: path)
-                            if msg.key != wireKey(for: msg) {
-                                rememberPath(key: "\(msg.key)/\(idx)", path: path)
+                guard let msg = event.message else { continue }
+                do {
+                    let cm = try sessionEpoch.withCurrent(token) { () -> ChatMessage in
+                        withStateLock {
+                            messageCache[wireKey(for: msg)] = msg
+                            let converted = chatMessage(msg)
+                            // Persist live attachment paths in the account-scoped
+                            // cache before publishing the message.
+                            for (idx, att) in msg.attachments.enumerated() {
+                                if let path = att.path, !path.isEmpty {
+                                    let cacheKey = "\(wireKey(for: msg))/\(idx)"
+                                    rememberPath(key: cacheKey, path: path)
+                                    if msg.key != wireKey(for: msg) {
+                                        rememberPath(key: "\(msg.key)/\(idx)", path: path)
+                                    }
+                                    localPaths[localPathKey(thread: msg.thread, ts: msg.sts, index: idx)] = path
+                                    if msg.sts != msg.ts {
+                                        localPaths[localPathKey(thread: msg.thread, ts: msg.ts, index: idx)] = path
+                                    }
+                                }
                             }
-                            localPaths[localPathKey(thread: msg.thread, ts: msg.sts, index: idx)] = path
-                            if msg.sts != msg.ts {
-                                localPaths[localPathKey(thread: msg.thread, ts: msg.ts, index: idx)] = path
-                            }
+                            return converted
                         }
                     }
-                    incomingContinuation.yield(cm)
+                    if sessionEpoch.isCurrent(token) {
+                        incomingContinuation.yield(cm)
+                    }
+                } catch SignalError.sessionInvalidated {
+                    return
+                } catch {
+                    Log.error("live message commit failed: \(error)")
                 }
             case "reaction":
                 if let thread = event.thread, let sts = event.targetSts,
-                   let emoji = event.emoji, !emoji.isEmpty {
+                   let emoji = event.emoji, !emoji.isEmpty,
+                   sessionEpoch.isCurrent(token) {
                     onReaction?(thread, sts, emoji, event.remove ?? false, event.senderName ?? "?")
                 }
             case "typing":
                 if let thread = event.thread,
                    let sender = event.typingSender,
-                   let started = event.started {
+                   let started = event.started,
+                   sessionEpoch.isCurrent(token) {
                     onTypingWithID?(thread, sender, event.senderName ?? sender, started)
                     onTyping?(thread, event.senderName ?? sender, started)
                 }
             case "receipt":
                 if event.ambiguous == true {
                     Log.error("receipt dropped: target timestamp matched multiple conversations")
-                } else if let kind = event.kind, let stamps = event.timestamps {
+                } else if let kind = event.kind, let stamps = event.timestamps,
+                          sessionEpoch.isCurrent(token) {
                     let sender = event.sender ?? event.senderName ?? "?"
                     if let scoped = onReceiptScoped {
                         scoped(event.thread, sender, kind, stamps)
@@ -1412,34 +1722,75 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             case "edit":
                 if let thread = event.thread,
                    let sts = event.targetSts,
-                   let body = event.body {
+                   let body = event.body,
+                   sessionEpoch.isCurrent(token) {
                     onEdit?(thread, sts, body, event.sender ?? "?", event.senderName ?? "?")
                 }
             case "delete":
-                if let thread = event.thread, let sts = event.targetSts {
+                if let thread = event.thread, let sts = event.targetSts,
+                   sessionEpoch.isCurrent(token) {
                     onDelete?(thread, sts, event.sender ?? "?", event.senderName ?? "?")
                 }
             default:
-                onSyncEvent?(event.type)
+                if sessionEpoch.isCurrent(token) {
+                    onSyncEvent?(event.type)
+                }
             }
         }
     }
 
-    private func initCore() async throws -> Symbols {
+    private func withCore<T: Sendable>(
+        token: SessionToken,
+        allowStale: Bool = false,
+        lifecycleOwned: Bool = false,
+        _ operation: @escaping @Sendable (Symbols) throws -> T
+    ) async throws -> T {
+        if lifecycleOwned {
+            return try await withCoreOnExecutor(
+                token: token,
+                allowStale: allowStale,
+                operation
+            )
+        }
+        return try await lifecycleGate.run { [self] in
+            try await self.withCoreOnExecutor(
+                token: token,
+                allowStale: allowStale,
+                operation
+            )
+        }
+    }
+
+    private func withCoreOnExecutor<T: Sendable>(
+        token: SessionToken,
+        allowStale: Bool,
+        _ operation: @escaping @Sendable (Symbols) throws -> T
+    ) async throws -> T {
+        try processState.requireUsable(databasePath: dbPath)
+        if !allowStale { try sessionEpoch.require(token) }
+        return try await nativeExecutor.run { [self] in
+            try self.processState.requireUsable(databasePath: self.dbPath)
+            if !allowStale { try self.sessionEpoch.require(token) }
+            let sym = try self.coreSymbolsOnNativeQueue()
+            let result = try operation(sym)
+            if !allowStale { try self.sessionEpoch.require(token) }
+            return result
+        }
+    }
+
+    /// Must only be called from `nativeExecutor` (or during construction).
+    private func coreSymbolsOnNativeQueue() throws -> Symbols {
         guard loadLibrary(), let handle = libraryHandle else {
             throw SignalError.unsupported("rust core not bundled — build it: cd rust-core && cargo build --release (see rust-core/README)")
         }
         guard let sym = Self.resolve(in: handle) else {
             throw SignalError.crypto("rust core dylib missing expected symbols (rebuild rust-core/)")
         }
-
-        // The lock is held by a synchronous helper; Swift 6 forbids
-        // NSLock.lock() directly from an async function.
         let rc = try initializeCoreIfNeeded(sym)
-        if rc < 0 { throw SignalError.storage("core init failed: \(lastError(sym))") }
-        if !didInit {
-            didInit = true
-            linked = (rc == 1)
+        if rc < 0 { throw SignalError.storage("core init failed: \(Self.lastError(sym))") }
+        if !initializedState {
+            setInitializedState(true)
+            setLinkedState(rc == 1)
         }
         return sym
     }
@@ -1447,7 +1798,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private func initializeCoreIfNeeded(_ sym: Symbols) throws -> Int32 {
         initLock.lock()
         defer { initLock.unlock() }
-        if didInit { return linked ? 1 : 0 }
+        if initializedState { return linkedState ? 1 : 0 }
 
         #if canImport(Security)
         let keychain = KeychainSecretStore()
@@ -1483,9 +1834,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 sym.initEncrypted(dbPointer, keyPointer)
             }
         }
-        if rc < 0 { throw SignalError.storage("core init failed: \(lastError(sym))") }
-        didInit = true
-        linked = (rc == 1)
+        if rc < 0 { throw SignalError.storage("core init failed: \(Self.lastError(sym))") }
+        setInitializedState(true)
+        setLinkedState(rc == 1)
         Self.protectFile(at: dbPath)
         Self.protectFile(at: dbPath + "-wal")
         Self.protectFile(at: dbPath + "-shm")
@@ -1507,14 +1858,36 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         return header == Data([0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00])
     }
 
-    private func isLinkedNow() -> Bool {
-        guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else { return false }
-        return sym.isLinked() == 1
+    private func isLinkedNow(token: SessionToken) async throws -> Bool {
+        try await withCore(token: token) { sym in
+            try Self.isLinked(sym)
+        }
     }
 
-    private func lastError(_ sym: Symbols) -> String {
+    private static func isLinked(_ sym: Symbols) throws -> Bool {
+        let result = sym.isLinked()
+        guard result >= 0 else {
+            throw SignalError.network("is_linked failed: \(lastError(sym))")
+        }
+        return result == 1
+    }
+
+    private static func lastError(_ sym: Symbols) -> String {
         guard let ptr = sym.lastError() else { return "unknown" }
         return String(cString: ptr)
+    }
+
+    private static func copyAndFree(
+        _ ptr: UnsafeMutablePointer<CChar>?,
+        sym: Symbols,
+        what: String
+    ) throws -> String {
+        guard let ptr else {
+            throw SignalError.network("\(what) failed: \(lastError(sym))")
+        }
+        let value = String(cString: ptr)
+        sym.freeString(ptr)
+        return value
     }
 
     private func mimeFor(url: URL) -> String {
@@ -1539,23 +1912,6 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     private func fileSize(url: URL) -> Int {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-    }
-
-    private func callString(_ fn: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?, _ arg: String, what: String) throws -> String {
-        var result: UnsafeMutablePointer<CChar>? = nil
-        arg.withCString { result = fn($0) }
-        guard let ptr = result else {
-            guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else {
-                throw SignalError.crypto("\(what): null without loaded library")
-            }
-            throw SignalError.network("\(what) failed: \(lastError(sym))")
-        }
-        // Copy out, then free the Rust allocation via the library (not free()).
-        let value = String(cString: ptr)
-        if let handle = libraryHandle, let sym = Self.resolve(in: handle) {
-            sym.freeString(ptr)
-        }
-        return value
     }
 
     private static func resolve(in handle: UnsafeMutableRawPointer) -> Symbols? {

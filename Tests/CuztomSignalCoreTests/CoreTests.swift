@@ -74,13 +74,24 @@ import Testing
     #expect(history.count == 1)
 }
 
-@Test func sessionEpochInvalidatesOldWork() {
+@Test func sessionEpochInvalidatesOldWork() throws {
     let epoch = SessionEpoch()
-    let first = epoch.invalidate()
+    let first = try epoch.capture()
     #expect(epoch.isCurrent(first))
-    let second = epoch.invalidate()
-    #expect(second > first)
+    let beforeRotation = epoch.current()
+    _ = try epoch.rotate()
+    #expect(epoch.current() > beforeRotation)
     #expect(!epoch.isCurrent(first))
+
+    _ = epoch.suspend()
+    do {
+        _ = try epoch.capture()
+        Issue.record("expected suspended session capture to fail")
+    } catch SignalError.sessionInvalidated {
+        // expected
+    }
+    let resumed = try epoch.resume()
+    #expect(epoch.isCurrent(resumed))
 }
 
 @Test func secretStoreRoundTrips() async throws {
