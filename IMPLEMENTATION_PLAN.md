@@ -1,131 +1,586 @@
-# Implementation status and next steps
+# Cuztom Signal Implementation Plan
 
 _Last updated: 2026-09-24_
 
-This document reflects the current `main` working tree after the native-call
-and messaging-hardening pass. The project is now a working linked-device
-client; the remaining work is primarily group calls, offline delivery,
-group administration, and release hardening.
+## 1. Purpose and current assessment
 
-## Completed work
+Cuztom Signal is a native macOS linked-device Signal client. The project has a
+substantial working implementation, but it should currently be treated as a
+**beta/pre-production client**, not a production release.
 
-### Core messaging and identity
+The linked-device happy path is implemented and has been manually exercised:
 
-- [x] Native QR linking and linked-session resume.
-- [x] Native Signal websocket receive loop and contact/groups sync.
-- [x] Canonical 1:1 and GroupsV2 thread IDs.
-- [x] GroupsV2 `masterKey`/`revision` context on outgoing group messages.
-- [x] Self/Note to Self labeling and stable canonical thread routing.
-- [x] Friendly contact and group names, sender hints, initials, and group
-  member profile-key fallback lookup.
-- [x] Contact sync refresh on the authoritative `contacts_synced` event.
-- [x] Resolved profile names are preserved when a later roster refresh has
-  only a blank/`Unknown` value.
+- QR provisioning and linked-session resume
+- Signal websocket receive loop and roster/group synchronization
+- 1:1 and group text messaging
+- Attachments, metadata-only history rows, downloads, and local rendering
+- Reactions, replies, edits, delete-for-me/for-everyone, receipts, and typing UI
+- Local macOS notifications
+- Native 1:1 RingRTC voice calls
 
-### Storage and duplicate suppression
+The main risk is not a lack of features; it is correctness and lifecycle
+reliability around live state, persistence, account switching, native FFI
+state, and security boundaries. Those issues should be addressed before
+adding more product features.
 
-- [x] SQLite/GRDB production message store with in-memory test store.
-- [x] Stable message identity based on thread, sender, and client/store
-  timestamp; server-clock differences no longer create a second UUID.
-- [x] UUID migration aliases for the previous server-clock key format.
-- [x] Logical deduplication in both in-memory and SQLite stores.
-- [x] Attachment-only message normalization (`""` vs `[attachment]`).
-- [x] Startup migration removes old duplicate rows and empty control-envelope
-  rows.
-- [x] Unread counts and notifications are not incremented by replayed rows.
-- [x] Startup reentrancy guard prevents multiple service/controller instances.
-- [x] Logout clears Rust state, Swift SQLite state, caches, attachments, UUID
-  mappings, path mappings, and keychain material.
+This document converts the latest codebase review into an implementation plan
+and roadmap.
 
-### Messaging features
+---
 
-- [x] 1:1 and group text sending/receiving.
-- [x] Attachments: upload, metadata-only history rows, on-demand download,
-  image/video rendering, animated GIFs, Reveal in Finder, and stable cache
-  paths per attachment index.
-- [x] Reactions.
-- [x] Replies and message edits.
-- [x] Delete for me and delete for everyone.
-- [x] Incoming typing indicators. Outgoing typing remains intentionally
-  disabled because the current presage sender path is unsupported.
-- [x] Read/delivery receipt settings, sending, and display.
-- [x] Link previews.
-- [x] Message list scrolls to newest content on send/receive.
-- [x] Group sender chips only on the first message in a contiguous sender run.
+## 2. Verification baseline
 
-### macOS integration
+The following checks were run during the latest review:
 
-- [x] Native local notifications for newly received messages.
-- [x] Native local notifications for incoming calls, with duplicate
-  suppression and cancellation on answer/decline/hangup.
-- [x] Notification enable/disable setting.
-- [x] Incoming message notifications are suppressed for the currently viewed
-  conversation while the app is active.
-- [x] Ad-hoc signed local app bundle with the rebuilt native dylib.
+| Check | Result |
+|---|---|
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 38/38 passed |
+| `swift build --target CuztomSignalCore` | Passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed with warnings |
+| `cargo test --all-targets` | 6/6 passed |
+| `cargo check --all-targets` | Passed with warnings |
+| `cargo build --release` | Passed with warnings |
+| `cargo clippy --all-targets -- -D warnings` | Not run: Clippy component unavailable |
+| `cargo fmt --all -- --check` | Not run: rustfmt component unavailable |
+| Default Command Line Tools Swift build | Fails because the `SwiftUIMacros` plugin is unavailable |
 
-### Native 1:1 calls
+The test suite currently exercises mostly mock/in-memory behavior. It does not
+cover the SwiftUI application, native FFI success paths, account switching,
+large SQLite histories, or a two-client Signal/RingRTC integration.
 
-- [x] RingRTC native/prebuilt-WebRTC foundation.
-- [x] Native offer/answer/ICE/hangup/busy Signal signaling.
-- [x] 1:1 voice call state machine, microphone permission, mute, elapsed
-  timer, and incoming/outgoing UI.
-- [x] Call state and signaling bridge survives the current 1:1 path.
+---
 
-## Current validation
+## 3. Priority findings from the review
 
-- Swift Testing: **38 tests passed**.
-- Rust library tests: **6 tests passed**.
-- `cargo check`: passed.
-- `cargo build --release`: passed.
-- `swift build --product CuztomSignal`: passed with full Xcode.
-- Local app bundle rebuilt, signed, and smoke-tested against a fresh link.
-- Fresh-reset verification confirmed contact/group names render and old
-  duplicate/control rows do not reappear.
+### P0 — correctness, lifecycle, and data integrity
 
-## Open work, in priority order
+These block reliable use with real accounts.
 
-### P0 — Group calls
+#### P0-1: Live controller state is not propagated to SwiftUI
 
-Do not enable the group-call button until all of the following are complete:
+`ChatController` updates its private message/conversation state when live
+messages, reactions, and receipts arrive, but `ChatViewModel` only uses the
+incoming-message callback to create notifications. The view model is not
+synchronized after those mutations.
 
-1. Retrieve and validate Signal external group membership proofs.
-2. Derive RingRTC group and accepted-member identities from the group master
-   key and membership ciphertext.
-3. Implement RingRTC's HTTP delegate for SFU requests/responses.
-4. Add opaque group-call signaling without changing the working 1:1 path.
-5. Add separate Rust FFI commands and Swift group-call lifecycle/UI.
-6. Verify with two linked/native clients before shipping the button.
+**Impact:** Live messages can remain invisible, sidebar previews and unread
+badges can be stale, and reactions/receipts can fail to appear until an
+unrelated action triggers `sync()`.
 
-### P1 — Reliability and background delivery
+**Required fix:** Add a single state-change callback after controller state is
+updated. Invoke it for messages, reactions, receipts, connection changes,
+selection changes, and local mutations.
 
-- Fetch Signal's authenticated TURN relay list.
-- Expose/support urgent-message signaling where the underlying sender permits
-  it.
-- Add APNs registration and encrypted provider-backed ordinary/VoIP delivery.
-- Add launch-at-login, reconnect policy, and background lifecycle handling.
-- Add CallKit/system call UI and lock-screen actions for incoming calls.
-- Add a true 500-message paging test and larger attachment/limit tests.
+#### P0-2: `RustCoreService` is unsynchronized and the native core is process-global
 
-### P1 — Product features
+The Swift service is a regular class marked `@unchecked Sendable`, with
+unsynchronized mutable caches and initialization state. Its event pump,
+profile lookups, sends, attachments, refreshes, and logout paths can run
+concurrently.
 
-- Group administration: create/rename, avatar, member management, roles, and
-  leave group.
-- Full video calling, group video, multi-call handling, and device selection.
-- Disappearing-message timers.
-- Cross-thread message search.
-- Encrypted SQLite/keychain-backed database protection at rest.
-- Backup/restore and crash reporting.
+The Rust worker is stored in a process-wide `OnceLock`. Multiple Swift service
+instances with different database paths can silently reuse the first native
+account.
 
-### P2 — Release engineering
+**Impact:** Dictionary races, lost cache writes, duplicate initialization,
+wrong-account operations, and corrupted UUID/path mappings.
 
-- Signed and notarized DMG with a reproducible release script.
-- Sparkle or another signed update channel.
-- App Store/notarization licensing review and user-facing privacy disclosures.
-- CI running the full Xcode Swift tests and RingRTC Rust build on macOS arm64.
+**Required fix:** Serialize the Swift service through an actor/private
+executor, enforce one native session per process, reject conflicting database
+paths, and add an account/session generation to all asynchronous work.
 
-## Definition of done for group calls
+#### P0-3: Logout and account switching are not atomic or fail closed
 
-A group-call MVP is not complete until membership proof retrieval, SFU HTTP
-request/response handling, opaque group signaling, accepted-member key
-mapping, and a two-client native test all pass. The existing 1:1 call path must
-remain green throughout the work.
+The app catches a native wipe failure and continues starting a new service.
+The native `clearAllData()` path can delete an SQLite file while the worker
+still owns an open store, ignores removal errors, and does not reset all native
+initialization state.
+
+The public `RustCoreService.logout()` path is only a partial logout. The
+Keychain boundary is not wired into production, and pending composer state is
+not cleared.
+
+**Impact:** The old account can remain linked, old messages/attachments can
+survive, and stale tasks can update a newly linked account.
+
+**Required fix:** Implement one authoritative, throwing wipe operation. Stop
+and await all tasks, quiesce the native receive loop, close stores, clear
+account-bound caches and key material, verify deletion, and refuse to relink
+after a failed wipe.
+
+#### P0-4: SQLite paging and unread state are incorrect
+
+`SQLiteMessageStore.messages(in:limit:)` uses `ORDER BY sentAt ASC LIMIT ?`,
+returning the oldest page instead of the newest page. `loadMore()` can then
+stop growing or display stale history.
+
+Roster upserts overwrite unread counts with zero. Historical seed messages
+are treated as new unread arrivals, while later refreshes can clear unread
+badges.
+
+**Impact:** New messages can disappear from the UI, history loading is broken,
+and unread state is incorrect.
+
+**Required fix:** Use newest-first cursor queries, distinguish historical
+import from live arrival, preserve local unread state, and add tests with
+201+ messages and repeated refreshes.
+
+#### P0-5: Duplicate replays erase local message state
+
+The in-memory and SQLite stores detect duplicate Signal identities but replace
+the entire stored message with the incoming representation. Empty roster
+values overwrite reactions, receipts, status, and attachment paths.
+
+**Impact:** A refresh can erase live metadata and cause downloaded media to
+disappear from the UI.
+
+**Required fix:** Merge server content with local-only metadata and preserve
+the most complete attachment/receipt/reaction state.
+
+#### P0-6: Native edits, deletes, and typing events are dropped
+
+The Rust event layer handles ordinary messages, reactions, receipts, and
+calls, but does not emit edit, delete, or typing events. Swift has UI/model
+support for typing but the Rust producer never emits the event.
+
+**Impact:** Remote edits and deletes do not update the Swift store, and
+incoming typing indicators are not reliable.
+
+**Required fix:** Add normalized native event types and Swift handlers with
+target timestamp, sender, thread, and author information.
+
+#### P0-7: PNI and group control messages are routed incorrectly
+
+Receipt and reaction paths strip `PNI:` and construct an ACI. Group reactions
+and receipts bypass the GroupsV2 context used by ordinary group text.
+
+Malformed group IDs are not validated before reaching presage, whose group
+sender uses an `expect()` for a 32-byte master key.
+
+**Impact:** PNI messages can be sent to the wrong identity, group control
+messages can be rejected/misrouted, and malformed FFI input can panic a native
+task.
+
+**Required fix:** Preserve service-ID type, attach group context consistently,
+validate all group keys as `[u8; 32]`, and return ordinary FFI errors instead
+of panicking.
+
+#### P0-8: Native history pages can be consumed by control envelopes
+
+`rust-core/src/sync.rs::thread_page()` takes the newest raw store rows before
+filtering receipts, reactions, edits, and other non-chat content. A page made
+up entirely of control messages can return no chat rows while advancing the
+cursor, causing older chat messages to become unreachable.
+
+**Required fix:** Filter/control-classify before applying the page limit, or
+continue fetching/overfetching until the requested number of chat messages is
+returned. Add a fixture containing interleaved control and chat messages.
+
+### P1 — security, privacy, and resource safety
+
+#### P1-1: Native and presentation databases are unencrypted
+
+The Rust store is opened without a passphrase. The Swift SQLite store and
+UUID/path maps are plaintext. `KeychainSecretStore` exists but is not used in
+production.
+
+The native `clear_registration()` operation does not necessarily remove all
+identity/master/account key material from the underlying store.
+
+**Required fix:** Introduce encrypted SQLite storage, keep the passphrase in
+Keychain with `ThisDeviceOnly` accessibility, protect cache files, and add a
+verified full native key wipe.
+
+#### P1-2: Unknown/changed identities are trusted automatically
+
+All native stores use `OnNewIdentity::Trust`, and there is no safety-number or
+identity-change confirmation UI.
+
+**Required fix:** Reject changed identities until explicitly verified and
+add a safety-number/identity-change workflow.
+
+#### P1-3: The dylib loader trusts writable paths
+
+The loader searches the executable directory, Application Support, and the
+current working directory, then calls `dlopen()` without signature, hash, or
+ABI validation.
+
+**Required fix:** Load only a signed bundled dylib in release builds, remove
+the current-directory fallback, verify code signature/hash, and negotiate an
+ABI version before resolving function pointers.
+
+#### P1-4: Attachment processing can exhaust resources
+
+Uploads read the whole file before checking the size limit. Missing size
+metadata bypasses the auto-download limit. Live downloads block the receive
+loop and fully buffer responses. Several Rust queues are unbounded.
+
+**Required fix:** Check metadata before reading, stream with hard byte limits,
+reject unknown sizes for automatic downloads, move downloads off the receive
+loop, bound queues, and add cache quotas/eviction.
+
+#### P1-5: Link previews create an automatic network/privacy path
+
+Rendering a message automatically fetches detected URLs and remote images
+without user opt-in, private-network blocking, response-size limits, or
+redirect validation.
+
+**Required fix:** Make previews opt-in, allow only approved HTTPS/public
+hosts, block loopback/private/link-local destinations after redirects, cap
+responses, and use an isolated ephemeral URL session.
+
+#### P1-6: Notifications and diagnostics retain sensitive plaintext
+
+Notifications contain full message bodies, and native stdout/stderr is
+redirected to an unbounded persistent log containing identifiers and paths.
+Logout does not remove or redact the log.
+
+**Required fix:** Add notification preview redaction, redact identifiers,
+rotate/limit logs, and define a logout retention policy.
+
+#### P1-7: Receipts lack thread scope and stable sender identity
+
+Rust receipt events contain sender/timestamp information but no conversation
+thread. `ChatController.applyReceipt()` scans every conversation and matches
+only timestamps, while the Swift layer prefers a display name over the stable
+sender ID.
+
+**Impact:** A receipt can update the wrong conversation if timestamps collide,
+and receipt rows can later display as `Unknown` when the display-name string
+is treated as an ACI/PNI identifier.
+
+**Required fix:** Include thread and stable sender service ID in receipt
+events/models, and use a separate display-name lookup for presentation.
+
+#### P1-8: Manual attachment paths are not persisted across relaunches
+
+`RustCoreService.bindLocalPath()` only updates the in-memory `localPaths` map.
+The persisted path cache is not updated when the user manually downloads an
+attachment.
+
+**Impact:** After relaunch, the cached file exists but the message loses its
+`localURL` and shows Download again.
+
+**Required fix:** Persist manual paths through the same account-scoped path
+cache used for live/sent attachments, with validation and eviction.
+
+### P2 — reliability, UX, and maintainability
+
+- Receipt settings do not control actual network behavior.
+- Read receipts are repeatedly sent because there is no local read cursor.
+- Reactions store only `[String]` and cannot represent multiple senders.
+- Composer state is global rather than scoped to a conversation.
+- Clipboard image staging deletes its own source before copying.
+- Same-basename attachments overwrite each other.
+- Failed attachment sends still delete staged files.
+- Edit failures close the editor and discard the draft.
+- SQLite errors are converted into empty/false results indistinguishable from
+  duplicate/not-found results.
+- Sync errors do not trigger reconnect/backoff.
+- Link timeout can leave the native worker stuck in `Linking`.
+- The first send can occur before the receive queue/session is ready.
+- Call mute can update the UI even if the native call fails.
+- Speaker and video toggles are currently cosmetic.
+- Call answer state can be overwritten by the view model.
+- Two rapid Call taps can start duplicate native calls while microphone
+  permission is pending.
+- Remote call termination can leave a delivered call notification.
+- Queued RingRTC signals have no account generation and can cross a
+  logout/relink boundary.
+- The Character Viewer integration uses a private AppKit selector and leaks
+  its observer.
+- QR expiration is not displayed or enforced.
+- Negative paging limits can trap.
+- SQLite schema migration is not versioned.
+- Attachment images are loaded synchronously on the UI path.
+- Video playback and thumbnail tasks are not fully cancellation-safe.
+
+---
+
+## 4. Roadmap
+
+The roadmap is ordered by dependency and risk. Do not begin broad feature
+expansion until Milestone 2 is complete.
+
+### Milestone 0 — Establish a safe development baseline
+
+**Goal:** Make builds, tests, and native integration reproducible before
+changing behavior.
+
+- [ ] Commit `Package.resolved`.
+- [ ] Commit `rust-core/Cargo.lock`.
+- [ ] Pin `presage` and `ringrtc` Git revisions/tags.
+- [ ] Add `rust-toolchain.toml` and document the supported Xcode/macOS/Rust
+      versions.
+- [ ] Make CI run Swift tests with full Xcode, Rust tests, `cargo check`,
+      `cargo fmt`, and Clippy.
+- [ ] Add an ABI/version symbol exposed by the Rust library.
+- [ ] Add a generated/versioned C header and verify Swift/Rust symbol parity.
+- [ ] Fix current compiler warnings, especially the AppKit actor warning and
+      ignored Swift operation results.
+- [ ] Ensure the native test does not silently skip when the dylib is missing.
+
+**Exit criteria:** A clean checkout builds the same dependency graph and
+fails CI if the native library is missing or ABI-incompatible.
+
+---
+
+### Milestone 1 — Fix live state and storage correctness
+
+**Goal:** Make the existing text-message experience correct under normal use.
+
+- [ ] Add `ChatController.stateDidChange` and connect it to the view model.
+- [ ] Ensure live messages, reactions, receipts, and connection changes update
+      the UI immediately.
+- [ ] Fix `SQLiteMessageStore.messages(in:limit:)` to return the newest page
+      in chronological display order.
+- [ ] Replace `loadMore()` boolean semantics with success/exhausted/failure
+      results.
+- [ ] Protect `loadMore()` and refresh results with a selection/session
+      generation.
+- [ ] Fix initial paging when the Swift cache is empty.
+- [ ] Push store-timestamp ordering and limits into the native SQLite query.
+- [ ] Filter non-chat control envelopes before applying native page limits.
+- [ ] Preserve unread counts during roster metadata upserts.
+- [ ] Add a separate historical import mode that does not mark old history
+      unread.
+- [ ] Merge duplicate message records instead of replacing them.
+- [ ] Recompute conversation preview/activity/unread state after deletion.
+- [ ] Make storage APIs failure-aware (`throws` or typed results).
+- [ ] Add production SQLite tests with 201+ messages, refreshes, replay,
+      unread state, and failed writes.
+
+**Exit criteria:** Live messages appear without manual refresh, 500-message
+paging has no gaps/duplicates, unread state survives refresh, and local
+metadata survives replay.
+
+---
+
+### Milestone 2 — Make session lifecycle and native state safe
+
+**Goal:** Prevent cross-account leakage and make logout/retry reliable.
+
+- [ ] Convert `RustCoreService` to an actor or serialize all mutable state on a
+      private executor.
+- [ ] Move blocking FFI calls to a controlled background executor.
+- [ ] Enforce one native worker/account per process.
+- [ ] Reject initialization with a different database path while linked.
+- [ ] Add account/session epochs to Rust events, call signals, call actions,
+      Swift tasks, and cache keys.
+- [ ] Drain or invalidate queued RingRTC signals/actions during logout before
+      allowing relink.
+- [ ] Guard call startup so rapid taps cannot create duplicate native calls.
+- [ ] Track and await all controller/service tasks.
+- [ ] Cancel watcher, refresh, selection, auto-fetch, and diagnostic tasks
+      before logout/retry.
+- [ ] Make `clearAllData()` throw on any failure and never continue relinking
+      after failure.
+- [ ] Add a native shutdown/reset operation that closes stores and returns
+      the worker to a genuinely fresh state.
+- [ ] Reset `didInit`, `selfAci`, path maps, UUID maps, resolver state, and
+      pending composer/call state.
+- [ ] Clear pending files and drafts on account switch.
+- [ ] Add tests for logout failure, relink, account switching, task
+      cancellation, and queued native work.
+
+**Exit criteria:** Logging out cannot resume the old account, and no callback
+or task from account A can update account B.
+
+---
+
+### Milestone 3 — Complete native message protocol semantics
+
+**Goal:** Make the advertised messaging features work for incoming traffic.
+
+- [ ] Add native `edit`, `delete`, and `typing` event extraction.
+- [ ] Add Swift event models and store reconciliation handlers.
+- [ ] Preserve PNI service IDs in contact, reaction, receipt, edit, and quote
+      paths.
+- [ ] Include thread and stable sender identity in receipt events/models.
+- [ ] Persist manually downloaded attachment paths through the account-scoped
+      path cache.
+- [ ] Attach GroupsV2 context/revision to all group control messages.
+- [ ] Validate group IDs and all FFI lengths before native calls.
+- [ ] Add exact attachment lookup by stable message identity rather than a
+      loose timestamp range.
+- [ ] Distinguish empty event queues from worker errors.
+- [ ] Wait for initial sync/session readiness before allowing first send.
+- [ ] Add PNI, group, edit, delete, typing, and malformed-input tests.
+
+**Exit criteria:** Remote edits/deletes/typing update immediately, PNI and
+group control messages route correctly, and malformed input returns an error
+without crashing the worker.
+
+---
+
+### Milestone 4 — Security and privacy hardening
+
+**Goal:** Make local data and native loading safe for real users.
+
+- [ ] Add encrypted SQLite support and Keychain-backed passphrase storage.
+- [ ] Migrate existing plaintext databases with a tested migration path.
+- [ ] Add identity-change verification/safety-number UI.
+- [ ] Bundle and sign the native dylib; remove user-writable search paths.
+- [ ] Verify native code signature/hash and ABI version before `dlopen()`.
+- [ ] Add notification preview redaction.
+- [ ] Redact, rotate, and cap diagnostic logs.
+- [ ] Make link previews opt-in and restrict them to safe public HTTPS hosts.
+- [ ] Add private-network/redirect/response-size protections.
+- [ ] Define secure deletion and retention behavior for databases, media,
+      logs, and notification content.
+
+**Exit criteria:** A filesystem/backup reader cannot recover message or key
+material without the Keychain-protected passphrase, and a replaced native
+library cannot be loaded silently.
+
+---
+
+### Milestone 5 — Calls and media reliability
+
+**Goal:** Make the supported 1:1 voice path predictable and honest about
+unsupported features.
+
+- [ ] Make mute state update only after native success.
+- [ ] Implement or remove speaker routing controls.
+- [ ] Implement or remove video controls and camera permission handling.
+- [ ] Implement a real decline signal instead of labeling a normal hangup as
+      declined locally.
+- [ ] Fix call state replay when native callbacks arrive before Swift ID
+      mapping.
+- [ ] Fix view-model answer-state races.
+- [ ] Cancel incoming-call notifications on every terminal state.
+- [ ] Add call session tests for permission denial, glare, remote hangup,
+      timeout, lost callbacks, and logout during a call.
+- [ ] Keep group-call and full-video features disabled until their native
+      requirements are complete.
+
+**Exit criteria:** UI state always reflects the actual native call state, and
+no unsupported control is presented as functional.
+
+---
+
+### Milestone 6 — Product completion
+
+**Goal:** Add remaining user-facing features only after the core is reliable.
+
+- [ ] Group administration: create, rename, avatar, members, roles, leave.
+- [ ] Authenticated TURN relay discovery.
+- [ ] APNs/VoIP push and killed-app delivery.
+- [ ] Launch-at-login, background lifecycle, and reconnect policy.
+- [ ] CallKit/system call UI and lock-screen actions.
+- [ ] Group calls after membership-proof/SFU work is complete.
+- [ ] Disappearing-message timers.
+- [ ] Cross-thread message search.
+- [ ] Backup/restore.
+- [ ] Crash reporting with redaction.
+- [ ] Persistent call history if required by the product.
+
+**Exit criteria:** Each feature has protocol fixtures, lifecycle tests, UI
+tests, and documented privacy behavior before being enabled.
+
+---
+
+### Milestone 7 — Release engineering
+
+**Goal:** Produce a reproducible, signed, notarized macOS build.
+
+- [ ] Create a real `.app`/XCFramework packaging target.
+- [ ] Include the Rust dylib in the signed bundle.
+- [ ] Add microphone/camera entitlements and required `Info.plist` keys.
+- [ ] Build arm64 and Intel artifacts reproducibly.
+- [ ] Generate and version the native header.
+- [ ] Add `codesign`, hardened-runtime, and notarization steps.
+- [ ] Add a clean-machine smoke test that links and receives a message.
+- [ ] Add dependency/license notices and AGPL compliance review.
+- [ ] Add release artifact checksums and rollback instructions.
+
+**Exit criteria:** A clean machine can install and run the signed app without
+manual dylib copying, and the release is reproducible from a clean checkout.
+
+---
+
+## 5. Required test strategy
+
+### Swift core tests
+
+Add tests for:
+
+- Live state propagation
+- Selection races and stale async results
+- 201+ SQLite messages and cursor boundaries
+- Control-envelope-heavy native history pages
+- Refresh/unread preservation
+- Replay preserving reactions, receipts, status, and attachment paths
+- Incoming edit/delete/typing events
+- Receipt settings, thread scope, stable sender identity, and read-cursor
+  behavior
+- PNI and group routing
+- Storage failures and deletion failures
+- Logout/account-switch task cancellation
+- Draft/reply/edit/attachment isolation by conversation
+
+### Rust tests
+
+Add tests for:
+
+- FFI success/error paths and ABI symbols
+- Malformed UTF-8, pointers, lengths, limits, and group IDs
+- PNI service-ID preservation
+- Group reaction/receipt context
+- Edit/delete/typing event normalization
+- Control-envelope-heavy history pages
+- Receipt thread scope and stable sender identity
+- Link timeout/retry and worker reset
+- Full native key/database wipe
+- Attachment size limits, missing sizes, cache collisions, and quotas
+- Sync errors and reconnect behavior
+
+### UI and integration tests
+
+Add tests for:
+
+- Start/retry/QR expiration/window restoration
+- Live message/reaction/receipt/typing propagation
+- Cross-conversation composer behavior
+- Logout failure, relink, and account switching
+- Notification authorization, routing, and call actions
+- Call answer/decline/end races
+- Duplicate call taps and queued call-signal logout races
+- Clipboard/file staging and failed sends
+- Link-preview URL filtering and response limits
+- Video cancellation and thumbnail invalidation
+- Dylib signature/ABI failures
+
+### Two-client integration
+
+Maintain a manual or automated two-client test matrix covering:
+
+- Fresh link and resume
+- 1:1 and group text
+- Attachments and large-file limits
+- Reactions, edits, deletes, receipts, and typing
+- 1:1 voice calls and remote hangup
+- Logout/relink/account switching
+
+---
+
+## 6. Current known limitations
+
+The following remain intentionally incomplete or blocked:
+
+- Group calls and SFU/membership-proof support
+- Authenticated TURN relay discovery
+- APNs/VoIP push and killed-app delivery
+- Background reconnect and launch-at-login
+- Group administration UI
+- Full video calling and multi-call handling
+- CallKit/system call actions
+- Disappearing-message timers
+- Cross-thread search
+- Encrypted SQLite/keychain-backed storage
+- Backup/restore and crash reporting
+- Reproducible signed/notarized DMG distribution
+- Sparkle or another signed update channel
+
+Until these limitations are addressed, the app should be distributed only to
+trusted testers and should not be presented as a complete Signal client.
