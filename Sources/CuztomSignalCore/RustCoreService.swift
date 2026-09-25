@@ -170,6 +170,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     public private(set) var libraryPath: String?
     private let explicitPath: String?
     private let dbPath: String
+    /// Stable namespace for account-bound Swift maps. The native database path
+    /// is already account-specific; hashing it avoids putting raw paths in
+    /// cache filenames or persisted JSON.
+    private let cacheNamespace: String
     private let initLock = NSLock()
     private var didInit = false
     private var linked = false
@@ -179,7 +183,15 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private var messageCache: [String: RosterPayload.Message] = [:]
     /// Wire key -> UUID mapping, persisted to prevent duplicate messages on re-sync.
     private var uuidCache: [String: UUID] = [:]
+    private var cacheDirectoryURL: URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))?.path ?? NSTemporaryDirectory()
+        return URL(fileURLWithPath: base)
+            .appendingPathComponent("CuztomSignal/CacheScopes/\(cacheNamespace)", isDirectory: true)
+    }
     private var uuidCacheURL: URL {
+        cacheDirectoryURL.appendingPathComponent("uuid_cache.json")
+    }
+    private var legacyUUIDCacheURL: URL {
         let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))?.path ?? NSTemporaryDirectory()
         return URL(fileURLWithPath: (base as NSString).appendingPathComponent("CuztomSignal/uuid_cache.json"))
     }
@@ -189,11 +201,16 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private var pathCache: [String: String] = [:]
 
     private var pathCacheURL: URL {
+        cacheDirectoryURL.appendingPathComponent("attachment_paths.json")
+    }
+    private var legacyPathCacheURL: URL {
         let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))?.path ?? NSTemporaryDirectory()
         return URL(fileURLWithPath: (base as NSString).appendingPathComponent("CuztomSignal/attachment_paths.json"))
     }
 
     private func loadPathCache() {
+        // The old un-namespaced map is intentionally not imported: it cannot
+        // be proven to belong to this account after a relink/account switch.
         guard let data = try? Data(contentsOf: pathCacheURL),
               let map = try? JSONDecoder().decode([String: String].self, from: data) else { return }
         // Prune entries whose files vanished (cache eviction, reinstalls) and
@@ -203,6 +220,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     private func savePathCache() {
         guard let data = try? JSONEncoder().encode(pathCache) else { return }
+        try? FileManager.default.createDirectory(at: cacheDirectoryURL, withIntermediateDirectories: true)
+        Self.protectFile(at: cacheDirectoryURL.path)
         try? data.write(to: pathCacheURL, options: .atomic)
         Self.protectFile(at: pathCacheURL.path)
     }
@@ -222,6 +241,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private func saveUUIDCache() {
         let stringMap = uuidCache.mapValues { $0.uuidString }
         guard let data = try? JSONEncoder().encode(stringMap) else { return }
+        try? FileManager.default.createDirectory(at: cacheDirectoryURL, withIntermediateDirectories: true)
+        Self.protectFile(at: cacheDirectoryURL.path)
         try? data.write(to: uuidCacheURL, options: .atomic)
         Self.protectFile(at: uuidCacheURL.path)
     }
@@ -303,6 +324,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         self.libraryPath = libraryPath
         self.explicitPath = libraryPath
         self.dbPath = dbPath ?? Self.defaultDBPath()
+        self.cacheNamespace = Self.cacheNamespace(for: self.dbPath)
         var sc: AsyncStream<ConnectionState>.Continuation!
         self.connectionState = AsyncStream { sc = $0 }
         self.stateContinuation = sc
@@ -317,6 +339,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
         loadPathCache()
         loadUUIDCache()
+        // Do not retain legacy un-namespaced account maps on disk.
+        try? removeIfPresent(legacyPathCacheURL)
+        try? removeIfPresent(legacyUUIDCacheURL)
     }
 
     deinit {
@@ -329,6 +354,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     public static func defaultDBPath() -> String {
         let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))?.path ?? NSTemporaryDirectory()
         return (base as NSString).appendingPathComponent("CuztomSignal/signal.db")
+    }
+
+    private static func cacheNamespace(for dbPath: String) -> String {
+        let normalized = URL(fileURLWithPath: dbPath).standardizedFileURL.path
+        let digest = SHA256.hash(data: Data(normalized.utf8))
+        return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func protectFile(at path: String) {
@@ -940,6 +971,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         pathCache = [:]
         localPaths = [:]
         lastRosterSummary = "never"
+        try removeIfPresent(cacheDirectoryURL)
+        try removeIfPresent(legacyPathCacheURL)
+        try removeIfPresent(legacyUUIDCacheURL)
     }
 
     /// Complete data wipe: stop the native session, delete the native store,
@@ -972,11 +1006,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             try removeIfPresent(URL(fileURLWithPath: dbPath + "-journal"))
         }
 
-        try removeIfPresent(pathCacheURL)
+        try removeIfPresent(cacheDirectoryURL)
+        try removeIfPresent(legacyPathCacheURL)
         let cachesRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("CuztomSignal", isDirectory: true)
         if let cachesRoot { try removeIfPresent(cachesRoot) }
-        try removeIfPresent(uuidCacheURL)
+        try removeIfPresent(legacyUUIDCacheURL)
         #if canImport(Security)
         // The key is account-bound to the wiped native store. Delete it only
         // after the database wipe and all Swift cache removal succeeded.

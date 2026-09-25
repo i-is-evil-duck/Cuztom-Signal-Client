@@ -27,9 +27,9 @@ link the Rust crate directly; it loads the release dylib at runtime.
 - Profile-name lookup with group-member profile-key fallback.
 - Native RingRTC 1:1 offer/answer/ICE/hangup/busy signaling and call state.
 - Explicit data/logout cleanup support for the Swift app.
-- Native ABI gating, release bundle/signature/hash checks, bounded command/call
-  intake, oversized/unknown attachment rejection, a 500 MB media-cache quota,
-  and file-protection metadata for native data/caches.
+- Native ABI gating, release bundle/signature/hash checks, bounded
+  command/call/sync-control intake, oversized/unknown attachment rejection, a
+  500 MB media-cache quota, and file-protection metadata for native data/caches.
 
 Group calls, authenticated TURN, APNs/urgent delivery, and the group-call SFU
 HTTP/membership-proof path are not complete.
@@ -149,10 +149,10 @@ and downloaded media. User data and the local app bundle are gitignored.
 ## Verification status
 
 - `cargo check`: passed.
-- `cargo test --lib`: 10 tests passed, including SQLCipher migration and
-  wrong-key rejection.
+- `cargo test --lib`: 11 tests passed, including SQLCipher migration,
+  wrong-key rejection, and bounded sync-control behavior.
 - `cargo build --release`: passed.
-- Full Xcode `swift test`: 52 tests passed.
+- Full Xcode `swift test`: 53 tests passed.
 - Manual verification: fresh QR link/resume, contacts/groups, name resolution,
   duplicate cleanup, message routing, and native 1:1 voice calling.
 

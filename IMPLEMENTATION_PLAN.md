@@ -34,10 +34,10 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 52/52 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 53/53 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
-| `cargo test --all-targets` | 10/10 passed |
+| `cargo test --all-targets` | 11/11 passed |
 | `cargo check --all-targets` | Passed with warnings |
 | `cargo build --release` | Passed with warnings |
 | `cargo clippy --all-targets -- -D warnings` | Not run: Clippy component unavailable |
@@ -237,9 +237,9 @@ loop, bound queues, and add cache quotas/eviction.
 
 **Status:** Implemented metadata preflight, unknown/oversized download
 rejection, a 500 MB attachment-cache quota, receive-loop decoupling, bounded
-core/call queues, and file protection. The presage attachment API still
-returns a bounded in-memory body; true streaming transport and the sync-control
-queue conversion remain follow-up work.
+core/call/sync-control queues, and file protection. The presage attachment API
+still returns a bounded in-memory body; true streaming transport remains
+follow-up work.
 
 #### P1-5: Link previews create an automatic network/privacy path
 
@@ -291,8 +291,9 @@ attachment.
 cache used for live/sent attachments, with validation and eviction.
 
 **Status:** Implemented with file-existence and app-cache-root validation,
-persisted lookup aliases, and protected cache files; account-scoped eviction
-and quotas remain part of the broader cache work.
+account/database-scoped map namespaces, logout/wipe cleanup, persisted lookup
+aliases, and protected cache files. Media eviction/quotas remain part of the
+broader cache work.
 
 #### P1 tranche completed 2026-09-25
 
@@ -300,13 +301,16 @@ and quotas remain part of the broader cache work.
   reject unsafe redirects, avoid remote image fetches, and cap response size.
 - [x] Redact notification content by default and clear bounded diagnostics on
   successful logout.
-- [x] Persist manual attachment paths and hydrate them after service restart.
+- [x] Persist manual attachment paths and hydrate them after service restart;
+      isolate maps by database/account namespace and remove them on logout.
+- [x] Bound the sync-control queue and fail explicitly on saturation; shutdown
+      waits for a reserved control slot with a timeout.
 - [x] Resolve receipt scope from native target timestamps, retain stable sender
       IDs, and drop ambiguous cross-conversation acknowledgements.
 - [x] Remove implicit native-library search paths and gate release loads on
       bundle/signature/hash/ABI validation.
-- [x] Bound command/call intake, reject unknown/oversized media, move
-      receive-loop downloads to the Swift fetcher, and enforce an
+- [x] Bound command/call/sync-control intake, reject unknown/oversized media,
+      move receive-loop downloads to the Swift fetcher, and enforce an
       attachment-cache quota.
 - [x] Apply complete file protection to presentation/native data and use
       device-only Keychain accessibility for secrets.

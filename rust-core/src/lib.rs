@@ -502,7 +502,7 @@ struct LinkedState {
     /// Live manager handle. `None` once the sync loop owns it.
     manager: Option<StoredManager>,
     /// Control plane into the sync loop, if running.
-    ctrl: Option<tmpsc::UnboundedSender<LoopCtrl>>,
+    ctrl: Option<tmpsc::Sender<LoopCtrl>>,
     /// Drained by `core_cmd_poll_event` (null = empty, not an error).
     events: Option<std::sync::mpsc::Receiver<String>>,
     /// False after the websocket receive task exits; allows a later
@@ -537,11 +537,34 @@ static ACTIVE_DB_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 /// The current sync-loop control sender. RingRTC's bridge is started once
 /// and survives logout/re-login; it waits while this slot is empty.
-static SYNC_CTRL: OnceLock<Mutex<Option<tmpsc::UnboundedSender<LoopCtrl>>>> = OnceLock::new();
+const SYNC_CTRL_CAPACITY: usize = 128;
+static SYNC_CTRL: OnceLock<Mutex<Option<tmpsc::Sender<LoopCtrl>>>> = OnceLock::new();
 static CALL_BRIDGE_STARTED: OnceLock<()> = OnceLock::new();
 static SYNC_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn set_sync_ctrl(sender: Option<tmpsc::UnboundedSender<LoopCtrl>>) {
+fn send_sync_ctrl(sender: &tmpsc::Sender<LoopCtrl>, message: LoopCtrl) -> Result<(), String> {
+    sender.try_send(message).map_err(|error| match error {
+        tmpsc::error::TrySendError::Full(_) => "sync control queue is full".to_string(),
+        tmpsc::error::TrySendError::Closed(_) => "sync loop is gone".to_string(),
+    })
+}
+
+async fn send_sync_ctrl_wait(
+    sender: &tmpsc::Sender<LoopCtrl>,
+    message: LoopCtrl,
+) -> Result<(), String> {
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sender.reserve(),
+    )
+    .await
+    .map_err(|_| "sync control queue shutdown timed out".to_string())?
+    .map_err(|_| "sync loop is gone".to_string())?;
+    permit.send(message);
+    Ok(())
+}
+
+fn set_sync_ctrl(sender: Option<tmpsc::Sender<LoopCtrl>>) {
     if let Ok(mut slot) = SYNC_CTRL
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -550,7 +573,7 @@ fn set_sync_ctrl(sender: Option<tmpsc::UnboundedSender<LoopCtrl>>) {
     }
 }
 
-fn current_sync_ctrl() -> Option<tmpsc::UnboundedSender<LoopCtrl>> {
+fn current_sync_ctrl() -> Option<tmpsc::Sender<LoopCtrl>> {
     SYNC_CTRL
         .get()
         .and_then(|slot| slot.lock().ok().and_then(|value| value.clone()))
@@ -987,7 +1010,7 @@ async fn cmd_request_contacts(state: &mut WorkerState) -> Result<(), String> {
                     .map_err(|e| format!("request contacts: {e}"))
             } else if let Some(ctrl) = linked.ctrl.as_ref() {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                ctrl.send(LoopCtrl::RequestContacts { reply: tx })
+                send_sync_ctrl(ctrl, LoopCtrl::RequestContacts { reply: tx })
                     .map_err(|_| "sync loop is gone".to_string())?;
                 rx.await.map_err(|_| "sync loop dropped reply".to_string())?
             } else {
@@ -1011,11 +1034,20 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
     if let Some(old_ctrl) = linked.ctrl.take() {
         set_sync_ctrl(None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        if old_ctrl
-            .send(LoopCtrl::Shutdown { reply: shutdown_tx })
-            .is_ok()
+        match send_sync_ctrl_wait(
+            &old_ctrl,
+            LoopCtrl::Shutdown { reply: shutdown_tx },
+        )
+        .await
         {
-            let _ = shutdown_rx.await;
+            Ok(()) => {
+                let _ = shutdown_rx.await;
+            }
+            Err(error) => {
+                set_sync_ctrl(Some(old_ctrl.clone()));
+                linked.ctrl = Some(old_ctrl);
+                return Err(error);
+            }
         }
     }
     linked.events = None;
@@ -1042,7 +1074,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
     let sync_generation = SYNC_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     sync_alive.store(true, Ordering::Release);
     let (event_tx, event_rx) = std::sync::mpsc::channel::<String>();
-    let (ctrl_tx, mut ctrl_rx) = tmpsc::unbounded_channel::<LoopCtrl>();
+    let (ctrl_tx, mut ctrl_rx) = tmpsc::channel::<LoopCtrl>(SYNC_CTRL_CAPACITY);
 
     // RingRTC callbacks run on a separate native worker. Keep one bridge
     // task for the process lifetime; it drops work while logged out and
@@ -1061,9 +1093,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                     }
                     if let Some(sender) = current_sync_ctrl() {
                         let call_id = pending.call_id;
-                        if sender
-                            .send(LoopCtrl::TransmitCallSignal { pending })
-                            .is_err()
+                        if send_sync_ctrl(&sender, LoopCtrl::TransmitCallSignal { pending }).is_err()
                         {
                             call::call_message_send_failure(call_id);
                         }
@@ -1087,7 +1117,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                         continue;
                     }
                     if let Some(sender) = current_sync_ctrl() {
-                        if sender.send(LoopCtrl::CallAction { action }).is_err() {
+                        if send_sync_ctrl(&sender, LoopCtrl::CallAction { action }).is_err() {
                             call::drop_active_call();
                         }
                     } else {
@@ -1438,14 +1468,19 @@ async fn cmd_logout(state: &mut WorkerState) -> Result<(), String> {
             set_sync_ctrl(None);
             if let Some(ctrl) = linked.ctrl.take() {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                if ctrl
-                    .send(LoopCtrl::Shutdown { reply: shutdown_tx })
-                    .is_ok()
+                if let Err(error) = send_sync_ctrl_wait(
+                    &ctrl,
+                    LoopCtrl::Shutdown { reply: shutdown_tx },
+                )
+                .await
                 {
-                    shutdown_rx
-                        .await
-                        .map_err(|_| "sync loop dropped shutdown acknowledgement".to_string())?;
+                    set_sync_ctrl(Some(ctrl.clone()));
+                    linked.ctrl = Some(ctrl);
+                    return Err(error);
                 }
+                shutdown_rx
+                    .await
+                    .map_err(|_| "sync loop dropped shutdown acknowledgement".to_string())?;
             }
             linked.manager.take();
             linked.events.take();
@@ -1521,7 +1556,7 @@ async fn cmd_send(state: &mut WorkerState, thread: &str, body: &str) -> Result<u
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::Send { thread: thread.to_string(), body: body.to_string(), reply: tx })
+            send_sync_ctrl(ctrl, LoopCtrl::Send { thread: thread.to_string(), body: body.to_string(), reply: tx })
                 .map_err(|_| "sync loop is gone".to_string())?;
             rx.await.map_err(|_| "sync loop dropped reply".to_string())?
         }
@@ -1567,7 +1602,7 @@ async fn cmd_send_attachment(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendAttachment {
+            send_sync_ctrl(ctrl, LoopCtrl::SendAttachment {
                 thread: thread.to_string(),
                 path: path.to_string(),
                 caption: caption.to_string(),
@@ -1593,7 +1628,7 @@ async fn cmd_send_reply(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendReply {
+            send_sync_ctrl(ctrl, LoopCtrl::SendReply {
                 thread: thread.to_string(),
                 body: body.to_string(),
                 quote_ts,
@@ -1614,7 +1649,7 @@ async fn cmd_send_delete(state: &mut WorkerState, thread: &str, target_ts: u64) 
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendDelete { thread: thread.to_string(), target_ts, reply: tx })
+            send_sync_ctrl(ctrl, LoopCtrl::SendDelete { thread: thread.to_string(), target_ts, reply: tx })
                 .map_err(|_| "sync loop is gone".to_string())?;
             rx.await.map_err(|_| "sync loop dropped reply".to_string())?
         }
@@ -1635,7 +1670,7 @@ async fn cmd_send_reaction(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendReaction {
+            send_sync_ctrl(ctrl, LoopCtrl::SendReaction {
                 thread: thread.to_string(),
                 target_sts,
                 target_author: target_author.to_string(),
@@ -1687,7 +1722,7 @@ async fn cmd_profile(state: &mut WorkerState, uuid: &str) -> Result<String, Stri
                 sync::profile_name(manager, uuid).await
             } else if let Some(ctrl) = linked.ctrl.as_ref() {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                ctrl.send(LoopCtrl::Profile { uuid: uuid.to_string(), reply: tx })
+                send_sync_ctrl(ctrl, LoopCtrl::Profile { uuid: uuid.to_string(), reply: tx })
                     .map_err(|_| "sync loop is gone".to_string())?;
                 rx.await.map_err(|_| "sync loop dropped reply".to_string())?
             } else {
@@ -1728,7 +1763,7 @@ async fn cmd_send_receipt(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendReceipt {
+            send_sync_ctrl(ctrl, LoopCtrl::SendReceipt {
                 thread: thread.to_string(),
                 timestamps,
                 kind: kind.to_string(),
@@ -1753,7 +1788,7 @@ async fn cmd_send_message_edit(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendMessageEdit {
+            send_sync_ctrl(ctrl, LoopCtrl::SendMessageEdit {
                 thread: thread.to_string(),
                 target_ts,
                 new_body: new_body.to_string(),
@@ -1777,7 +1812,7 @@ async fn cmd_send_typing(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendTyping {
+            send_sync_ctrl(ctrl, LoopCtrl::SendTyping {
                 thread: thread.to_string(),
                 started,
                 reply: tx,
@@ -1998,7 +2033,7 @@ async fn cmd_send_call_offer(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendCallOffer {
+            send_sync_ctrl(ctrl, LoopCtrl::SendCallOffer {
                 call_id: call_id.to_string(),
                 to: to.to_string(),
                 media_type: media_type.to_string(),
@@ -2023,7 +2058,7 @@ async fn cmd_send_call_answer(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendCallAnswer {
+            send_sync_ctrl(ctrl, LoopCtrl::SendCallAnswer {
                 call_id: call_id.to_string(),
                 sdp: sdp.to_string(),
                 reply: tx,
@@ -2048,7 +2083,7 @@ async fn cmd_send_call_ice(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendCallIceCandidate {
+            send_sync_ctrl(ctrl, LoopCtrl::SendCallIceCandidate {
                 call_id: call_id.to_string(),
                 candidate: candidate.to_string(),
                 sdp_mid: sdp_mid.to_string(),
@@ -2073,7 +2108,7 @@ async fn cmd_send_call_hangup(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendCallHangup {
+            send_sync_ctrl(ctrl, LoopCtrl::SendCallHangup {
                 call_id: call_id.to_string(),
                 reason: reason.to_string(),
                 reply: tx,
@@ -2096,7 +2131,7 @@ async fn cmd_send_call_signal(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::SendCallSignal {
+            send_sync_ctrl(ctrl, LoopCtrl::SendCallSignal {
                 thread: thread.to_string(),
                 call_message_json: call_message_json.to_string(),
                 reply: tx,
@@ -2280,7 +2315,7 @@ async fn cmd_fetch_attachment(
         WorkerState::Linked(linked) => {
             let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ctrl.send(LoopCtrl::FetchAttachment {
+            send_sync_ctrl(ctrl, LoopCtrl::FetchAttachment {
                 thread_id: thread_id.to_string(),
                 ts,
                 index,
@@ -3311,6 +3346,16 @@ pub extern "C" fn core_free_string(s: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_control_queue_is_bounded() {
+        let (sender, _receiver) = tmpsc::channel(1);
+        let (reply, _ack) = oneshot::channel();
+        send_sync_ctrl(&sender, LoopCtrl::Shutdown { reply }).unwrap();
+        let (reply, _ack) = oneshot::channel();
+        let error = send_sync_ctrl(&sender, LoopCtrl::Shutdown { reply }).unwrap_err();
+        assert!(error.contains("full"));
+    }
 
     #[test]
     fn abi_version_is_stable() {

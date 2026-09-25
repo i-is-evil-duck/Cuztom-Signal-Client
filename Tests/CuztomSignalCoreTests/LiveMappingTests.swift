@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Testing
 @testable import CuztomSignalCore
 
@@ -112,6 +113,48 @@ private let rosterFixture = """
     let second = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
     let message = second.chatMessage(payload.messages[0])
     #expect(message.attachments.first?.localURL?.path == file.path)
+}
+
+@Test func attachmentPathCacheIsAccountScoped() throws {
+    let attachmentDirectory = testAttachmentCacheDirectory()
+    try FileManager.default.createDirectory(at: attachmentDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: attachmentDirectory) }
+
+    let file = attachmentDirectory.appendingPathComponent("scoped.jpg")
+    try Data([0x01, 0x02, 0x03]).write(to: file)
+    let thread = "contact:scoped-\(UUID().uuidString)"
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cuztom-cache-scope-test-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let db1 = root.appendingPathComponent("account-one.db").path
+    let db2 = root.appendingPathComponent("account-two.db").path
+
+    let first = RustCoreService(libraryPath: "/nonexistent/lib.dylib", dbPath: db1)
+    first.bindLocalPath(thread: thread, ts: 42, index: 0, path: file.path)
+
+    let json = """
+    {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],"messages":[{
+      "key":"\(thread)/42/x","thread":"\(thread)","sender":"x","sender_name":"X",
+      "body":"file","ts":42,"sts":42,"outgoing":false,
+      "attachments":[{"name":"scoped.jpg","mime":"image/jpeg","size":3,"path":null}]
+    }]}
+    """
+    let payload = try JSONDecoder().decode(RosterPayload.self, from: Data(json.utf8))
+    let otherAccount = RustCoreService(libraryPath: "/nonexistent/lib.dylib", dbPath: db2)
+    #expect(otherAccount.chatMessage(payload.messages[0]).attachments.first?.localURL == nil)
+
+    let sameAccount = RustCoreService(libraryPath: "/nonexistent/lib.dylib", dbPath: db1)
+    #expect(sameAccount.chatMessage(payload.messages[0]).attachments.first?.localURL?.path == file.path)
+
+    // Remove only the two namespace directories created by this test.
+    let scopes = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        .appendingPathComponent("CuztomSignal/CacheScopes", isDirectory: true)
+    for dbPath in [db1, db2] {
+        let digest = SHA256.hash(data: Data(URL(fileURLWithPath: dbPath).standardizedFileURL.path.utf8))
+        let namespace = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        try? FileManager.default.removeItem(at: scopes.appendingPathComponent(namespace))
+    }
 }
 
 @Test func manualAttachmentPathRejectsFilesOutsideAppCache() throws {
