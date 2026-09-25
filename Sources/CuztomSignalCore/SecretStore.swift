@@ -24,6 +24,7 @@ public actor InMemorySecretStore: SecretStoring {
 import Security
 
 /// Minimal Keychain wrapper (kSecClassGenericPassword, this app's access group).
+/// Values are device-only and unavailable while the device is locked.
 /// M1 will move identity + session blobs here instead of `config/` files
 /// like signal-bridge-V2 used (`config/instagram_session.json` + bind mounts).
 public struct KeychainSecretStore: SecretStoring {
@@ -51,11 +52,15 @@ public struct KeychainSecretStore: SecretStoring {
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
         ]
-        let attrs: [String: Any] = [kSecValueData as String: value]
+        let attrs: [String: Any] = [
+            kSecValueData as String: value,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
         let status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
         if status == errSecItemNotFound {
             var add = query
             add[kSecValueData as String] = value
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
             let addStatus = SecItemAdd(add as CFDictionary, nil)
             guard addStatus == errSecSuccess else {
                 throw SignalError.storage("keychain add failed: \(addStatus)")

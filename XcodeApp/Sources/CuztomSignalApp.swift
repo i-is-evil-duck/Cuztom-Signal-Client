@@ -24,6 +24,10 @@ struct CuztomSignalApp: App {
         if !FileManager.default.fileExists(atPath: url.path) {
             FileManager.default.createFile(atPath: url.path, contents: nil)
         }
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: url.path
+        )
         url.path.withCString { path in
             _ = freopen(path, "a+", stdout)
             _ = freopen(path, "a+", stderr)
@@ -626,6 +630,10 @@ func sendTyping(started: Bool) async {
             }
 
             var files = pendingFilesByConversation[conversationID] ?? []
+            try? FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: dest.path
+            )
             if !files.contains(dest) {
                 files.append(dest)
                 pendingFilesByConversation[conversationID] = files
@@ -650,6 +658,10 @@ func sendTyping(started: Bool) async {
             if let rep = img.tiffRepresentation,
                let png = NSBitmapImageRep(data: rep)?.representation(using: .png, properties: [:]) {
                 try? png.write(to: dest)
+                try? FileManager.default.setAttributes(
+                    [.protectionKey: FileProtectionType.complete],
+                    ofItemAtPath: dest.path
+                )
                 var files = pendingFilesByConversation[conversationID] ?? []
                 files.append(dest)
                 pendingFilesByConversation[conversationID] = files

@@ -2,6 +2,11 @@ import Foundation
 import Testing
 @testable import CuztomSignalCore
 
+private func testAttachmentCacheDirectory() -> URL {
+    FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        .appendingPathComponent("CuztomSignal/test-\(UUID().uuidString)", isDirectory: true)
+}
+
 private let rosterFixture = """
 {"self":{"aci":"00000000-0000-0000-0000-000000000000","number":"+1000"},
  "contacts":[{"id":"11111111-1111-1111-1111-111111111111","name":"Alice","phone":"+1001"},
@@ -87,8 +92,7 @@ private let rosterFixture = """
 }
 
 @Test func manualAttachmentPathPersistsAcrossServiceInstances() throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent("cuztom-path-test-\(UUID().uuidString)", isDirectory: true)
+    let directory = testAttachmentCacheDirectory()
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let file = directory.appendingPathComponent("downloaded.jpg")
@@ -110,11 +114,34 @@ private let rosterFixture = """
     #expect(message.attachments.first?.localURL?.path == file.path)
 }
 
+@Test func manualAttachmentPathRejectsFilesOutsideAppCache() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cuztom-outside-cache-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("outside.jpg")
+    try Data([0x01]).write(to: file)
+
+    let service = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
+    service.bindLocalPath(thread: "contact:x", ts: 42, index: 0, path: file.path)
+    let json = """
+    {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],"messages":[{
+      "key":"contact:x/42/x","thread":"contact:x","sender":"x","sender_name":"X",
+      "body":"file","ts":42,"sts":42,"outgoing":false,
+      "attachments":[{"name":"outside.jpg","mime":"image/jpeg","size":1,"path":null}]
+    }]}
+    """
+    let payload = try JSONDecoder().decode(RosterPayload.self, from: Data(json.utf8))
+    #expect(service.chatMessage(payload.messages[0]).attachments.first?.localURL == nil)
+}
+
 @Test func attachmentMetadataMaps() throws {
     // chatMessage only links paths that exist on disk (stale cache prune).
-    let real = FileManager.default.temporaryDirectory.appendingPathComponent("cuztom-test-photo.jpg")
+    let directory = testAttachmentCacheDirectory()
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let real = directory.appendingPathComponent("cuztom-test-photo.jpg")
     try "x".write(to: real, atomically: true, encoding: .utf8)
-    defer { try? FileManager.default.removeItem(at: real) }
     let json = """
     {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],
      "messages":[{

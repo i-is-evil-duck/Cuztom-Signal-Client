@@ -3,7 +3,7 @@
 //! RingRTC's `CallManager` runs on its own worker thread. Its signaling
 //! callback is synchronous, while libsignal sends are asynchronous and must
 //! run on the core's `!Send` tokio `LocalSet`. The two sides are connected by
-//! unbounded channels: the callback enqueues a fully-built Signal
+//! bounded channels: the callback enqueues a fully-built Signal
 //! `CallMessage`, and the core sync loop performs the actual send. RingRTC is
 //! notified when that send succeeds or fails.
 
@@ -77,16 +77,15 @@ pub enum CallAction {
     },
 }
 
-static CALL_SIGNAL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<PendingCallSignal>> =
-    OnceLock::new();
-static CALL_SIGNAL_RX: OnceLock<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PendingCallSignal>>>> =
-    OnceLock::new();
-
-static CALL_ACTION_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<CallAction>> = OnceLock::new();
-static CALL_ACTION_RX: OnceLock<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CallAction>>>> =
+static CALL_SIGNAL_TX: OnceLock<tokio::sync::mpsc::Sender<PendingCallSignal>> = OnceLock::new();
+static CALL_SIGNAL_RX: OnceLock<Mutex<Option<tokio::sync::mpsc::Receiver<PendingCallSignal>>>> =
     OnceLock::new();
 
-static CALL_EVENT_TX: OnceLock<std::sync::mpsc::Sender<String>> = OnceLock::new();
+static CALL_ACTION_TX: OnceLock<tokio::sync::mpsc::Sender<CallAction>> = OnceLock::new();
+static CALL_ACTION_RX: OnceLock<Mutex<Option<tokio::sync::mpsc::Receiver<CallAction>>>> =
+    OnceLock::new();
+
+static CALL_EVENT_TX: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
 static CALL_EVENT_RX: OnceLock<Mutex<std::sync::mpsc::Receiver<String>>> = OnceLock::new();
 
 static CALL_MANAGER: OnceLock<Mutex<CallManager<NativePlatform>>> = OnceLock::new();
@@ -95,13 +94,13 @@ static CALL_AUDIO_TRACK: OnceLock<AudioTrack> = OnceLock::new();
 static LOCAL_DEVICE_ID: AtomicU32 = AtomicU32::new(1);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-fn signal_tx() -> Option<&'static tokio::sync::mpsc::UnboundedSender<PendingCallSignal>> {
+fn signal_tx() -> Option<&'static tokio::sync::mpsc::Sender<PendingCallSignal>> {
     CALL_SIGNAL_TX.get()
 }
-fn action_tx() -> Option<&'static tokio::sync::mpsc::UnboundedSender<CallAction>> {
+fn action_tx() -> Option<&'static tokio::sync::mpsc::Sender<CallAction>> {
     CALL_ACTION_TX.get()
 }
-fn event_tx() -> Option<&'static std::sync::mpsc::Sender<String>> {
+fn event_tx() -> Option<&'static std::sync::mpsc::SyncSender<String>> {
     CALL_EVENT_TX.get()
 }
 fn manager() -> Option<&'static Mutex<CallManager<NativePlatform>>> {
@@ -112,14 +111,14 @@ fn context() -> Option<&'static NativeCallContext> {
 }
 
 /// Take the signal receiver once, when the core receive loop starts.
-pub fn take_signal_rx() -> Option<tokio::sync::mpsc::UnboundedReceiver<PendingCallSignal>> {
+pub fn take_signal_rx() -> Option<tokio::sync::mpsc::Receiver<PendingCallSignal>> {
     CALL_SIGNAL_RX
         .get()
         .and_then(|slot| slot.lock().ok().and_then(|mut r| r.take()))
 }
 
 /// Take the deferred RingRTC-action receiver once.
-pub fn take_action_rx() -> Option<tokio::sync::mpsc::UnboundedReceiver<CallAction>> {
+pub fn take_action_rx() -> Option<tokio::sync::mpsc::Receiver<CallAction>> {
     CALL_ACTION_RX
         .get()
         .and_then(|slot| slot.lock().ok().and_then(|mut r| r.take()))
@@ -234,13 +233,19 @@ impl SignalingSender for CuztomSignalingSender {
         let Some(tx) = signal_tx() else {
             return Err(std::io::Error::other("call signaling is not initialized").into());
         };
-        tx.send(PendingCallSignal {
+        tx.try_send(PendingCallSignal {
             session_generation: session_generation(),
             thread: recipient_id.to_string(),
             call_id: call_id.as_u64(),
             proto: proto.encode_to_vec(),
         })
-        .map_err(|_| std::io::Error::other("call signaling receiver is closed").into())
+        .map_err(|error| {
+            std::io::Error::other(match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => "call signaling queue is full",
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => "call signaling receiver is closed",
+            })
+        })
+        .map_err(Into::into)
     }
 
     fn send_call_message(
@@ -319,7 +324,7 @@ impl CallStateHandler for CuztomStateHandler {
         state: CallState,
     ) -> ringrtc::common::Result<()> {
         if let Some(tx) = event_tx() {
-            let _ = tx.send(
+            let _ = tx.try_send(
                 serde_json::json!({
                     "type": "call_state",
                     "thread": remote_peer_id,
@@ -334,7 +339,7 @@ impl CallStateHandler for CuztomStateHandler {
         // the initial Incoming/Outgoing state. Defer it to the core loop.
         if matches!(state, CallState::Incoming(_) | CallState::Outgoing(_)) {
             if let Some(tx) = action_tx() {
-                let _ = tx.send(CallAction::Proceed {
+                let _ = tx.try_send(CallAction::Proceed {
                     session_generation: session_generation(),
                     call_id: call_id.as_u64(),
                 });
@@ -449,9 +454,9 @@ pub fn init_calls() -> Result<(), String> {
         return Ok(());
     }
 
-    let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<PendingCallSignal>();
-    let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel::<CallAction>();
-    let (event_tx, event_rx) = std::sync::mpsc::channel::<String>();
+    let (signal_tx, signal_rx) = tokio::sync::mpsc::channel::<PendingCallSignal>(64);
+    let (action_tx, action_rx) = tokio::sync::mpsc::channel::<CallAction>(64);
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<String>(128);
     let _ = CALL_SIGNAL_TX.set(signal_tx);
     let _ = CALL_SIGNAL_RX.set(Mutex::new(Some(signal_rx)));
     let _ = CALL_ACTION_TX.set(action_tx);

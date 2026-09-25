@@ -25,12 +25,27 @@ public actor SQLiteMessageStore: MessageStoring {
                 .appendingPathComponent("CuztomSignal", isDirectory: true)
         }
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: base.path
+        )
         let dbPath = base.appendingPathComponent("messages.sqlite")
         self.path = dbPath
         self.dbQueue = try DatabaseQueue(path: dbPath.path)
         try dbQueue.write { db in
             try Self.migrate(db)
         }
+        Self.protectFile(at: dbPath)
+        Self.protectFile(at: URL(fileURLWithPath: dbPath.path + "-wal"))
+        Self.protectFile(at: URL(fileURLWithPath: dbPath.path + "-shm"))
+    }
+
+    private static func protectFile(at url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: url.path
+        )
     }
 
     private static func migrate(_ db: Database) throws {

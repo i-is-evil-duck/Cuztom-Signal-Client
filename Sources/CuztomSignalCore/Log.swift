@@ -42,6 +42,10 @@ public enum Log {
                 if !FileManager.default.fileExists(atPath: fileURL.path) {
                     FileManager.default.createFile(atPath: fileURL.path, contents: nil)
                 }
+                try? FileManager.default.setAttributes(
+                    [.protectionKey: FileProtectionType.complete],
+                    ofItemAtPath: fileURL.path
+                )
                 let handle = try FileHandle(forWritingTo: fileURL)
                 defer { try? handle.close() }
                 try handle.truncate(atOffset: 0)
@@ -87,6 +91,10 @@ public enum Log {
                 if !FileManager.default.fileExists(atPath: fileURL.path) {
                     FileManager.default.createFile(atPath: fileURL.path, contents: nil)
                 }
+                try? FileManager.default.setAttributes(
+                    [.protectionKey: FileProtectionType.complete],
+                    ofItemAtPath: fileURL.path
+                )
                 let handle = try FileHandle(forWritingTo: fileURL)
                 defer { try? handle.close() }
                 try trimIfNeeded(handle)

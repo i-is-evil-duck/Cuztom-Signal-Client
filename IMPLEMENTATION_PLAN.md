@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 51/51 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 52/52 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 9/9 passed |
@@ -191,6 +191,11 @@ identity/master/account key material from the underlying store.
 Keychain with `ThisDeviceOnly` accessibility, protect cache files, and add a
 verified full native key wipe.
 
+**Status:** Keychain values now use `WhenUnlockedThisDeviceOnly`, and the
+Swift/native databases, path maps, and sent-media cache receive complete file
+protection. SQLCipher/passphrase-backed database encryption and migration are
+still pending.
+
 #### P1-2: Unknown/changed identities are trusted automatically
 
 All native stores use `OnNewIdentity::Trust`, and there is no safety-number or
@@ -225,9 +230,10 @@ reject unknown sizes for automatic downloads, move downloads off the receive
 loop, bound queues, and add cache quotas/eviction.
 
 **Status:** Implemented metadata preflight, unknown/oversized download
-rejection, a 500 MB attachment-cache quota, and receive-loop decoupling. The
-presage attachment API still returns a bounded in-memory body; true streaming
-transport and all remaining queue conversions are follow-up work.
+rejection, a 500 MB attachment-cache quota, receive-loop decoupling, bounded
+core/call queues, and file protection. The presage attachment API still
+returns a bounded in-memory body; true streaming transport and the sync-control
+queue conversion remain follow-up work.
 
 #### P1-5: Link previews create an automatic network/privacy path
 
@@ -278,8 +284,9 @@ attachment.
 **Required fix:** Persist manual paths through the same account-scoped path
 cache used for live/sent attachments, with validation and eviction.
 
-**Status:** Implemented with file-existence validation and persisted lookup
-aliases; account-scoped eviction/quotas remain part of the broader cache work.
+**Status:** Implemented with file-existence and app-cache-root validation,
+persisted lookup aliases, and protected cache files; account-scoped eviction
+and quotas remain part of the broader cache work.
 
 #### P1 tranche completed 2026-09-25
 
@@ -292,8 +299,11 @@ aliases; account-scoped eviction/quotas remain part of the broader cache work.
       IDs, and drop ambiguous cross-conversation acknowledgements.
 - [x] Remove implicit native-library search paths and gate release loads on
       bundle/signature/hash/ABI validation.
-- [x] Bound command intake, reject unknown/oversized media, move receive-loop
-      downloads to the Swift fetcher, and enforce an attachment-cache quota.
+- [x] Bound command/call intake, reject unknown/oversized media, move
+      receive-loop downloads to the Swift fetcher, and enforce an
+      attachment-cache quota.
+- [x] Apply complete file protection to presentation/native data and use
+      device-only Keychain accessibility for secrets.
 
 ### P2 — reliability, UX, and maintainability
 

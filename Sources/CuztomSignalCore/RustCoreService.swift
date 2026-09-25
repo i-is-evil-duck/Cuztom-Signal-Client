@@ -193,18 +193,21 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private func loadPathCache() {
         guard let data = try? Data(contentsOf: pathCacheURL),
               let map = try? JSONDecoder().decode([String: String].self, from: data) else { return }
-        // Prune entries whose files vanished (cache eviction, reinstalls).
-        pathCache = map.filter { FileManager.default.fileExists(atPath: $0.value) }
+        // Prune entries whose files vanished (cache eviction, reinstalls) and
+        // reject paths outside the app-owned media cache.
+        pathCache = map.filter { Self.isAllowedCachedPath($0.value) }
     }
 
     private func savePathCache() {
         guard let data = try? JSONEncoder().encode(pathCache) else { return }
         try? data.write(to: pathCacheURL, options: .atomic)
+        Self.protectFile(at: pathCacheURL.path)
     }
 
     private func rememberPath(key: String, path: String) {
         pathCache[key] = path
         savePathCache()
+        Self.protectFile(at: path)
     }
 
     private func loadUUIDCache() {
@@ -217,6 +220,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let stringMap = uuidCache.mapValues { $0.uuidString }
         guard let data = try? JSONEncoder().encode(stringMap) else { return }
         try? data.write(to: uuidCacheURL, options: .atomic)
+        Self.protectFile(at: uuidCacheURL.path)
     }
 
     /// Local override for on-demand downloads, keyed by message and
@@ -230,7 +234,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     public func bindLocalPath(thread: String, ts: Int64, index: Int = 0, path: String) {
         let standardized = URL(fileURLWithPath: path).standardizedFileURL
-        guard FileManager.default.fileExists(atPath: standardized.path) else { return }
+        guard Self.isAllowedCachedPath(standardized.path) else { return }
         let localKey = localPathKey(thread: thread, ts: ts, index: index)
         localPaths[localKey] = standardized.path
         // `bindLocalPath` is the authoritative path returned by an on-demand
@@ -269,6 +273,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         } else if let data = try? Data(contentsOf: sourceURL) {
             try? data.write(to: cacheURL)
         }
+        Self.protectFile(at: cacheURL.path)
 
         // Register using the same sender identity that roster messages use.
         // Older builds used the literal "self"; retain that alias so already
@@ -321,6 +326,24 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     public static func defaultDBPath() -> String {
         let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))?.path ?? NSTemporaryDirectory()
         return (base as NSString).appendingPathComponent("CuztomSignal/signal.db")
+    }
+
+    private static func protectFile(at path: String) {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: path
+        )
+    }
+
+    private static func isAllowedCachedPath(_ path: String) -> Bool {
+        let root = (FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("CuztomSignal", isDirectory: true)
+            .standardizedFileURL.path) ?? ""
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL.path
+        return !root.isEmpty
+            && (candidate == root || candidate.hasPrefix(root + "/"))
+            && FileManager.default.fileExists(atPath: candidate)
     }
 
     public static func defaultSearchPaths() -> [String] {
@@ -1220,7 +1243,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 ?? pathCache["\(m.thread)/\(m.sts)/\(index)"]
                 ?? a.path
             let resolved: URL? = {
-                guard let candidate, FileManager.default.fileExists(atPath: candidate) else { return nil }
+                guard let candidate, Self.isAllowedCachedPath(candidate) else { return nil }
                 return URL(fileURLWithPath: candidate)
             }()
             if let resolved {
@@ -1364,6 +1387,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             if rc < 0 { throw SignalError.storage("core init failed: \(lastError(sym))") }
             didInit = true
             linked = (rc == 1)
+            Self.protectFile(at: dbPath)
+            Self.protectFile(at: dbPath + "-wal")
+            Self.protectFile(at: dbPath + "-shm")
         }
         return sym
     }
