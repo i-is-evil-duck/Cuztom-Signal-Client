@@ -128,24 +128,35 @@ swift build --product CuztomSignal
 cd rust-core
 PATH="$PWD/scripts:$PATH" cargo test
 PATH="$PWD/scripts:$PATH" cargo build --release
+
+# Runnable, ad-hoc signed bundle in build/CuztomSignal.app
+scripts/build-app.sh            # optional: scripts/build-app.sh 0.2.0 3
 ```
 
 The checked-in source does not include the local app bundle or user data.
-The SQLCipher XCFramework is resolved as a pinned SwiftPM binary dependency and
-must be embedded/signed with the app. For a local runnable bundle, copy the
-built Swift executable and release dylib into `CuztomSignal.app/Contents/MacOS/`,
-then ad-hoc sign the bundle. The UI build tag comes from
-`CFBundleShortVersionString`/`CFBundleVersion`; local SwiftPM runs show
+`scripts/build-app.sh` assembles `build/CuztomSignal.app`: it embeds the
+release dylib next to the executable, embeds the pinned SQLCipher XCFramework
+(and adds the `@executable_path/../Frameworks` rpath it needs), ad-hoc signs
+everything, and records the signed dylib's SHA-256 in `Info.plist`. The sign →
+hash → `Info.plist` → sign order matters: re-signing the dylib afterwards
+invalidates the recorded hash. `scripts/verify-app.sh` re-checks a bundle
+against the same rules the release loader enforces (in-bundle path, strict
+nested signature, hash, native ABI version), so a broken bundle fails there
+instead of showing "rust core not found" in the UI.
+
+The UI build tag comes from `CFBundleShortVersionString`/`CFBundleVersion`; a
+bundle built by the script shows e.g. `Build 0.1.0 (1)`, local SwiftPM runs show
 `Build dev`, and CI can override it with `CUZTOM_SIGNAL_BUILD_TAG`.
 
 ## Verification status
 
 | Area | Status |
 |---|---|
-| Swift core tests | **67 passed** with full Xcode |
+| Swift core tests | **71 passed** with full Xcode |
 | Rust library tests | **11 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |
+| Ad-hoc signed bundle | Built and launched; embedded dylib passes in-bundle/signature/hash/ABI checks |
 | QR link/resume | Manually verified |
 | Contacts/groups/name resolution | Manually verified after fresh reset |
 | 1:1/group text routing | Manually verified |
@@ -164,6 +175,7 @@ Sources/CuztomSignalCore/       Core models, services, stores, controllers
 XcodeApp/Sources/               SwiftUI app and macOS notification coordinator
 Tests/CuztomSignalCoreTests/    Swift Testing coverage
 rust-core/                      Rust presage/libsignal/RingRTC core and C ABI
+scripts/                        Local app bundle build and preflight checks
 IMPLEMENTATION_PLAN.md           Detailed completion/open-work status
 CALLS_PLAN.md                    Native call implementation and limitations
 TODO.md                          Prioritized remaining work
