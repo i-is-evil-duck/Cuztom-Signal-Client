@@ -44,6 +44,8 @@ mod encrypted_store;
 
 mod call;
 
+pub mod group_calls;
+
 use libsignal_service::proto::CallMessage as ProtoCallMessage;
 
 enum Command {
