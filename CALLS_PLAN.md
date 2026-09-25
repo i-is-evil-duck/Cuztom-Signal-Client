@@ -133,7 +133,7 @@ hop and all lifecycle/UI work are better in Swift.
 | # | Increment | Where | Independently verifiable? | Status |
 |---|---|---|---|---|
 | 1 | Group id + member identities + proof auth string | Rust | **Done** — 6 offline tests | ✅ |
-| 2 | Authenticated credential fetch | presage patch → Rust FFI | Needs a vendored presage (decision below) | ⛔ blocked |
+| 2 | Authenticated credential fetch | presage patch → Rust FFI | Vendored presage | **Done** — 12 Rust + 6 Swift tests |
 | 3 | CDN token fetch (`GET /v2/groups/token`) | Swift | Mock transport | **Done** — 13 tests | ✅ |
 | 4 | SFU request/response bridge | Rust + Swift | Injected synthetic response | **Done** — ABI 3, 6 tests | ✅ |
 | 5 | Group-call lifecycle + opaque signaling transport | Rust | Fake SFU client | Not started | ⬜ |
@@ -152,20 +152,18 @@ loudly at startup rather than hanging on join.
 
 ### Open decision: how to carry the presage patch
 
-Increment 2 requires modifying presage, which is currently a pinned git
-dependency. Options:
+**Resolved: presage is vendored** under `rust-core/vendor/presage` and both
+`presage` and `presage-store-sqlite` are pointed at the local tree. Both are
+required together: `presage-store-sqlite` depends on `presage` by relative path
+inside the upstream workspace, so patching only one would put two copies of the
+crate in the graph.
 
-- **Vendor presage** into the repository and point Cargo at the path via
-  `[patch]`. Explicit and reproducible, but adds a large crate to the tree and
-  means carrying presage updates by hand. The project already anticipates this
-  for the protocol-store work.
-- **Track a presage fork.** Cleaner diffs, but needs a remote the project
-  controls.
-- **Skip increment 2** and ship the rest as a diagnostic-only path that reports
-  the missing credential honestly. No group calls, but no blocked work either.
-
-Increments 1, 3, 4, and 5 do not depend on this decision, so they can proceed
-while it is made.
+The patch is one new `pub async fn` on `Registered` that issues the
+authenticated credential GET, plus one dependency edge that already existed
+transitively. The response is returned as raw JSON and decoded in this crate
+where the shape is tested. See `rust-core/vendor/README.md` and
+`rust-core/vendor/presage/CHANGELOG-VENDOR.md` for the exact change and how to
+re-apply it after an upstream update.
 
 ## Known 1:1 limitations and follow-ups
 

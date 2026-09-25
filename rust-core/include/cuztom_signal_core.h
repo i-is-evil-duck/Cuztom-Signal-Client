@@ -73,6 +73,11 @@ int32_t core_cmd_call_accept(uint64_t call_id);
 int32_t core_cmd_call_hangup(void);
 int32_t core_cmd_call_set_muted(int32_t muted);
 
+/* Fetch today's ZK group auth credentials as raw JSON. Group calls derive a
+ * membership proof from one of these. Returns a malloc'd JSON string to be
+ * released with core_free_string(), or NULL on error. */
+char *core_cmd_group_auth_credentials(void);
+
 /* Deliver an SFU HTTP response that the host performed for RingRTC.
  * RingRTC raises SFU requests as `http_request` events and stalls until this
  * is called with the matching request id. A `status` of 0 reports that the

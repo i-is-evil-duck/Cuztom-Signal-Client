@@ -2977,7 +2977,6 @@ dependencies = [
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=33dd1491130793390e356e15a5711f1e6ca14fdb#33dd1491130793390e356e15a5711f1e6ca14fdb"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2987,6 +2986,7 @@ dependencies = [
  "hex",
  "libsignal-service",
  "rand 0.9.5",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2999,7 +2999,6 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=33dd1491130793390e356e15a5711f1e6ca14fdb#33dd1491130793390e356e15a5711f1e6ca14fdb"
 dependencies = [
  "async-trait",
  "bytes",

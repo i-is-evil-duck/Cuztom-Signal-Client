@@ -927,6 +927,86 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
     }
 
+    /// One server-issued ZK group auth credential.
+    public struct ZkAuthCredential: Sendable, Equatable {
+        /// Base64-encoded `AuthCredentialWithPniResponse` protobuf.
+        public let credential: String
+        public let redemptionTime: UInt64
+
+        public init(credential: String, redemptionTime: UInt64) {
+            self.credential = credential
+            self.redemptionTime = redemptionTime
+        }
+    }
+
+    /// The `GET /v1/certificate/auth/group?zkcCredential=true` response.
+    public struct GroupAuthCredentials: Sendable, Equatable {
+        public let pni: String?
+        public let credentials: [ZkAuthCredential]
+
+        public init(pni: String?, credentials: [ZkAuthCredential]) {
+            self.pni = pni
+            self.credentials = credentials
+        }
+
+        /// The credential valid on `day`.
+        ///
+        /// The server is asked for a *range* of days, so a credential is only
+        /// returned when its redemption day actually falls inside the request.
+        /// Returning the nearest entry instead would let a stale or
+        /// not-yet-valid credential be presented, which the SFU rejects and
+        /// which is hard to diagnose.
+        public func credential(forDay day: UInt64) -> ZkAuthCredential? {
+            credentials.first { $0.redemptionTime / 86_400_000 == day }
+        }
+    }
+
+    /// Fetch the ZK group auth credentials that a group-call membership proof
+    /// is derived from.
+    ///
+    /// Throws when the account is not linked, the sync loop is not running, or
+    /// the response is not the expected shape. No credential is ever
+    /// synthesized: a group call without a real credential cannot be made.
+    public func groupAuthCredentials() async throws -> GroupAuthCredentials {
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            guard let ptr = sym.groupAuthCredentials() else {
+                throw SignalError.network(
+                    "group credential fetch failed: \(Self.lastError(sym))"
+                )
+            }
+            defer { sym.freeString(ptr) }
+            let json = String(cString: ptr)
+            guard let data = json.data(using: .utf8) else {
+                throw SignalError.storage("group credential response was not UTF-8")
+            }
+            return try Self.decodeGroupAuthCredentials(data)
+        }
+    }
+
+    /// Wire shape of the credential response. Kept strict: an unrecognised
+    /// document is rejected rather than partially interpreted.
+    private struct GroupAuthCredentialsPayload: Decodable {
+        struct Entry: Decodable {
+            let credential: String
+            let redemptionTime: UInt64
+        }
+        let pni: String?
+        let credentials: [Entry]
+    }
+
+    static func decodeGroupAuthCredentials(_ data: Data) throws -> GroupAuthCredentials {
+        guard let payload = try? JSONDecoder().decode(GroupAuthCredentialsPayload.self, from: data) else {
+            throw SignalError.storage("group credential response was not understood")
+        }
+        return GroupAuthCredentials(
+            pni: payload.pni,
+            credentials: payload.credentials.map {
+                ZkAuthCredential(credential: $0.credential, redemptionTime: $0.redemptionTime)
+            }
+        )
+    }
+
     /// An SFU request RingRTC raised and handed to the host to perform.
     ///
     /// RingRTC has no HTTP transport in this core, so every SFU request stalls
@@ -1433,6 +1513,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let callHangup: @convention(c) () -> Int32
         let callSetMuted: @convention(c) (Int32) -> Int32
         let httpResponse: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32
+        let groupAuthCredentials: @convention(c) () -> UnsafeMutablePointer<CChar>?
         // Call signaling integration
         let sendCallSignal: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let buildCallOffer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -2051,6 +2132,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cah = dlsym(handle, "core_cmd_call_hangup"),
               let csm = dlsym(handle, "core_cmd_call_set_muted"),
               let chr = dlsym(handle, "core_cmd_http_response"),
+              let cgac = dlsym(handle, "core_cmd_group_auth_credentials"),
               let scs = dlsym(handle, "core_cmd_send_call_signal"),
               let bco = dlsym(handle, "core_cmd_build_call_offer"),
               let bca = dlsym(handle, "core_cmd_build_call_answer"),
@@ -2094,6 +2176,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             callHangup: unsafeBitCast(cah, to: (@convention(c) () -> Int32).self),
             callSetMuted: unsafeBitCast(csm, to: (@convention(c) (Int32) -> Int32).self),
             httpResponse: unsafeBitCast(chr, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
+            groupAuthCredentials: unsafeBitCast(cgac, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             sendCallSignal: unsafeBitCast(scs, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             buildCallOffer: unsafeBitCast(bco, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             buildCallAnswer: unsafeBitCast(bca, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),

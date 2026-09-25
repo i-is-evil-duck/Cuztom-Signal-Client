@@ -62,6 +62,67 @@ impl std::fmt::Display for GroupCallError {
 
 impl std::error::Error for GroupCallError {}
 
+/// Days since the Unix epoch, the addressing Signal uses for credential
+/// redemption.
+pub fn current_redemption_day(now_secs: u64) -> u64 {
+    now_secs / 86_400
+}
+
+/// One server-issued ZK auth credential.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZkAuthCredential {
+    /// Base64-encoded `AuthCredentialWithPniResponse` protobuf.
+    pub credential: String,
+    /// Signal's REST API uses camelCase even though the websocket proto does
+    /// not. Strict on purpose: an unrecognised shape is rejected rather than
+    /// partially interpreted.
+    #[serde(rename = "redemptionTime")]
+    pub redemption_time: u64,
+}
+
+/// The `GET /v1/certificate/auth/group?zkcCredential=true` response.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GroupAuthCredentialsResponse {
+    /// PNI echoed back, when the server sends it. Checked against our own PNI
+    /// by the caller when we have one.
+    #[serde(default)]
+    pub pni: Option<String>,
+    #[serde(default)]
+    pub credentials: Vec<ZkAuthCredential>,
+}
+
+impl GroupAuthCredentialsResponse {
+    /// The credential valid on `day`, if the server sent one.
+    ///
+    /// The window is a range rather than a single day, so a credential is only
+    /// returned when its redemption day actually falls inside it. Picking the
+    /// nearest entry instead would let a stale or not-yet-valid credential be
+    /// presented, which the SFU rejects and which is hard to diagnose.
+    pub fn credential_for_day(&self, day: u64) -> Option<&ZkAuthCredential> {
+        self.credentials.iter().find(|entry| {
+            let entry_day = redemption_day_of(entry.redemption_time);
+            entry_day == day
+        })
+    }
+
+    /// Redemption days present in the response, ascending.
+    pub fn days(&self) -> Vec<u64> {
+        let mut days: Vec<u64> = self
+            .credentials
+            .iter()
+            .map(|entry| redemption_day_of(entry.redemption_time))
+            .collect();
+        days.sort_unstable();
+        days.dedup();
+        days
+    }
+}
+
+/// Signal's `redemptionTime` is milliseconds since the epoch.
+fn redemption_day_of(redemption_time_ms: u64) -> u64 {
+    redemption_time_ms / 86_400_000
+}
+
 /// The ZK identity a group call is made with, derived from the group master key.
 pub struct GroupCallIdentity {
     secret_params: GroupSecretParams,
@@ -235,5 +296,84 @@ mod tests {
     fn hex_encoding_is_lowercase_and_padded() {
         assert_eq!(hex_encode(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
         assert_eq!(hex_encode(&[]), "");
+    }
+
+    // ---- credential response decoding ----
+
+    const DAY_MS: u64 = 86_400_000;
+
+    fn response_json(entries: &[(u64, &str)]) -> String {
+        let items: Vec<String> = entries
+            .iter()
+            .map(|(redemption_time, credential)| {
+                format!(r#"{{"credential":"{credential}","redemptionTime":{redemption_time}}}"#)
+            })
+            .collect();
+        format!(
+            r#"{{"pni":"PNI:abc","credentials":[{}],"callLinkAuthCredentials":[]}}"#,
+            items.join(",")
+        )
+    }
+
+    #[test]
+    fn decodes_a_credential_response() {
+        let day = 19_000u64;
+        let json = response_json(&[(day * DAY_MS, "QUJD")]);
+        let parsed: GroupAuthCredentialsResponse =
+            serde_json::from_str(&json).expect("valid credential response");
+        assert_eq!(parsed.pni.as_deref(), Some("PNI:abc"));
+        assert_eq!(parsed.credentials.len(), 1);
+        assert_eq!(parsed.credential_for_day(day).map(|c| c.credential.as_str()), Some("QUJD"));
+        assert_eq!(parsed.days(), vec![day]);
+    }
+
+    #[test]
+    fn a_day_without_a_credential_yields_none() {
+        let day = 19_000u64;
+        let json = response_json(&[(day * DAY_MS, "QUJD")]);
+        let parsed: GroupAuthCredentialsResponse = serde_json::from_str(&json).expect("valid");
+        // A neighbouring day must not borrow tomorrow's credential.
+        assert!(parsed.credential_for_day(day + 1).is_none());
+        assert!(parsed.credential_for_day(day - 1).is_none());
+    }
+
+    #[test]
+    fn redemption_time_is_read_as_milliseconds() {
+        // If milliseconds were treated as seconds the day would be off by 1000x.
+        let day = 19_000u64;
+        let parsed: GroupAuthCredentialsResponse =
+            serde_json::from_str(&response_json(&[(day * DAY_MS, "QUJD")])).expect("valid");
+        assert_eq!(parsed.days(), vec![day]);
+    }
+
+    #[test]
+    fn tolerates_a_response_with_no_credentials() {
+        let parsed: GroupAuthCredentialsResponse =
+            serde_json::from_str(r#"{"credentials":[]}"#).expect("valid");
+        assert!(parsed.credential_for_day(19_000).is_none());
+        assert!(parsed.days().is_empty());
+        assert!(parsed.pni.is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_responses() {
+        for bad in [
+            "",
+            "not json",
+            r#"{"credentials":{}}"#,
+            r#"{"credentials":[{"credential":123}]}"#,
+            r#"{"credentials":[{"credential":"QUJD"}]}"#, // missing redemptionTime
+        ] {
+            assert!(
+                serde_json::from_str::<GroupAuthCredentialsResponse>(bad).is_err(),
+                "expected {bad} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn current_day_matches_wall_clock_math() {
+        assert_eq!(current_redemption_day(0), 0);
+        assert_eq!(current_redemption_day(DAY_MS * 2 / 1000), 2);
     }
 }

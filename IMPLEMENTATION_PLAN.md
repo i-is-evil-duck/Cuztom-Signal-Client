@@ -34,10 +34,10 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 97/97 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 103/103 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
-| `cargo test --all-targets` | 11/11 passed |
+| `cargo test --all-targets` | 23/23 passed |
 | `cargo check --all-targets` | Passed with warnings |
 | `cargo build --release` | Passed with warnings |
 | `cargo clippy --all-targets -- -D warnings` | Not run: Clippy component unavailable |

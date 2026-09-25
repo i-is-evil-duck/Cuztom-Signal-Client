@@ -274,6 +274,10 @@ enum Command {
         body: Vec<u8>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Fetch ZK group auth credentials for the current day, as raw JSON.
+    GroupAuthCredentials {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -425,6 +429,13 @@ enum LoopCtrl {
         call_id: String,
         reason: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Fetch ZK group auth credentials, as raw JSON. Issued through the loop
+    /// because it is the loop that owns the live manager.
+    GroupAuthCredentials {
+        start_day: u64,
+        end_day: u64,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     // Call signaling integration
     SendCallSignal {
@@ -836,6 +847,10 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::HttpResponse { request_id, status, body, reply } => {
                             let result = cmd_http_response(&state, request_id, status, body);
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupAuthCredentials { reply } => {
+                            let result = cmd_group_auth_credentials(&state).await;
                             let _ = reply.send(result);
                         }
                         Command::Logout { reply } => {
@@ -1270,6 +1285,16 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(LoopCtrl::SendCallHangup { call_id, reason, reply }) => {
                                     let r = send_call_hangup_inner(&mut manager, &call_id, &reason).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::GroupAuthCredentials { start_day, end_day, reply }) => {
+                                    // The loop owns the live manager, so the
+                                    // authenticated credential request has to
+                                    // happen here.
+                                    let r = manager
+                                        .group_auth_credentials_raw(start_day, end_day)
+                                        .await
+                                        .map_err(|e| e.to_string());
                                     let _ = reply.send(r);
                                 }
                                 // Call signaling integration
@@ -2049,6 +2074,37 @@ fn cmd_http_response(
         return Err("not linked".to_string());
     }
     call::deliver_http_response(request_id, status, body)
+}
+
+/// Fetch the ZK group auth credentials that a group-call membership proof is
+/// derived from, as raw JSON.
+///
+/// Routed through the sync loop because that is where the live manager lives:
+/// once the loop is running, `LinkedState.manager` is `None`. The body is
+/// returned unparsed on purpose, so the caller decodes it where that shape is
+/// tested, and the vendored presage patch stays a single authenticated GET.
+async fn cmd_group_auth_credentials(state: &WorkerState) -> Result<String, String> {
+    let sender = match state {
+        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
+            Some(sender) => sender,
+            None => return Err("sync loop is not running".to_string()),
+        },
+        _ => return Err("not linked".to_string()),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let day = group_calls::current_redemption_day(now);
+    // Ask for today and tomorrow: the server decides which days are issued, and
+    // a credential only becomes usable as its day arrives.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    send_sync_ctrl_wait(
+        sender,
+        LoopCtrl::GroupAuthCredentials { start_day: day, end_day: day + 1, reply: reply_tx },
+    )
+    .await?;
+    reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
 }
 
 /// Legacy SDP-shaped command retained for source compatibility. New clients
@@ -3084,6 +3140,28 @@ pub extern "C" fn core_cmd_call_set_muted(muted: i32) -> i32 {
     match roundtrip(|reply| Command::CallSetMuted { muted: muted != 0, reply }) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Fetch today's ZK group auth credentials as raw JSON.
+///
+/// Group calls need one of these to derive a membership proof. Returns a
+/// JSON document; the caller decodes it. Fails when the account is not linked
+/// or the sync loop is not running, since the loop owns the live manager.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_auth_credentials() -> *mut c_char {
+    match roundtrip(|reply| Command::GroupAuthCredentials { reply }) {
+        Ok(Ok(json)) => match std::ffi::CString::new(json) {
+            Ok(value) => value.into_raw(),
+            Err(_) => {
+                set_last_error("credential response was not valid UTF-8".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            std::ptr::null_mut()
+        }
     }
 }
 
