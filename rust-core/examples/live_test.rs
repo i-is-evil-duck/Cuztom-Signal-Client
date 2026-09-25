@@ -18,7 +18,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use cuztom_signal_core::{
-    core_cmd_delete_local, core_cmd_fetch_attachment, core_cmd_init, core_cmd_is_linked,
+    core_cmd_delete_local, core_cmd_fetch_attachment, core_cmd_init_encrypted, core_cmd_is_linked,
     core_cmd_profile, core_cmd_request_contacts, core_cmd_roster, core_cmd_send,
     core_cmd_send_attachment, core_cmd_send_delete, core_cmd_send_reaction, core_cmd_thread,
     core_cmd_whoami, core_free_string, core_last_error,
@@ -73,7 +73,9 @@ fn main() {
         usage();
     }
 
-    let rc = unsafe { core_cmd_init(cstr(&db).as_ptr()) };
+    let passphrase = std::env::var("CUZTOM_SIGNAL_CORE_PASSPHRASE")
+        .expect("set CUZTOM_SIGNAL_CORE_PASSPHRASE to the Keychain native-store key");
+    let rc = unsafe { core_cmd_init_encrypted(cstr(&db).as_ptr(), cstr(&passphrase).as_ptr()) };
     if rc < 0 {
         eprintln!("init failed: {}", err());
         std::process::exit(1);

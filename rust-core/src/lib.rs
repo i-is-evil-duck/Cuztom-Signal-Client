@@ -7,7 +7,7 @@
 //!
 //! C ABI (Swift `RustCoreService` resolves these with `dlsym`):
 //!   `core_abi_version() -> u32`          ABI gate before symbol use
-//!   `core_cmd_init(db_path) -> i32`      1 linked, 0 fresh, -1 error
+//!   `core_cmd_init_encrypted(db_path, passphrase) -> i32`  1 linked, 0 fresh, -1 error
 //!   `core_cmd_begin_link(name) -> *mut c_char`  provisioning URL (free with
 //!                                        `core_free_string`), null on error
 //!   `core_cmd_poll_link() -> i32`        1 linked, 0 pending, -1 failed
@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use base64::Engine as _;
 
 use presage::libsignal_service::configuration::SignalServers;
-use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::store::StateStore;
 use presage::Manager;
@@ -41,6 +40,8 @@ use sync::{
 
 mod groups;
 
+mod encrypted_store;
+
 mod call;
 
 use libsignal_service::proto::CallMessage as ProtoCallMessage;
@@ -48,6 +49,7 @@ use libsignal_service::proto::CallMessage as ProtoCallMessage;
 enum Command {
     Init {
         db_path: String,
+        passphrase: String,
         reply: oneshot::Sender<Result<bool, String>>,
     },
     BeginLink {
@@ -484,12 +486,19 @@ enum PollLink {
 enum WorkerState {
     Fresh,
     Ready { store: SqliteStore, db_path: String },
-    Linking { task: tokio::task::JoinHandle<Result<StoredManager, String>>, db_path: String },
+    Linking {
+        task: tokio::task::JoinHandle<Result<StoredManager, String>>,
+        store: SqliteStore,
+        db_path: String,
+    },
     Linked(Box<LinkedState>),
 }
 
 struct LinkedState {
     db_path: String,
+    /// Keep the encrypted store alive so all later offline/reconnect paths do
+    /// not retain or reopen the raw passphrase.
+    store: SqliteStore,
     /// Live manager handle. `None` once the sync loop owns it.
     manager: Option<StoredManager>,
     /// Control plane into the sync loop, if running.
@@ -502,9 +511,10 @@ struct LinkedState {
 }
 
 impl LinkedState {
-    fn new(db_path: String, manager: StoredManager) -> Self {
+    fn new(db_path: String, store: SqliteStore, manager: StoredManager) -> Self {
         Self {
             db_path,
+            store,
             manager: Some(manager),
             ctrl: None,
             events: None,
@@ -513,9 +523,7 @@ impl LinkedState {
     }
 
     async fn open_store(&self) -> Result<SqliteStore, String> {
-        SqliteStore::open(&self.db_path, OnNewIdentity::Trust)
-            .await
-            .map_err(|e| format!("open store: {e}"))
+        Ok(self.store.clone())
     }
 }
 
@@ -556,7 +564,7 @@ fn set_last_error(msg: String) {
 
 fn core_handle() -> Result<&'static Core, String> {
     CORE.get()
-        .ok_or_else(|| "core not initialized (call core_cmd_init first)".to_string())
+        .ok_or_else(|| "core not initialized (call core_cmd_init_encrypted first)".to_string())
 }
 
 /// Blocking request/response round-trip from any (non-Tokio) thread.
@@ -594,8 +602,8 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                 let mut state = WorkerState::Fresh;
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        Command::Init { db_path, reply } => {
-                            let result = init_state(&mut state, &db_path).await;
+                        Command::Init { db_path, passphrase, reply } => {
+                            let result = init_state(&mut state, &db_path, &passphrase).await;
                             let _ = reply.send(result);
                         }
                         Command::BeginLink { device_name, reply } => {
@@ -822,7 +830,11 @@ fn same_db_path(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
-async fn init_state(state: &mut WorkerState, db_path: &str) -> Result<bool, String> {
+async fn init_state(
+    state: &mut WorkerState,
+    db_path: &str,
+    passphrase: &str,
+) -> Result<bool, String> {
     match state {
         WorkerState::Linked(linked) if same_db_path(&linked.db_path, db_path) => {
             return Ok(true);
@@ -853,21 +865,18 @@ async fn init_state(state: &mut WorkerState, db_path: &str) -> Result<bool, Stri
             std::fs::create_dir_all(parent).map_err(|e| format!("db dir: {e}"))?;
         }
     }
-    // No passphrase in M1 (Keychain-backed passphrase lands with M2 storage
-    // hardening); same trust policy as `presage-cli`.
-    let store = SqliteStore::open(db_path, OnNewIdentity::Trust)
-        .await
-        .map_err(|e| format!("open store: {e}"))?;
-    match Manager::load_registered(store).await {
+    let store = encrypted_store::open_encrypted(db_path, passphrase).await?;
+    match Manager::load_registered(store.clone()).await {
         Ok(manager) => {
             set_active_db_path(db_path);
-            *state = WorkerState::Linked(Box::new(LinkedState::new(db_path.to_string(), manager)));
+            *state = WorkerState::Linked(Box::new(LinkedState::new(
+                db_path.to_string(),
+                store,
+                manager,
+            )));
             Ok(true)
         }
         Err(presage::Error::NotYetRegisteredError) => {
-            let store = SqliteStore::open(db_path, OnNewIdentity::Trust)
-                .await
-                .map_err(|e| format!("reopen store: {e}"))?;
             set_active_db_path(db_path);
             *state = WorkerState::Ready { store, db_path: db_path.to_string() };
             Ok(false)
@@ -882,10 +891,10 @@ async fn begin_link(state: &mut WorkerState, device_name: &str) -> Result<String
     let (store, db_path) = match std::mem::replace(state, WorkerState::Fresh) {
         WorkerState::Ready { store, db_path } => (store, db_path),
         WorkerState::Fresh => {
-            return Err("no store: call core_cmd_init first".to_string());
+            return Err("no store: call core_cmd_init_encrypted first".to_string());
         }
-        WorkerState::Linking { task, db_path } => {
-            *state = WorkerState::Linking { task, db_path };
+        WorkerState::Linking { task, store, db_path } => {
+            *state = WorkerState::Linking { task, store, db_path };
             return Err("link already in progress".to_string());
         }
         WorkerState::Linked(linked) => {
@@ -896,12 +905,13 @@ async fn begin_link(state: &mut WorkerState, device_name: &str) -> Result<String
 
     let (url_tx, url_rx) = futures::channel::oneshot::channel();
     let name = device_name.to_string();
+    let link_store = store.clone();
     let task = tokio::task::spawn_local(async move {
-        Manager::link_secondary_device(store, SignalServers::Production, name, url_tx)
+        Manager::link_secondary_device(link_store, SignalServers::Production, name, url_tx)
             .await
             .map_err(|e| format!("link: {e}"))
     });
-    *state = WorkerState::Linking { task, db_path };
+    *state = WorkerState::Linking { task, store, db_path };
 
     // The provisioning URL arrives as soon as the server side is ready —
     // well before the user scans. 90s covers slow networks; the phone scan
@@ -914,8 +924,8 @@ async fn begin_link(state: &mut WorkerState, device_name: &str) -> Result<String
 }
 
 async fn poll_link(state: &mut WorkerState) -> PollLink {
-    let (task, db_path) = match std::mem::replace(state, WorkerState::Fresh) {
-        WorkerState::Linking { task, db_path } => (task, db_path),
+    let (task, store, db_path) = match std::mem::replace(state, WorkerState::Fresh) {
+        WorkerState::Linking { task, store, db_path } => (task, store, db_path),
         other => {
             let linked = matches!(other, WorkerState::Linked(_));
             *state = other;
@@ -923,22 +933,20 @@ async fn poll_link(state: &mut WorkerState) -> PollLink {
         }
     };
     if !task.is_finished() {
-        *state = WorkerState::Linking { task, db_path };
+        *state = WorkerState::Linking { task, store, db_path };
         return PollLink::Pending;
     }
     match task.await {
         Ok(Ok(manager)) => {
-            *state = WorkerState::Linked(Box::new(LinkedState::new(db_path, manager)));
+            *state = WorkerState::Linked(Box::new(LinkedState::new(db_path, store, manager)));
             PollLink::Linked
         }
         Ok(Err(e)) => {
-            // Registration was cleared when linking started; go back to Ready
-            // would need the store (moved into the task). Fresh forces re-init.
-            *state = WorkerState::Fresh;
+            *state = WorkerState::Ready { store, db_path };
             PollLink::Failed(e)
         }
         Err(join) => {
-            *state = WorkerState::Fresh;
+            *state = WorkerState::Ready { store, db_path };
             PollLink::Failed(format!("link task panicked: {join}"))
         }
     }
@@ -1012,11 +1020,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
     }
     linked.events = None;
     linked.sync_alive.store(false, Ordering::Release);
-    let db_path = linked.db_path.clone();
-
-    let store = SqliteStore::open(&db_path, OnNewIdentity::Trust)
-        .await
-        .map_err(|e| format!("open store: {e}"))?;
+    let store = linked.store.clone();
     let reg = store
         .load_registration_data()
         .await
@@ -1449,9 +1453,10 @@ async fn cmd_logout(state: &mut WorkerState) -> Result<(), String> {
         }
         _ => return Err("not linked".to_string()),
     };
-    let mut store = SqliteStore::open(&db_path, OnNewIdentity::Trust)
-        .await
-        .map_err(|e| format!("open store: {e}"))?;
+    let mut store = match state {
+        WorkerState::Linked(linked) => linked.store.clone(),
+        _ => return Err("not linked".to_string()),
+    };
     store
         .clear_registration()
         .await
@@ -1474,7 +1479,7 @@ async fn cmd_wipe(state: &mut WorkerState) -> Result<(), String> {
             }
         }
         WorkerState::Ready { db_path, .. } => db_path.clone(),
-        WorkerState::Linking { task, db_path } => {
+        WorkerState::Linking { task, db_path, .. } => {
             task.abort();
             let _ = task.await;
             db_path.clone()
@@ -2291,7 +2296,7 @@ async fn cmd_fetch_attachment(
 // ---- C ABI ----
 
 /// ABI version consumed by the Swift loader before any other symbol is used.
-pub const CORE_ABI_VERSION: u32 = 1;
+pub const CORE_ABI_VERSION: u32 = 2;
 
 #[no_mangle]
 pub extern "C" fn core_abi_version() -> u32 {
@@ -2309,22 +2314,56 @@ fn c_str_arg(ptr: *const c_char, what: &str) -> Result<String, String> {
 }
 
 /// 1 linked, 0 fresh, -1 error (see `core_last_error`).
+///
+/// The Keychain-backed initializer is `core_cmd_init_encrypted`; this legacy
+/// symbol is retained only as a fail-closed migration guard for old callers.
 #[no_mangle]
 pub extern "C" fn core_cmd_init(db_path: *const c_char) -> i32 {
+    if let Err(error) = c_str_arg(db_path, "db_path") {
+        set_last_error(error);
+    } else {
+        set_last_error(
+            "plaintext core_cmd_init is disabled; use core_cmd_init_encrypted".to_string(),
+        );
+    }
+    -1
+}
+
+/// 1 linked, 0 fresh, -1 error (see `core_last_error`).
+#[no_mangle]
+pub extern "C" fn core_cmd_init_encrypted(
+    db_path: *const c_char,
+    passphrase: *const c_char,
+) -> i32 {
     let path = match c_str_arg(db_path, "db_path") {
-        Ok(p) => p,
-        Err(e) => {
-            set_last_error(e);
+        Ok(path) => path,
+        Err(error) => {
+            set_last_error(error);
+            return -1;
+        }
+    };
+    let passphrase = match c_str_arg(passphrase, "passphrase") {
+        Ok(passphrase) if !passphrase.is_empty() => passphrase,
+        Ok(_) => {
+            set_last_error("passphrase: empty".to_string());
+            return -1;
+        }
+        Err(error) => {
+            set_last_error(error);
             return -1;
         }
     };
     let core = CORE.get_or_init(|| Core { cmd_tx: spawn_worker() });
     let _ = core;
-    match roundtrip(|reply| Command::Init { db_path: path, reply }) {
+    match roundtrip(|reply| Command::Init {
+        db_path: path,
+        passphrase,
+        reply,
+    }) {
         Ok(Ok(true)) => 1,
         Ok(Ok(false)) => 0,
-        Ok(Err(e)) | Err(e) => {
-            set_last_error(e);
+        Ok(Err(error)) | Err(error) => {
+            set_last_error(error);
             -1
         }
     }
@@ -3275,12 +3314,14 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
+        assert_eq!(core_abi_version(), 2);
         assert_eq!(core_abi_version(), CORE_ABI_VERSION);
     }
 
     #[test]
     fn null_args_fail_loudly() {
         assert_eq!(core_cmd_init(std::ptr::null()), -1);
+        assert_eq!(core_cmd_init_encrypted(std::ptr::null(), std::ptr::null()), -1);
         assert!(!core_last_error().is_null());
         assert!(core_cmd_begin_link(std::ptr::null()).is_null());
         // The worker is process-wide and may already have been initialized by
@@ -3293,8 +3334,10 @@ mod tests {
     fn init_rejects_bad_db_dir() {
         // /proc is not writable: open must fail instead of hanging.
         let raw = CString::new("/proc/nope/signal.db").unwrap().into_raw();
-        assert_eq!(core_cmd_init(raw), -1);
+        let key = CString::new("test-passphrase").unwrap().into_raw();
+        assert_eq!(core_cmd_init_encrypted(raw, key), -1);
         core_free_string(raw);
+        core_free_string(key);
     }
 
     #[test]
@@ -3302,8 +3345,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cuztom-test-{}", std::process::id()));
         let db = dir.join("signal.db");
         let raw = CString::new(db.to_string_lossy().into_owned()).unwrap().into_raw();
-        assert_eq!(core_cmd_init(raw), 0);
+        let key = CString::new("test-passphrase").unwrap().into_raw();
+        assert_eq!(core_cmd_init_encrypted(raw, key), 0);
         core_free_string(raw);
+        core_free_string(key);
         assert_eq!(core_cmd_is_linked(), 1 - 1); // 0: fresh store, not linked
         assert_eq!(core_cmd_poll_link(), 0); // nothing in flight -> pending/idle
         // Roster + whoami on a fresh store fail loudly (not linked).

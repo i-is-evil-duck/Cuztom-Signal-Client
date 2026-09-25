@@ -123,10 +123,11 @@ private let rosterFixture = """
     try Data([0x01]).write(to: file)
 
     let service = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
-    service.bindLocalPath(thread: "contact:x", ts: 42, index: 0, path: file.path)
+    let thread = "contact:outside-\(UUID().uuidString)"
+    service.bindLocalPath(thread: thread, ts: 42, index: 0, path: file.path)
     let json = """
     {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],"messages":[{
-      "key":"contact:x/42/x","thread":"contact:x","sender":"x","sender_name":"X",
+      "key":"\(thread)/42/x","thread":"\(thread)","sender":"x","sender_name":"X",
       "body":"file","ts":42,"sts":42,"outgoing":false,
       "attachments":[{"name":"outside.jpg","mime":"image/jpeg","size":1,"path":null}]
     }]}

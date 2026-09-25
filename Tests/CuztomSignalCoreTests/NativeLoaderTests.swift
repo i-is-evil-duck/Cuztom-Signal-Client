@@ -10,5 +10,5 @@ import Testing
         + "/rust-core/target/debug/libcuztom_signal_core.dylib"
     #expect(!paths.contains(inferredRelease))
     #expect(!paths.contains(inferredDebug))
-    #expect(RustCoreService.expectedNativeABI == 1)
+    #expect(RustCoreService.expectedNativeABI == 2)
 }

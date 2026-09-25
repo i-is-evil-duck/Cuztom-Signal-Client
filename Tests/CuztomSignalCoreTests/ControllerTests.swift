@@ -143,12 +143,21 @@ import Testing
         .appendingPathComponent("cuztom-swift-test-\(ProcessInfo.processInfo.processIdentifier)")
     let db = dir.appendingPathComponent("signal.db").path
     let svc = RustCoreService(dbPath: db)
-    guard svc.loadLibrary() else { return }
+    let nativeRequired = ProcessInfo.processInfo.environment["CUZTOM_SIGNAL_CORE_PATH"] != nil
+    if nativeRequired {
+        #expect(svc.loadLibrary())
+    } else {
+        guard svc.loadLibrary() else { return }
+    }
     #expect(svc.isLibraryLoaded)
     let linked = try await svc.isLinkedAccount()
     #expect(!linked) // fresh temp store
     let again = try await svc.isLinkedAccount()
     #expect(!again) // init is idempotent
+    let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: db))
+    defer { try? handle.close() }
+    let header = try handle.read(upToCount: 16) ?? Data()
+    #expect(header != Data([0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00]))
     try? FileManager.default.removeItem(at: dir)
 }
 

@@ -141,7 +141,8 @@ struct LiveEvent: Decodable {
 /// M1: `SignalService` backed by `rust-core/` (`presage` Manager) over C FFI.
 ///
 /// Expected C ABI (see `rust-core/src/lib.rs`):
-///   `core_cmd_init(db_path) -> i32`   1 linked, 0 fresh, -1 error
+///   `core_cmd_init_encrypted(db_path, passphrase) -> i32`
+///       1 linked, 0 fresh, -1 error; ABI 2
 ///   `core_cmd_begin_link(name) -> *mut c_char` (free with `core_free_string`)
 ///   `core_cmd_poll_link() -> i32`     1 linked, 0 pending, -1 failed
 ///   `core_cmd_is_linked() -> i32`     1 / 0
@@ -154,9 +155,10 @@ struct LiveEvent: Decodable {
 /// The library is loaded lazily with `dlopen` so the Swift package still
 /// builds/tests on machines without Rust.
 public final class RustCoreService: SignalService, @unchecked Sendable {
-    public static let expectedNativeABI: UInt32 = 1
+    public static let expectedNativeABI: UInt32 = 2
     private static let dylibEnvironmentKey = "CUZTOM_SIGNAL_CORE_PATH"
     private static let dylibHashInfoKey = "CuztomSignalCoreSHA256"
+    private static let nativeStoreKeychainAccount = "native.signal.sqlcipher.passphrase.v2"
 
     private let stateContinuation: AsyncStream<ConnectionState>.Continuation
     public let connectionState: AsyncStream<ConnectionState>
@@ -168,6 +170,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     public private(set) var libraryPath: String?
     private let explicitPath: String?
     private let dbPath: String
+    private let initLock = NSLock()
     private var didInit = false
     private var linked = false
     /// Own ACI (resolved after linking via whoami) for identifying our own messages.
@@ -974,6 +977,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             .appendingPathComponent("CuztomSignal", isDirectory: true)
         if let cachesRoot { try removeIfPresent(cachesRoot) }
         try removeIfPresent(uuidCacheURL)
+        #if canImport(Security)
+        // The key is account-bound to the wiped native store. Delete it only
+        // after the database wipe and all Swift cache removal succeeded.
+        try KeychainSecretStore().deleteStrict(key: Self.nativeStoreKeychainAccount)
+        #endif
 
         didInit = false
         linked = false
@@ -995,7 +1003,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     private struct Symbols {
         let abiVersion: @convention(c) () -> UInt32
-        let initCore: @convention(c) (UnsafePointer<CChar>) -> Int32
+        let initEncrypted: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let beginLink: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let pollLink: @convention(c) () -> Int32
         let isLinked: @convention(c) () -> Int32
@@ -1382,16 +1390,79 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         guard let sym = Self.resolve(in: handle) else {
             throw SignalError.crypto("rust core dylib missing expected symbols (rebuild rust-core/)")
         }
+
+        // The lock is held by a synchronous helper; Swift 6 forbids
+        // NSLock.lock() directly from an async function.
+        let rc = try initializeCoreIfNeeded(sym)
+        if rc < 0 { throw SignalError.storage("core init failed: \(lastError(sym))") }
         if !didInit {
-            let rc: Int32 = dbPath.withCString { sym.initCore($0) }
-            if rc < 0 { throw SignalError.storage("core init failed: \(lastError(sym))") }
             didInit = true
             linked = (rc == 1)
-            Self.protectFile(at: dbPath)
-            Self.protectFile(at: dbPath + "-wal")
-            Self.protectFile(at: dbPath + "-shm")
         }
         return sym
+    }
+
+    private func initializeCoreIfNeeded(_ sym: Symbols) throws -> Int32 {
+        initLock.lock()
+        defer { initLock.unlock() }
+        if didInit { return linked ? 1 : 0 }
+
+        #if canImport(Security)
+        let keychain = KeychainSecretStore()
+        let keyData: Data
+        do {
+            if let existing = try keychain.loadStrict(key: Self.nativeStoreKeychainAccount) {
+                guard existing.count == 32 else {
+                    throw SignalError.storage("native database key has an invalid length")
+                }
+                keyData = existing
+            } else {
+                // Never create replacement material for an existing
+                // encrypted/unknown database. That would make recovery
+                // impossible and could silently strand an account.
+                guard Self.canCreateNativeDatabaseKey(at: dbPath) else {
+                    throw SignalError.storage(
+                        "native database key is missing for an existing database; restore Keychain access before relinking"
+                    )
+                }
+                keyData = try keychain.loadOrCreateRandom(
+                    key: Self.nativeStoreKeychainAccount,
+                    count: 32
+                )
+            }
+        } catch let error as SignalError {
+            throw error
+        } catch {
+            throw SignalError.storage("native database keychain: \(error)")
+        }
+        let passphrase = keyData.base64EncodedString()
+        let rc: Int32 = dbPath.withCString { dbPointer in
+            passphrase.withCString { keyPointer in
+                sym.initEncrypted(dbPointer, keyPointer)
+            }
+        }
+        if rc < 0 { throw SignalError.storage("core init failed: \(lastError(sym))") }
+        didInit = true
+        linked = (rc == 1)
+        Self.protectFile(at: dbPath)
+        Self.protectFile(at: dbPath + "-wal")
+        Self.protectFile(at: dbPath + "-shm")
+        return rc
+        #else
+        throw SignalError.unsupported("SQLCipher requires macOS Security/Keychain support")
+        #endif
+    }
+
+    private static func canCreateNativeDatabaseKey(at path: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: path) else { return true }
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return false
+        }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 16), header.count == 16 else {
+            return false
+        }
+        return header == Data([0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00])
     }
 
     private func isLinkedNow() -> Bool {
@@ -1449,7 +1520,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         #if canImport(Darwin)
         let wp = dlsym(handle, "core_cmd_wipe")
         guard let abi = dlsym(handle, "core_abi_version"),
-              let i = dlsym(handle, "core_cmd_init"),
+              let i = dlsym(handle, "core_cmd_init_encrypted"),
               let b = dlsym(handle, "core_cmd_begin_link"),
               let p = dlsym(handle, "core_cmd_poll_link"),
               let l = dlsym(handle, "core_cmd_is_linked"),
@@ -1491,7 +1562,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let f = dlsym(handle, "core_free_string") else { return nil }
         return Symbols(
             abiVersion: unsafeBitCast(abi, to: (@convention(c) () -> UInt32).self),
-            initCore: unsafeBitCast(i, to: (@convention(c) (UnsafePointer<CChar>) -> Int32).self),
+            initEncrypted: unsafeBitCast(i, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             beginLink: unsafeBitCast(b, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             pollLink: unsafeBitCast(p, to: (@convention(c) () -> Int32).self),
             isLinked: unsafeBitCast(l, to: (@convention(c) () -> Int32).self),

@@ -10,14 +10,12 @@ DerivedData/
 # SwiftPM
 .build/
 .swiftpm/
-Package.resolved
 
 # Local app bundle (built via swift build, ad-hoc signed)
 *.app/
 
 # Rust
 rust-core/target/
-rust-core/Cargo.lock
 **/*.rs.bk
 
 # App data / secrets (never commit)

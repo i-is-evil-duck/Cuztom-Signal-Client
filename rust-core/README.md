@@ -36,9 +36,10 @@ HTTP/membership-proof path are not complete.
 
 ## Prerequisites
 
-Verified on macOS arm64:
+Verified on macOS 14+ arm64:
 
-- Rust stable toolchain (the current verification used Rust 1.98.1).
+- Rust stable toolchain (the current verification used Rust 1.98.1; the
+  repository pins it in `rust-toolchain.toml`).
 - Full Xcode for the Swift app/tests.
 - `protoc` for the libsignal/SPQR build scripts (`brew install protobuf`).
 - Network access for the Git/prebuilt-WebRTC dependencies on the first build.
@@ -64,6 +65,9 @@ cd rust-core
 PATH="$PWD/scripts:$PATH" cargo check
 PATH="$PWD/scripts:$PATH" cargo test --lib
 PATH="$PWD/scripts:$PATH" cargo build --release
+# Native live-test commands also need the Keychain passphrase:
+CUZTOM_SIGNAL_CORE_PASSPHRASE='<keychain-base64>' PATH="$PWD/scripts:$PATH" \
+  cargo run --example live_test -- '<db>' whoami
 ```
 
 The release library is written to:
@@ -89,10 +93,13 @@ and user databases are intentionally not committed.
 
 ## Main C ABI surface
 
-The exact declarations are in `src/lib.rs`; the important groups are:
+The versioned declarations are in `include/cuztom_signal_core.h`; the Rust
+source remains the implementation source of truth. Run
+`scripts/check-ffi-parity.sh` after changing the ABI. The important groups are:
 
-- ABI gate: `core_abi_version` is checked before any other symbol is resolved.
-- Session/sync: `core_cmd_init`, `core_cmd_begin_link`,
+- ABI gate: `core_abi_version` is checked before any other symbol is resolved;
+  the current ABI is 2.
+- Session/sync: `core_cmd_init_encrypted`, `core_cmd_begin_link`,
   `core_cmd_poll_link`, `core_cmd_is_linked`, `core_cmd_roster`,
   `core_cmd_thread`, `core_cmd_whoami`, `core_cmd_request_contacts`,
   `core_cmd_start_sync`, `core_cmd_poll_event`, `core_cmd_logout`, and the
@@ -123,6 +130,13 @@ The Rust/Signal store is at:
 ~/Library/Application Support/CuztomSignal/signal.db
 ```
 
+The native store is SQLCipher-encrypted with a device-only Keychain passphrase.
+On first launch after upgrading, a recognized legacy plaintext Presage store
+is validated, exported to a private staging file, checked for SQLCipher
+integrity, and atomically replaced. Existing encrypted/unknown files fail
+closed; no plaintext fallback is attempted. The live-test harness requires
+`CUZTOM_SIGNAL_CORE_PASSPHRASE` to use the same Keychain value.
+
 Downloaded media is stored below:
 
 ```text
@@ -135,7 +149,8 @@ and downloaded media. User data and the local app bundle are gitignored.
 ## Verification status
 
 - `cargo check`: passed.
-- `cargo test --lib`: 9 tests passed.
+- `cargo test --lib`: 10 tests passed, including SQLCipher migration and
+  wrong-key rejection.
 - `cargo build --release`: passed.
 - Full Xcode `swift test`: 52 tests passed.
 - Manual verification: fresh QR link/resume, contacts/groups, name resolution,

@@ -37,7 +37,7 @@ The following checks were run during the latest review:
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 52/52 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
-| `cargo test --all-targets` | 9/9 passed |
+| `cargo test --all-targets` | 10/10 passed |
 | `cargo check --all-targets` | Passed with warnings |
 | `cargo build --release` | Passed with warnings |
 | `cargo clippy --all-targets -- -D warnings` | Not run: Clippy component unavailable |
@@ -191,18 +191,24 @@ identity/master/account key material from the underlying store.
 Keychain with `ThisDeviceOnly` accessibility, protect cache files, and add a
 verified full native key wipe.
 
-**Status:** Keychain values now use `WhenUnlockedThisDeviceOnly`, and the
-Swift/native databases, path maps, and sent-media cache receive complete file
-protection. SQLCipher/passphrase-backed database encryption and migration are
-still pending.
+**Status:** The native store now opens through SQLCipher using a 32-byte
+Keychain-backed passphrase, and recognized legacy plaintext stores are migrated
+through a validated, atomic SQLCipher export. Native identity changes use
+`OnNewIdentity::Reject`; unknown-identity TOFU behavior and a safety-number
+approval workflow remain pending upstream work. Swift presentation SQLite,
+full key-material wipe verification, and encrypted attachment bodies remain
+pending.
 
 #### P1-2: Unknown/changed identities are trusted automatically
 
-All native stores use `OnNewIdentity::Trust`, and there is no safety-number or
+The native store now rejects a changed key, but the pinned Presage SQLite
+implementation still accepts first-seen identities by TOFU and does not expose
+the candidate key or a challenge event. There is no safety-number or
 identity-change confirmation UI.
 
-**Required fix:** Reject changed identities until explicitly verified and
-add a safety-number/identity-change workflow.
+**Required fix:** Add a protocol-store challenge/approval layer that captures
+unknown and changed candidates, exposes safety numbers, and atomically approves
+or rejects them without bypassing the encrypted store.
 
 #### P1-3: The dylib loader trusts writable paths
 
@@ -304,6 +310,10 @@ and quotas remain part of the broader cache work.
       attachment-cache quota.
 - [x] Apply complete file protection to presentation/native data and use
       device-only Keychain accessibility for secrets.
+- [x] Add ABI-v2 `core_cmd_init_encrypted`, strict Keychain key loading, and
+      validated SQLCipher migration for recognized legacy native stores.
+- [ ] Block first-seen identities and add a safety-number challenge/approval
+      workflow; the pinned Presage store still requires a protocol-layer patch.
 
 ### P2 — reliability, UX, and maintainability
 
@@ -350,18 +360,21 @@ expansion until Milestone 2 is complete.
 **Goal:** Make builds, tests, and native integration reproducible before
 changing behavior.
 
-- [ ] Commit `Package.resolved`.
-- [ ] Commit `rust-core/Cargo.lock`.
-- [ ] Pin `presage` and `ringrtc` Git revisions/tags.
-- [ ] Add `rust-toolchain.toml` and document the supported Xcode/macOS/Rust
+- [x] Commit `Package.resolved`.
+- [x] Commit `rust-core/Cargo.lock`.
+- [x] Pin `presage` and `ringrtc` Git revisions/tags.
+- [x] Add `rust-toolchain.toml` and document the supported Xcode/macOS/Rust
       versions.
-- [ ] Make CI run Swift tests with full Xcode, Rust tests, `cargo check`,
-      `cargo fmt`, and Clippy.
-- [ ] Add an ABI/version symbol exposed by the Rust library.
-- [ ] Add a generated/versioned C header and verify Swift/Rust symbol parity.
+- [x] Add a macOS CI workflow for full-Xcode Swift tests/builds and native
+      Rust tests/checks/builds.
+- [ ] Add strict `cargo fmt` and Clippy gates once the current warning/toolchain
+      baseline is cleaned up.
+- [x] Add an ABI/version symbol exposed by the Rust library.
+- [x] Add a versioned C header and a parity check for every exported ABI symbol.
 - [ ] Fix current compiler warnings, especially the AppKit actor warning and
       ignored Swift operation results.
-- [ ] Ensure the native test does not silently skip when the dylib is missing.
+- [x] Make the native integration test fail when CI supplies a native path;
+      local runs without a built dylib may still skip explicitly.
 
 **Exit criteria:** A clean checkout builds the same dependency graph and
 fails CI if the native library is missing or ABI-incompatible.
