@@ -140,7 +140,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     public var selfAci: String?
     /// Last roster snapshot, keyed by stable wire key (dedupe across refresh).
     private var messageCache: [String: RosterPayload.Message] = [:]
+    /// Wire key -> UUID mapping, persisted to prevent duplicate messages on re-sync.
     private var uuidCache: [String: UUID] = [:]
+    private var uuidCacheURL: URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))?.path ?? NSTemporaryDirectory()
+        return URL(fileURLWithPath: (base as NSString).appendingPathComponent("CuztomSignal/uuid_cache.json"))
+    }
     private var pumpTask: Task<Void, Never>?
     /// Wire key -> local file path, persisted across launches so roster
     /// re-seeds don't re-download (or re-prompt) every restart.
@@ -168,12 +173,67 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         savePathCache()
     }
 
+    private func loadUUIDCache() {
+        guard let data = try? Data(contentsOf: uuidCacheURL),
+              let map = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+        uuidCache = map.compactMapValues { UUID(uuidString: $0) }
+    }
+
+    private func saveUUIDCache() {
+        let stringMap = uuidCache.mapValues { $0.uuidString }
+        guard let data = try? JSONEncoder().encode(stringMap) else { return }
+        try? data.write(to: uuidCacheURL, options: .atomic)
+    }
+
     /// Local override for on-demand downloads, keyed "thread/ts".
     /// Consulted (and persisted) by `chatMessage`.
     private var localPaths: [String: String] = [:]
 
     public func bindLocalPath(thread: String, ts: Int64, path: String) {
         localPaths["\(thread)/\(ts)"] = path
+    }
+
+    /// Cache a sent attachment locally so it renders immediately and persists across restarts.
+    /// Returns the cached file URL.
+    public func cacheSentAttachment(thread: String, ts: Int64, sourceURL: URL, filename: String) -> URL {
+        // Create cache directory
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("CuztomSignal/attachments", isDirectory: true)
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+
+        // Generate stable cache filename: thread-sanitized-ts-index-filename
+        let safeThread = thread.replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
+        let cacheFilename = "\(safeThread)-\(ts)-0-\(filename)"
+        let cacheURL = cacheDir.appendingPathComponent(cacheFilename)
+
+        // Copy file to cache (use security-scoped access if needed)
+        let scoped = sourceURL.startAccessingSecurityScopedResource()
+        defer { if scoped { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        try? FileManager.default.removeItem(at: cacheURL)
+        if FileManager.default.fileExists(atPath: sourceURL.path) {
+            try? FileManager.default.copyItem(at: sourceURL, to: cacheURL)
+        } else if let data = try? Data(contentsOf: sourceURL) {
+            try? data.write(to: cacheURL)
+        }
+
+        // Register in pathCache using message key format: "thread/ts/sender/index"
+        // For sent messages, sender is "self"
+        let messageKey = "\(thread)/\(ts)/self"
+        let cacheKey = "\(messageKey)/0"
+        rememberPath(key: cacheKey, path: cacheURL.path)
+        localPaths["\(thread)/\(ts)"] = cacheURL.path
+
+        // Also register with ThreadID-derived key for consistency
+        let threadComponents = ThreadID.parse(thread)
+        if let groupKey = threadComponents.groupMasterKey {
+            // For groups, also register with group master key
+            let groupCacheKey = "group:\(groupKey)/\(ts)/self/0"
+            rememberPath(key: groupCacheKey, path: cacheURL.path)
+        }
+
+        Log.info("cached sent attachment: \(cacheURL.path)")
+        return cacheURL
     }
 
     public init(libraryPath: String? = nil, dbPath: String? = nil) {
@@ -191,15 +251,14 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             if libraryHandle != nil { self.libraryPath = path }
         }
         loadPathCache()
+        loadUUIDCache()
     }
 
     deinit {
         pumpTask?.cancel()
-        if let handle = libraryHandle {
-            #if canImport(Darwin)
-            dlclose(handle)
-            #endif
-        }
+        // The Rust command worker and RingRTC actor are process-wide and may
+        // still be finishing callbacks. Never dlclose the dylib from a Swift
+        // service deinit; the OS will reclaim it at process exit.
     }
 
     public static func defaultDBPath() -> String {
@@ -278,6 +337,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         guard linked || isLinkedNow() else { throw SignalError.notLinked }
         let payload = try JSONDecoder().decode(RosterPayload.self, from: try await rosterData())
         return applyRoster(payload)
+    }
+
+    /// Get raw roster data for contact resolver population
+    public func getRosterData() async throws -> RosterPayload {
+        guard linked || isLinkedNow() else { throw SignalError.notLinked }
+        return try JSONDecoder().decode(RosterPayload.self, from: try await rosterData())
     }
 
     public func fetchMessages(conversationId: String, limit: Int) async throws -> [ChatMessage] {
@@ -498,6 +563,177 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         guard rc == 0 else { throw SignalError.network("send call hangup failed: \(lastError(sym))") }
     }
 
+    // MARK: - Call Signaling Integration (M4)
+
+    // MARK: - Native RingRTC call control
+
+    /// Start a real 1:1 call. Returns RingRTC's numeric call id.
+    public func startCall(thread: String, mediaType: String) async throws -> UInt64 {
+        let sym = try await initCore()
+        var id: UInt64 = .max
+        thread.withCString { t in
+            mediaType.withCString { m in
+                id = sym.callStart(t, m)
+            }
+        }
+        guard id != .max else { throw SignalError.network("start call failed: \(lastError(sym))") }
+        return id
+    }
+
+    /// Accept a native incoming call.
+    public func acceptCall(callId: UInt64) async throws {
+        let sym = try await initCore()
+        guard sym.callAccept(callId) == 0 else {
+            throw SignalError.network("accept call failed: \(lastError(sym))")
+        }
+    }
+
+    /// Hang up the native active call.
+    public func hangupCall() async throws {
+        let sym = try await initCore()
+        guard sym.callHangup() == 0 else {
+            throw SignalError.network("hangup call failed: \(lastError(sym))")
+        }
+    }
+
+    /// Mute/unmute the native outgoing audio track.
+    public func setCallMuted(_ muted: Bool) async throws {
+        let sym = try await initCore()
+        guard sym.callSetMuted(muted ? 1 : 0) == 0 else {
+            throw SignalError.network("set call mute failed: \(lastError(sym))")
+        }
+    }
+
+    /// Send a pre-built call signal (base64-encoded protobuf CallMessage) to a thread.
+    public func sendCallSignalRaw(thread: String, callMessageBase64: String) async throws {
+        let sym = try await initCore()
+        let rc = thread.withCString { t in
+            callMessageBase64.withCString { j in
+                sym.sendCallSignal(t, j)
+            }
+        }
+        guard rc == 0 else { throw SignalError.network("send call signal failed: \(lastError(sym))") }
+    }
+
+    /// Build a call offer protobuf. Returns JSON describing the message.
+    public func buildCallOffer(callId: String, mediaType: String, opaque: String) async throws -> String {
+        let sym = try await initCore()
+        return try callString3(sym.buildCallOffer, callId, mediaType, opaque, what: "build call offer")
+    }
+
+    /// Build a call answer protobuf. Returns JSON describing the message.
+    public func buildCallAnswer(callId: String, opaque: String) async throws -> String {
+        let sym = try await initCore()
+        return try callString2(sym.buildCallAnswer, callId, opaque, what: "build call answer")
+    }
+
+    /// Build a call ICE protobuf. Returns JSON describing the message.
+    public func buildCallIce(callId: String, opaque: String) async throws -> String {
+        let sym = try await initCore()
+        return try callString2(sym.buildCallIce, callId, opaque, what: "build call ice")
+    }
+
+    /// Build a call hangup protobuf. Returns JSON describing the message.
+    public func buildCallHangup(callId: String, hangupType: UInt32, deviceId: UInt32 = 0) async throws -> String {
+        let sym = try await initCore()
+        var ptr: UnsafeMutablePointer<CChar>? = nil
+        callId.withCString { c in
+            ptr = sym.buildCallHangup(c, hangupType, deviceId)
+        }
+        guard let ptr else { throw SignalError.network("build call hangup failed: \(lastError(sym))") }
+        defer { sym.freeString(ptr) }
+        return String(cString: ptr)
+    }
+
+    /// Build a call busy protobuf. Returns JSON describing the message.
+    public func buildCallBusy(callId: String) async throws -> String {
+        let sym = try await initCore()
+        return try callString1(sym.buildCallBusy, callId, what: "build call busy")
+    }
+
+    /// Parse a base64-encoded protobuf CallMessage. Returns JSON describing the parsed signal.
+    public func parseCallMessage(base64: String) async throws -> String {
+        let sym = try await initCore()
+        return try callString1(sym.parseCallMessage, base64, what: "parse call message")
+    }
+
+    /// Convert an i32 call end reason to a string.
+    public func callEndReasonName(_ reason: Int32) async throws -> String {
+        let sym = try await initCore()
+        guard let ptr = sym.callEndReasonToString(reason) else {
+            throw SignalError.network("call end reason lookup failed: \(lastError(sym))")
+        }
+        defer { sym.freeString(ptr) }
+        return String(cString: ptr)
+    }
+
+    private func callString1(
+        _ fn: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?,
+        _ arg: String, what: String
+    ) throws -> String {
+        var ptr: UnsafeMutablePointer<CChar>? = nil
+        arg.withCString { ptr = fn($0) }
+        guard let ptr else {
+            guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else {
+                throw SignalError.crypto("\(what): null without loaded library")
+            }
+            throw SignalError.network("\(what) failed: \(lastError(sym))")
+        }
+        let value = String(cString: ptr)
+        if let handle = libraryHandle, let sym = Self.resolve(in: handle) {
+            sym.freeString(ptr)
+        }
+        return value
+    }
+
+    private func callString2(
+        _ fn: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?,
+        _ a: String, _ b: String, what: String
+    ) throws -> String {
+        var ptr: UnsafeMutablePointer<CChar>? = nil
+        a.withCString { x in
+            b.withCString { y in
+                ptr = fn(x, y)
+            }
+        }
+        guard let ptr else {
+            guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else {
+                throw SignalError.crypto("\(what): null without loaded library")
+            }
+            throw SignalError.network("\(what) failed: \(lastError(sym))")
+        }
+        let value = String(cString: ptr)
+        if let handle = libraryHandle, let sym = Self.resolve(in: handle) {
+            sym.freeString(ptr)
+        }
+        return value
+    }
+
+    private func callString3(
+        _ fn: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?,
+        _ a: String, _ b: String, _ c: String, what: String
+    ) throws -> String {
+        var ptr: UnsafeMutablePointer<CChar>? = nil
+        a.withCString { x in
+            b.withCString { y in
+                c.withCString { z in
+                    ptr = fn(x, y, z)
+                }
+            }
+        }
+        guard let ptr else {
+            guard let handle = libraryHandle, let sym = Self.resolve(in: handle) else {
+                throw SignalError.crypto("\(what): null without loaded library")
+            }
+            throw SignalError.network("\(what) failed: \(lastError(sym))")
+        }
+        let value = String(cString: ptr)
+        if let handle = libraryHandle, let sym = Self.resolve(in: handle) {
+            sym.freeString(ptr)
+        }
+        return value
+    }
+
     /// Profile display name for a contact uuid (nil when unavailable).
     public func profileName(uuid: String) async -> String? {
         guard let sym = try? await initCore() else { return nil }
@@ -602,6 +838,43 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         lastRosterSummary = "never"
     }
 
+    /// Complete data wipe: logout + delete all local databases, caches, and keychain entries.
+    public func clearAllData() async throws {
+        // 1. Logout from Signal when a session still exists. The operation is
+        // intentionally idempotent because the UI also clears its Swift-side
+        // state immediately afterward.
+        if linked || isLinkedNow() {
+            try await logout()
+        } else {
+            linked = false
+            pumpTask?.cancel()
+            pumpTask = nil
+        }
+
+        // 2. Delete SQLite database file
+        let dbURL = URL(fileURLWithPath: dbPath)
+        try? FileManager.default.removeItem(at: dbURL)
+        // Also delete WAL/SHM files if they exist
+        try? FileManager.default.removeItem(at: dbURL.appendingPathExtension("wal"))
+        try? FileManager.default.removeItem(at: dbURL.appendingPathExtension("shm"))
+
+        // 3. Delete attachment paths cache
+        try? FileManager.default.removeItem(at: pathCacheURL)
+
+        // 4. Delete UUID cache
+        try? FileManager.default.removeItem(at: uuidCacheURL)
+
+        // 5. Clear in-memory caches
+        messageCache = [:]
+        uuidCache = [:]
+        pathCache = [:]
+        localPaths = [:]
+        lastRosterSummary = "never"
+        selfAci = nil
+
+        Log.info("RustCoreService: cleared all data (DB, caches, keychain)")
+    }
+
     // MARK: - private FFI
 
     private struct Symbols {
@@ -627,6 +900,19 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let sendCallAnswer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let sendCallIce: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UInt32) -> Int32
         let sendCallHangup: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
+        let callStart: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UInt64
+        let callAccept: @convention(c) (UInt64) -> Int32
+        let callHangup: @convention(c) () -> Int32
+        let callSetMuted: @convention(c) (Int32) -> Int32
+        // Call signaling integration
+        let sendCallSignal: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
+        let buildCallOffer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let buildCallAnswer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let buildCallIce: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let buildCallHangup: @convention(c) (UnsafePointer<CChar>, UInt32, UInt32) -> UnsafeMutablePointer<CChar>?
+        let buildCallBusy: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let parseCallMessage: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let callEndReasonToString: @convention(c) (Int32) -> UnsafeMutablePointer<CChar>?
         let deleteLocal: @convention(c) (UnsafePointer<CChar>, UInt64) -> Int32
         let profile: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let whoami: @convention(c) () -> UnsafeMutablePointer<CChar>?
@@ -635,18 +921,49 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let freeString: @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
     }
 
+    private let callbackLock = NSLock()
+    private var _onSyncEvent: ((String) -> Void)?
+    private var _onCallSignal: ((CallSignal) -> Void)?
+    private var _onCallState: ((CallStateEvent) -> Void)?
+    private var _onReaction: ((String, Int64, String, Bool, String) -> Void)?
+    private var _onReceipt: ((String, String, [Int64]) -> Void)?
+    private var _onTyping: ((String, String, Bool) -> Void)?
+
     /// Non-message sync traffic ("queue_empty", "contacts_synced",
     /// "sync_error:…"). Fires on an internal task — hop threads as needed.
-    public var onSyncEvent: ((String) -> Void)?
+    public var onSyncEvent: ((String) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onSyncEvent }
+        set { callbackLock.lock(); _onSyncEvent = newValue; callbackLock.unlock() }
+    }
+
+    /// Native RingRTC signaling/state callbacks. They are invoked on the
+    /// service pump task; callers should hop to their own actor if needed.
+    public var onCallSignal: ((CallSignal) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onCallSignal }
+        set { callbackLock.lock(); _onCallSignal = newValue; callbackLock.unlock() }
+    }
+    public var onCallState: ((CallStateEvent) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onCallState }
+        set { callbackLock.lock(); _onCallState = newValue; callbackLock.unlock() }
+    }
 
     /// Live reaction: (thread, target store-ts, emoji, remove, sender name).
-    public var onReaction: ((String, Int64, String, Bool, String) -> Void)?
+    public var onReaction: ((String, Int64, String, Bool, String) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onReaction }
+        set { callbackLock.lock(); _onReaction = newValue; callbackLock.unlock() }
+    }
 
     /// Live receipt: (sender name, "read"|"delivered", message timestamps).
-    public var onReceipt: ((String, String, [Int64]) -> Void)?
+    public var onReceipt: ((String, String, [Int64]) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onReceipt }
+        set { callbackLock.lock(); _onReceipt = newValue; callbackLock.unlock() }
+    }
 
     /// Live typing: (thread, sender name, started: Bool)
-    public var onTyping: ((String, String, Bool) -> Void)?
+    public var onTyping: ((String, String, Bool) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onTyping }
+        set { callbackLock.lock(); _onTyping = newValue; callbackLock.unlock() }
+    }
 
     /// "12 contacts, 3 groups, 45 msgs @ 22:01" or "never".
     public private(set) var lastRosterSummary = "never"
@@ -665,26 +982,36 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             byThread[m.thread, default: []].append(m)
         }
         var convs: [Conversation] = []
+        let selfID = payload.thisDevice.aci.lowercased()
         for c in payload.contacts {
-            let id = "contact:\(c.id)"
-            let title = c.name.isEmpty ? (c.phone.isEmpty ? String(c.id.prefix(8)) : c.phone) : c.name
+            let id = ThreadID.contactThreadId(uuid: c.id)
+            let isSelf = c.id.lowercased() == selfID
+            let title: String
+            if isSelf {
+                // Signal's roster includes our own profile as a contact. It is
+                // the Note to Self conversation, not a second contact named
+                // after the profile.
+                title = "Note to Self"
+            } else {
+                title = c.name.isEmpty ? (c.phone.isEmpty ? "Unknown" : c.phone) : c.name
+            }
             let recent = (byThread[id] ?? []).sorted { $0.ts < $1.ts }
             convs.append(Conversation(
                 id: id,
                 title: title,
-                peer: SignalAddress(uuidString: c.id, phone: c.phone.isEmpty ? nil : c.phone),
+                peer: SignalAddress(uuidString: c.id, phone: c.phone.isEmpty ? nil : c.phone, threadId: id),
                 lastMessagePreview: recent.last.map { String($0.body.prefix(120)) },
                 lastActiveAt: recent.last.map { Date(timeIntervalSince1970: Double($0.ts) / 1000) } ?? Date.distantPast,
                 unreadCount: 0
             ))
         }
         for g in payload.groups {
-            let id = "group:\(g.id)"
+            let id = ThreadID.groupThreadId(masterKey: g.id)
             let recent = (byThread[id] ?? []).sorted { $0.ts < $1.ts }
             convs.append(Conversation(
                 id: id,
                 title: g.title.isEmpty ? "Unnamed group" : g.title,
-                peer: SignalAddress(groupId: "group.\(g.id)"),
+                peer: SignalAddress(groupId: g.id, threadId: id),
                 lastMessagePreview: recent.last.map { String($0.body.prefix(120)) },
                 lastActiveAt: recent.last.map { Date(timeIntervalSince1970: Double($0.ts) / 1000) } ?? Date.distantPast,
                 unreadCount: 0
@@ -700,9 +1027,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         } else {
             let fresh = UUID()
             uuidCache[m.key] = fresh
+            saveUUIDCache()
             id = fresh
         }
-        let isGroup = m.thread.hasPrefix("group:")
+        let threadComponents = ThreadID.parse(m.thread)
+        let groupMasterKey = threadComponents.groupMasterKey
         var metas: [AttachmentMeta] = []
         for (index, a) in m.attachments.enumerated() {
             // Newest source wins: live/on-demand override, then persisted
@@ -724,12 +1053,14 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 localURL: resolved
             ))
         }
+
         return ChatMessage(
             id: id,
             conversationId: m.thread,
             author: SignalAddress(
                 uuidString: m.outgoing ? (selfAci ?? "self") : m.sender,
-                groupId: isGroup ? m.thread : nil
+                groupId: groupMasterKey,
+                threadId: m.thread
             ),
             body: m.body.isEmpty ? (metas.isEmpty ? "" : "[attachment]") : m.body,
             direction: m.outgoing ? .outgoing : .incoming,
@@ -759,6 +1090,18 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             let text = String(cString: ptr)
             guard let data = text.data(using: .utf8),
                   let event = try? JSONDecoder().decode(LiveEvent.self, from: data) else { continue }
+            if event.type == "call_signal" {
+                if let signal = try? JSONDecoder().decode(CallSignal.self, from: data) {
+                    onCallSignal?(signal)
+                }
+                continue
+            }
+            if event.type == "call_state" {
+                if let state = try? JSONDecoder().decode(CallStateEvent.self, from: data) {
+                    onCallState?(state)
+                }
+                continue
+            }
             switch event.type {
             case "message":
                 if let msg = event.message {
@@ -887,6 +1230,18 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let sca = dlsym(handle, "core_cmd_send_call_answer"),
               let sci = dlsym(handle, "core_cmd_send_call_ice"),
               let sch = dlsym(handle, "core_cmd_send_call_hangup"),
+              let cst = dlsym(handle, "core_cmd_call_start"),
+              let cac = dlsym(handle, "core_cmd_call_accept"),
+              let cah = dlsym(handle, "core_cmd_call_hangup"),
+              let csm = dlsym(handle, "core_cmd_call_set_muted"),
+              let scs = dlsym(handle, "core_cmd_send_call_signal"),
+              let bco = dlsym(handle, "core_cmd_build_call_offer"),
+              let bca = dlsym(handle, "core_cmd_build_call_answer"),
+              let bci = dlsym(handle, "core_cmd_build_call_ice"),
+              let bch = dlsym(handle, "core_cmd_build_call_hangup"),
+              let bcb = dlsym(handle, "core_cmd_build_call_busy"),
+              let pcm = dlsym(handle, "core_cmd_parse_call_message"),
+              let cers = dlsym(handle, "core_cmd_call_end_reason_to_string"),
               let dl = dlsym(handle, "core_cmd_delete_local"),
               let pf = dlsym(handle, "core_cmd_profile"),
               let w = dlsym(handle, "core_cmd_whoami"),
@@ -916,6 +1271,18 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             sendCallAnswer: unsafeBitCast(sca, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             sendCallIce: unsafeBitCast(sci, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>, UInt32) -> Int32).self),
             sendCallHangup: unsafeBitCast(sch, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
+            callStart: unsafeBitCast(cst, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UInt64).self),
+            callAccept: unsafeBitCast(cac, to: (@convention(c) (UInt64) -> Int32).self),
+            callHangup: unsafeBitCast(cah, to: (@convention(c) () -> Int32).self),
+            callSetMuted: unsafeBitCast(csm, to: (@convention(c) (Int32) -> Int32).self),
+            sendCallSignal: unsafeBitCast(scs, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
+            buildCallOffer: unsafeBitCast(bco, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            buildCallAnswer: unsafeBitCast(bca, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            buildCallIce: unsafeBitCast(bci, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            buildCallHangup: unsafeBitCast(bch, to: (@convention(c) (UnsafePointer<CChar>, UInt32, UInt32) -> UnsafeMutablePointer<CChar>?).self),
+            buildCallBusy: unsafeBitCast(bcb, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            parseCallMessage: unsafeBitCast(pcm, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            callEndReasonToString: unsafeBitCast(cers, to: (@convention(c) (Int32) -> UnsafeMutablePointer<CChar>?).self),
             deleteLocal: unsafeBitCast(dl, to: (@convention(c) (UnsafePointer<CChar>, UInt64) -> Int32).self),
             profile: unsafeBitCast(pf, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             whoami: unsafeBitCast(w, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),

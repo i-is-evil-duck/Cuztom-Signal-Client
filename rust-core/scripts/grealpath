@@ -1,0 +1,47 @@
+#!/bin/sh
+# Minimal `grealpath` shim for macOS.
+#
+# ringrtc's `bin/env.sh` probes for GNU realpath with the `-e` flag:
+#     REALPATH=realpath
+#     if ! $REALPATH -e . >/dev/null 2>&1 ; then
+#         REALPATH=grealpath
+#     fi
+#
+# macOS ships /bin/realpath without `-e`, so the script falls back to
+# `grealpath` (normally shipped by Homebrew coreutils). This shim provides the
+# same behaviour without pulling in coreutils.
+#
+#   grealpath [-e] [-q] PATH...   ->  print canonical absolute PATHs
+#
+# -e is accepted and ignored: the system realpath resolves every supplied path
+# and exits non-zero if one does not exist, which is what the probe tests for.
+
+set -e
+
+REALPATH=/bin/realpath
+[ -x "$REALPATH" ] || REALPATH=$(command -v realpath) || {
+    echo "grealpath: no realpath found on PATH" >&2
+    exit 127
+}
+
+# Strip GNU-only flags that macOS realpath does not understand.
+args=""
+for arg in "$@"; do
+    case "$arg" in
+        -e|-m|-L|-P|--canonicalize-existing|--canonicalize-missing) ;;
+        *) args="$args $(printf '%s' "$arg" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/")" ;;
+    esac
+done
+
+# shellcheck disable=SC2086
+eval "set -- $args"
+
+# Match realpath's behaviour: a missing operand is an error.
+for arg in "$@"; do
+    if [ ! -e "$arg" ] && [ ! -L "$arg" ]; then
+        echo "grealpath: $arg: No such file or directory" >&2
+        exit 1
+    fi
+done
+
+exec "$REALPATH" "$@"

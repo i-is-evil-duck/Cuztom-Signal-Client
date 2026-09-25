@@ -18,7 +18,10 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use base64::Engine as _;
 
 use presage::libsignal_service::configuration::SignalServers;
 use presage::model::identity::OnNewIdentity;
@@ -35,6 +38,10 @@ use sync::{
 };
 
 mod groups;
+
+mod call;
+
+use libsignal_service::proto::CallMessage as ProtoCallMessage;
 
 enum Command {
     Init {
@@ -197,6 +204,62 @@ enum Command {
         reason: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    // Call signaling integration (new)
+    SendCallSignal {
+        thread: String,
+        call_message_json: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    BuildCallOffer {
+        call_id: String,
+        media_type: String,
+        opaque: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    BuildCallAnswer {
+        call_id: String,
+        opaque: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    BuildCallIce {
+        call_id: String,
+        opaque: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    BuildCallHangup {
+        call_id: String,
+        hangup_type: u32,
+        device_id: u32,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    BuildCallBusy {
+        call_id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    ParseCallMessage {
+        call_message_json: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    CallEndReasonToString {
+        reason: i32,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    CallStart {
+        thread: String,
+        media_type: String,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    CallAccept {
+        call_id: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    CallHangup {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    CallSetMuted {
+        muted: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -344,6 +407,55 @@ enum LoopCtrl {
         reason: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    // Call signaling integration
+    SendCallSignal {
+        thread: String,
+        call_message_json: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    // Legacy internal call-message helpers retained for binary/source
+    // compatibility with older callers. Native calls use TransmitCallSignal.
+    BuildCallOffer {
+        call_id: String,
+        media_type: String,
+        opaque: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    BuildCallAnswer {
+        call_id: String,
+        opaque: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    BuildCallIce {
+        call_id: String,
+        opaque: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    BuildCallHangup {
+        call_id: String,
+        hangup_type: u32,
+        device_id: u32,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    BuildCallBusy {
+        call_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    ParseCallMessage {
+        call_message_json: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    CallEndReasonToString {
+        reason: i32,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Internal bridge messages produced by the native RingRTC platform.
+    TransmitCallSignal {
+        pending: call::PendingCallSignal,
+    },
+    CallAction {
+        action: call::CallAction,
+    },
     FetchAttachment {
         thread_id: String,
         ts: u64,
@@ -377,11 +489,20 @@ struct LinkedState {
     ctrl: Option<tmpsc::UnboundedSender<LoopCtrl>>,
     /// Drained by `core_cmd_poll_event` (null = empty, not an error).
     events: Option<std::sync::mpsc::Receiver<String>>,
+    /// False after the websocket receive task exits; allows a later
+    /// `start_sync` to reload the manager instead of treating it as live.
+    sync_alive: Arc<AtomicBool>,
 }
 
 impl LinkedState {
     fn new(db_path: String, manager: StoredManager) -> Self {
-        Self { db_path, manager: Some(manager), ctrl: None, events: None }
+        Self {
+            db_path,
+            manager: Some(manager),
+            ctrl: None,
+            events: None,
+            sync_alive: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     async fn open_store(&self) -> Result<SqliteStore, String> {
@@ -397,6 +518,27 @@ struct Core {
 
 static CORE: OnceLock<Core> = OnceLock::new();
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+
+/// The current sync-loop control sender. RingRTC's bridge is started once
+/// and survives logout/re-login; it waits while this slot is empty.
+static SYNC_CTRL: OnceLock<Mutex<Option<tmpsc::UnboundedSender<LoopCtrl>>>> = OnceLock::new();
+static CALL_BRIDGE_STARTED: OnceLock<()> = OnceLock::new();
+static SYNC_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn set_sync_ctrl(sender: Option<tmpsc::UnboundedSender<LoopCtrl>>) {
+    if let Ok(mut slot) = SYNC_CTRL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *slot = sender;
+    }
+}
+
+fn current_sync_ctrl() -> Option<tmpsc::UnboundedSender<LoopCtrl>> {
+    SYNC_CTRL
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|value| value.clone()))
+}
 
 fn set_last_error(msg: String) {
     if let Ok(mut slot) = LAST_ERROR.lock() {
@@ -473,8 +615,9 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                                 WorkerState::Linked(linked) => linked
                                     .events
                                     .as_ref()
-                                    .and_then(|rx| rx.try_recv().ok()),
-                                _ => None,
+                                    .and_then(|rx| rx.try_recv().ok())
+                                    .or_else(call::try_event),
+                                _ => call::try_event(),
                             };
                             let _ = reply.send(event);
                         }
@@ -588,6 +731,55 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                         }
                         Command::SendCallHangup { call_id, reason, reply } => {
                             let result = cmd_send_call_hangup(&mut state, &call_id, &reason).await;
+                            let _ = reply.send(result);
+                        }
+                        // Call signaling integration
+                        Command::SendCallSignal { thread, call_message_json, reply } => {
+                            let result = cmd_send_call_signal(&mut state, &thread, &call_message_json).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::BuildCallOffer { call_id, media_type, opaque, reply } => {
+                            let result = cmd_build_call_offer(&call_id, &media_type, &opaque).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::BuildCallAnswer { call_id, opaque, reply } => {
+                            let result = cmd_build_call_answer(&call_id, &opaque).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::BuildCallIce { call_id, opaque, reply } => {
+                            let result = cmd_build_call_ice(&call_id, &opaque).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::BuildCallHangup { call_id, hangup_type, device_id, reply } => {
+                            let result = cmd_build_call_hangup(&call_id, hangup_type, device_id).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::BuildCallBusy { call_id, reply } => {
+                            let result = cmd_build_call_busy(&call_id).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::ParseCallMessage { call_message_json, reply } => {
+                            let result = cmd_parse_call_message(&call_message_json).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::CallEndReasonToString { reason, reply } => {
+                            let result = cmd_call_end_reason_to_string(reason).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::CallStart { thread, media_type, reply } => {
+                            let result = cmd_call_start(&mut state, &thread, &media_type).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::CallAccept { call_id, reply } => {
+                            let result = cmd_call_accept(&mut state, call_id).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::CallHangup { reply } => {
+                            let result = cmd_call_hangup(&mut state).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::CallSetMuted { muted, reply } => {
+                            let result = cmd_call_set_muted(&mut state, muted);
                             let _ = reply.send(result);
                         }
                         Command::Logout { reply } => {
@@ -753,13 +945,15 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
         WorkerState::Linked(linked) => linked,
         _ => return Err("not linked".to_string()),
     };
-    if linked.ctrl.is_some() {
+    if linked.ctrl.is_some() && linked.sync_alive.load(Ordering::Acquire) {
         return Ok(());
     }
-    let mut manager = linked
-        .manager
-        .take()
-        .ok_or_else(|| "manager already owned by sync loop".to_string())?;
+    if let Some(old_ctrl) = linked.ctrl.take() {
+        set_sync_ctrl(None);
+        let _ = old_ctrl.send(LoopCtrl::Shutdown);
+    }
+    linked.events = None;
+    linked.sync_alive.store(false, Ordering::Release);
     let db_path = linked.db_path.clone();
 
     let store = SqliteStore::open(&db_path, OnNewIdentity::Trust)
@@ -770,13 +964,68 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
         .await
         .map_err(|e| format!("registration: {e}"))?
         .ok_or_else(|| "not linked".to_string())?;
+    let mut manager = match linked.manager.take() {
+        Some(manager) => manager,
+        None => Manager::load_registered(store)
+            .await
+            .map_err(|e| format!("reload manager: {e}"))?,
+    };
+    let names_store = manager.store().clone();
     let self_aci = reg.service_ids.aci.to_string();
+    call::set_local_device_id(reg.device_id.unwrap_or(1));
+    call::init_calls().map_err(|e| format!("initialize calls: {e}"))?;
+    call::set_self_uuid(&self_aci);
 
+    let sync_alive = Arc::clone(&linked.sync_alive);
+    let sync_generation = SYNC_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    sync_alive.store(true, Ordering::Release);
     let (event_tx, event_rx) = std::sync::mpsc::channel::<String>();
     let (ctrl_tx, mut ctrl_rx) = tmpsc::unbounded_channel::<LoopCtrl>();
+
+    // RingRTC callbacks run on a separate native worker. Keep one bridge
+    // task for the process lifetime; it drops work while logged out and
+    // forwards to the current sync loop after re-linking.
+    set_sync_ctrl(Some(ctrl_tx.clone()));
+    CALL_BRIDGE_STARTED.get_or_init(|| {
+        if let Some(mut signal_rx) = call::take_signal_rx() {
+            tokio::task::spawn_local(async move {
+                while let Some(pending) = signal_rx.recv().await {
+                    // A message queued during logout belongs to the old
+                    // account. Drop it while the current control loop is
+                    // absent rather than forwarding it after re-linking.
+                    if let Some(sender) = current_sync_ctrl() {
+                        let call_id = pending.call_id;
+                        if sender
+                            .send(LoopCtrl::TransmitCallSignal { pending })
+                            .is_err()
+                        {
+                            call::call_message_send_failure(call_id);
+                        }
+                    } else {
+                        call::call_message_send_failure(pending.call_id);
+                    }
+                }
+            });
+        }
+        if let Some(mut action_rx) = call::take_action_rx() {
+            tokio::task::spawn_local(async move {
+                while let Some(action) = action_rx.recv().await {
+                    // Do not carry a deferred `proceed` into a new session.
+                    if let Some(sender) = current_sync_ctrl() {
+                        if sender.send(LoopCtrl::CallAction { action }).is_err() {
+                            call::drop_active_call();
+                        }
+                    } else {
+                        call::drop_active_call();
+                    }
+                }
+            });
+        }
+    });
+
     tokio::task::spawn_local(async move {
         use futures::StreamExt;
-        let mut names = sync::load_names(&store).await;
+        let mut names = sync::load_names(&names_store).await;
         let send_listen = async {
             match manager.receive_messages().await {
                 Ok(stream) => {
@@ -898,6 +1147,52 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                     let r = send_call_hangup_inner(&mut manager, &call_id, &reason).await;
                                     let _ = reply.send(r);
                                 }
+                                // Call signaling integration
+                                Some(LoopCtrl::SendCallSignal { thread, call_message_json, reply }) => {
+                                    let r = crate::call::send_call_signal(&mut manager, &thread, &call_message_json).await;
+                                    let _ = reply.send(r.map_err(|e| e.to_string()));
+                                }
+                                Some(LoopCtrl::BuildCallOffer { call_id, media_type, opaque, reply }) => {
+                                    let r = cmd_build_call_offer(&call_id, &media_type, &opaque).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::BuildCallAnswer { call_id, opaque, reply }) => {
+                                    let r = cmd_build_call_answer(&call_id, &opaque).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::BuildCallIce { call_id, opaque, reply }) => {
+                                    let r = cmd_build_call_ice(&call_id, &opaque).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::BuildCallHangup { call_id, hangup_type, device_id, reply }) => {
+                                    let r = cmd_build_call_hangup(&call_id, hangup_type, device_id).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::BuildCallBusy { call_id, reply }) => {
+                                    let r = cmd_build_call_busy(&call_id).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::ParseCallMessage { call_message_json, reply }) => {
+                                    let r = cmd_parse_call_message(&call_message_json).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::CallEndReasonToString { reason, reply }) => {
+                                    let r = cmd_call_end_reason_to_string(reason).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::TransmitCallSignal { pending }) => {
+                                    let id = pending.call_id;
+                                    match call::transmit(&mut manager, pending).await {
+                                        Ok(()) => call::call_message_sent(id),
+                                        Err(error) => {
+                                            eprintln!("[core] call signaling send failed: {error}");
+                                            call::call_message_send_failure(id);
+                                        }
+                                    }
+                                }
+                                Some(LoopCtrl::CallAction { action }) => {
+                                    call::call_action(action);
+                                }
                                 Some(LoopCtrl::FetchAttachment { thread_id, ts, index, reply }) => {
                                     let r = sync::fetch_attachment(&mut manager, &thread_id, ts, index).await;
                                     let _ = reply.send(r);
@@ -910,10 +1205,23 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                             },
                             next = stream.next() => match next {
                                 Some(Received::Content(c)) => {
-                                    // Reactions + receipts travel as message
-                                    // envelopes; emit them as events, never rows.
+                                    // Reactions + receipts + call signaling travel as
+                                    // message envelopes; emit them as events, never rows.
                                     if let Some(rv) = sync::receipt_part(&c, &names) {
                                         let _ = event_tx.send(rv.to_string());
+                                    } else if let Some(rv) = sync::call_signal_part(&c, &names) {
+                                        // Call offer/answer/ICE/hangup/busy. These are
+                                        // real Signal call envelopes and must reach
+                                        // the call state machine, not the message store.
+                                        eprintln!(
+                                            "[core] call signal kind={} thread={} from={}",
+                                            rv.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),
+                                            rv.get("thread").and_then(|v| v.as_str()).unwrap_or("?"),
+                                            rv.get("sender").and_then(|v| v.as_str()).unwrap_or("?"),
+                                        );
+                                        if call::receive_call_signal(&mut manager, &rv).await {
+                                            let _ = event_tx.send(rv.to_string());
+                                        }
                                     } else {
                                         if let Some(rv) = sync::reaction_part(&c, &names) {
                                             let _ = event_tx.send(rv.to_string());
@@ -976,7 +1284,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(received) => {
                                     if matches!(received, Received::Contacts) {
-                                        names = sync::load_names(&store).await;
+                                        names = sync::load_names(&names_store).await;
                                     }
                                     if let Some(ev) = sync::received_event(&received, &self_aci, &names) {
                                         let _ = event_tx.send(ev);
@@ -999,6 +1307,10 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
             }
         };
         send_listen.await;
+        if SYNC_GENERATION.load(Ordering::Acquire) == sync_generation {
+            sync_alive.store(false, Ordering::Release);
+            set_sync_ctrl(None);
+        }
     });
     linked.ctrl = Some(ctrl_tx);
     linked.events = Some(event_rx);
@@ -1010,6 +1322,11 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
 async fn cmd_logout(state: &mut WorkerState) -> Result<(), String> {
     let db_path = match state {
         WorkerState::Linked(linked) => {
+            call::drop_active_call();
+            call::clear_events();
+            linked.sync_alive.store(false, Ordering::Release);
+            SYNC_GENERATION.fetch_add(1, Ordering::AcqRel);
+            set_sync_ctrl(None);
             if let Some(ctrl) = linked.ctrl.take() {
                 let _ = ctrl.send(LoopCtrl::Shutdown);
             }
@@ -1485,7 +1802,46 @@ async fn cmd_leave_group(
     }
 }
 
-/// Send a call offer (SDP) via the sync loop.
+async fn cmd_call_start(
+    state: &mut WorkerState,
+    thread: &str,
+    media_type: &str,
+) -> Result<u64, String> {
+    cmd_start_sync(state).await?;
+    if !matches!(state, WorkerState::Linked(_)) {
+        return Err("not linked".to_string());
+    }
+    let media = match media_type {
+        "video" => ringrtc::common::CallMediaType::Video,
+        _ => ringrtc::common::CallMediaType::Audio,
+    };
+    call::call_start(thread, media)
+}
+
+async fn cmd_call_accept(state: &mut WorkerState, call_id: u64) -> Result<(), String> {
+    if !matches!(state, WorkerState::Linked(_)) {
+        return Err("not linked".to_string());
+    }
+    call::call_accept(call_id)
+}
+
+async fn cmd_call_hangup(state: &mut WorkerState) -> Result<(), String> {
+    if !matches!(state, WorkerState::Linked(_)) {
+        return Err("not linked".to_string());
+    }
+    call::call_hangup()
+}
+
+fn cmd_call_set_muted(state: &WorkerState, muted: bool) -> Result<(), String> {
+    if !matches!(state, WorkerState::Linked(_)) {
+        return Err("not linked".to_string());
+    }
+    call::set_audio_muted(muted);
+    Ok(())
+}
+
+/// Legacy SDP-shaped command retained for source compatibility. New clients
+/// use `core_cmd_call_start` and let RingRTC generate the opaque signaling.
 async fn cmd_send_call_offer(
     state: &mut WorkerState,
     call_id: &str,
@@ -1583,6 +1939,189 @@ async fn cmd_send_call_hangup(
         }
         _ => Err("not linked".to_string()),
     }
+}
+
+/// Send a call signaling message via the sync loop.
+async fn cmd_send_call_signal(
+    state: &mut WorkerState,
+    thread: &str,
+    call_message_json: &str,
+) -> Result<(), String> {
+    cmd_start_sync(state).await?;
+    match state {
+        WorkerState::Linked(linked) => {
+            let ctrl = linked.ctrl.as_ref().ok_or_else(|| "sync loop not running".to_string())?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ctrl.send(LoopCtrl::SendCallSignal {
+                thread: thread.to_string(),
+                call_message_json: call_message_json.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| "sync loop is gone".to_string())?;
+            rx.await.map_err(|_| "sync loop dropped reply".to_string())?
+        }
+        _ => Err("not linked".to_string()),
+    }
+}
+
+fn call_id_from_wire(value: &str) -> u64 {
+    value.parse().unwrap_or(0)
+}
+
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn call_message_json(message: &ringrtc::core::signaling::Message) -> String {
+    let json = match message {
+        ringrtc::core::signaling::Message::Offer(offer) => serde_json::json!({
+            "offer": {
+                "media_type": match offer.call_media_type {
+                    ringrtc::common::CallMediaType::Audio => "audio",
+                    ringrtc::common::CallMediaType::Video => "video",
+                },
+                "opaque": b64(&offer.opaque),
+            }
+        }),
+        ringrtc::core::signaling::Message::Answer(answer) => serde_json::json!({
+            "answer": { "opaque": b64(&answer.opaque) }
+        }),
+        ringrtc::core::signaling::Message::Ice(ice) => serde_json::json!({
+            "ice": ice.candidates.iter().map(|candidate| serde_json::json!({
+                "opaque": b64(&candidate.opaque)
+            })).collect::<Vec<_>>()
+        }),
+        ringrtc::core::signaling::Message::Hangup(hangup) => {
+            let (kind, _) = hangup.to_type_and_device_id();
+            serde_json::json!({ "hangup": { "type": kind as i32 } })
+        }
+        ringrtc::core::signaling::Message::Busy => serde_json::json!({ "busy": {} }),
+    };
+    json.to_string()
+}
+
+/// Build a call offer message (returns JSON).
+async fn cmd_build_call_offer(call_id: &str, media_type: &str, opaque: &str) -> Result<String, String> {
+    let media = if media_type == "video" {
+        ringrtc::common::CallMediaType::Video
+    } else {
+        ringrtc::common::CallMediaType::Audio
+    };
+    let message = call::build_offer_message(
+        ringrtc::common::CallId::new(call_id_from_wire(call_id)),
+        media,
+        opaque.as_bytes().to_vec(),
+    );
+    let json = if let Some(offer) = message.offer {
+        serde_json::json!({
+            "offer": {
+                "id": offer.id,
+                "type": offer.r#type,
+                "opaque": b64(&offer.opaque.unwrap_or_default()),
+            }
+        })
+    } else {
+        serde_json::json!({})
+    };
+    Ok(json.to_string())
+}
+
+/// Build a call answer message (returns JSON).
+async fn cmd_build_call_answer(call_id: &str, opaque: &str) -> Result<String, String> {
+    let message = call::build_answer_message(
+        ringrtc::common::CallId::new(call_id_from_wire(call_id)),
+        opaque.as_bytes().to_vec(),
+    );
+    let json = if let Some(answer) = message.answer {
+        serde_json::json!({
+            "answer": { "id": answer.id, "opaque": b64(&answer.opaque.unwrap_or_default()) }
+        })
+    } else {
+        serde_json::json!({})
+    };
+    Ok(json.to_string())
+}
+
+/// Build a call ICE message (returns JSON).
+async fn cmd_build_call_ice(call_id: &str, opaque: &str) -> Result<String, String> {
+    let message = call::build_ice_message(
+        ringrtc::common::CallId::new(call_id_from_wire(call_id)),
+        opaque.as_bytes().to_vec(),
+    );
+    Ok(serde_json::json!({
+        "ice_update": message.ice_update.iter().map(|ice| serde_json::json!({
+            "id": ice.id,
+            "opaque": b64(ice.opaque.as_deref().unwrap_or_default()),
+        })).collect::<Vec<_>>()
+    }).to_string())
+}
+
+/// Build a call hangup message (returns JSON).
+async fn cmd_build_call_hangup(call_id: &str, hangup_type: u32, device_id: u32) -> Result<String, String> {
+    let message = call::build_hangup_message(
+        ringrtc::common::CallId::new(call_id_from_wire(call_id)),
+        hangup_type,
+        (device_id != 0).then_some(device_id),
+    );
+    let json = if let Some(hangup) = message.hangup {
+        serde_json::json!({
+            "hangup": { "id": hangup.id, "type": hangup.r#type, "device_id": hangup.device_id }
+        })
+    } else {
+        serde_json::json!({})
+    };
+    Ok(json.to_string())
+}
+
+/// Build a call busy message (returns JSON).
+async fn cmd_build_call_busy(call_id: &str) -> Result<String, String> {
+    let message = call::build_busy_message(ringrtc::common::CallId::new(call_id_from_wire(call_id)));
+    let json = if let Some(busy) = message.busy {
+        serde_json::json!({ "busy": { "id": busy.id } })
+    } else {
+        serde_json::json!({})
+    };
+    Ok(json.to_string())
+}
+
+/// Parse a base64 protobuf call message (returns JSON).
+async fn cmd_parse_call_message(call_message_json: &str) -> Result<String, String> {
+    use prost::Message as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(call_message_json)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    let message = ProtoCallMessage::decode(bytes.as_slice())
+        .map_err(|e| format!("protobuf decode: {e}"))?;
+    let parsed = call::parse_call_message(&message).map_err(|e| e.to_string())?;
+    Ok(call_message_json_for_signal(&parsed))
+}
+
+fn call_message_json_for_signal(message: &ringrtc::core::signaling::Message) -> String {
+    call_message_json(message)
+}
+
+/// Convert a call end reason to string.
+async fn cmd_call_end_reason_to_string(reason: i32) -> Result<String, String> {
+    let name = match reason {
+        0 => "local_hangup",
+        1 => "remote_hangup",
+        2 => "remote_hangup_need_permission",
+        3 => "remote_hangup_accepted",
+        4 => "remote_hangup_declined",
+        5 => "remote_hangup_busy",
+        6 => "remote_busy",
+        7 => "remote_glare",
+        8 => "remote_recall",
+        9 => "timeout",
+        10 => "internal_failure",
+        11 => "signaling_failure",
+        12 => "connection_failure",
+        13 => "app_dropped_call",
+        14 => "device_explicitly_disconnected",
+        15 => "server_explicitly_disconnected",
+        _ => "other",
+    };
+    Ok(name.to_string())
 }
 
 /// On-demand attachment fetch (metadata-only roster rows).
@@ -2235,6 +2774,50 @@ pub extern "C" fn core_cmd_group_leave(
     }
 }
 
+/// Start a native RingRTC call. Returns the RingRTC call id, or `u64::MAX` on error.
+#[no_mangle]
+pub extern "C" fn core_cmd_call_start(thread: *const c_char, media_type: *const c_char) -> u64 {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => { set_last_error(e); return u64::MAX; }
+    };
+    let m = match c_str_arg(media_type, "media_type") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return u64::MAX; }
+    };
+    match roundtrip(|reply| Command::CallStart { thread: t, media_type: m, reply }) {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); u64::MAX }
+    }
+}
+
+/// Accept an incoming native call. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_call_accept(call_id: u64) -> i32 {
+    match roundtrip(|reply| Command::CallAccept { call_id, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Hang up the active native call. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_call_hangup() -> i32 {
+    match roundtrip(|reply| Command::CallHangup { reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Set the native outgoing audio track mute state. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_call_set_muted(muted: i32) -> i32 {
+    match roundtrip(|reply| Command::CallSetMuted { muted: muted != 0, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
 /// Send a call offer (SDP). 0 ok, -1 error.
 #[no_mangle]
 pub extern "C" fn core_cmd_send_call_offer(
@@ -2328,6 +2911,155 @@ pub extern "C" fn core_cmd_send_call_hangup(
     match roundtrip(|reply| Command::SendCallHangup { call_id: cid, reason: r, reply }) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Send a call signaling message (offer, answer, ICE, hangup, busy). 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_send_call_signal(
+    thread: *const c_char,
+    call_message_json: *const c_char,
+) -> i32 {
+    let t = match c_str_arg(thread, "thread") {
+        Ok(t) => t,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    let json = match c_str_arg(call_message_json, "call_message_json") {
+        Ok(j) => j,
+        Err(e) => { set_last_error(e); return -1; }
+    };
+    match roundtrip(|reply| Command::SendCallSignal { thread: t, call_message_json: json, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Build a call offer message. Returns JSON string (free with core_free_string).
+#[no_mangle]
+pub extern "C" fn core_cmd_build_call_offer(
+    call_id: *const c_char,
+    media_type: *const c_char,
+    opaque: *const c_char,
+) -> *mut c_char {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+    let mt = match c_str_arg(media_type, "media_type") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+    let op = match c_str_arg(opaque, "opaque") {
+        Ok(o) => o,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+
+    match roundtrip(|reply| Command::BuildCallOffer { call_id: cid, media_type: mt, opaque: op, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Build a call answer message. Returns JSON string (free with core_free_string).
+#[no_mangle]
+pub extern "C" fn core_cmd_build_call_answer(
+    call_id: *const c_char,
+    opaque: *const c_char,
+) -> *mut c_char {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+    let op = match c_str_arg(opaque, "opaque") {
+        Ok(o) => o,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+
+    match roundtrip(|reply| Command::BuildCallAnswer { call_id: cid, opaque: op, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Build a call ICE message. Returns JSON string (free with core_free_string).
+#[no_mangle]
+pub extern "C" fn core_cmd_build_call_ice(
+    call_id: *const c_char,
+    opaque: *const c_char,
+) -> *mut c_char {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+    let op = match c_str_arg(opaque, "opaque") {
+        Ok(o) => o,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+
+    match roundtrip(|reply| Command::BuildCallIce { call_id: cid, opaque: op, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Build a call hangup message. Returns JSON string (free with core_free_string).
+#[no_mangle]
+pub extern "C" fn core_cmd_build_call_hangup(
+    call_id: *const c_char,
+    hangup_type: u32,
+    device_id: u32,
+) -> *mut c_char {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+
+    match roundtrip(|reply| Command::BuildCallHangup { call_id: cid, hangup_type, device_id, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Build a call busy message. Returns JSON string (free with core_free_string).
+#[no_mangle]
+pub extern "C" fn core_cmd_build_call_busy(
+    call_id: *const c_char,
+) -> *mut c_char {
+    let cid = match c_str_arg(call_id, "call_id") {
+        Ok(c) => c,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+
+    match roundtrip(|reply| Command::BuildCallBusy { call_id: cid, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Parse a call message from JSON. Returns JSON string (free with core_free_string).
+#[no_mangle]
+pub extern "C" fn core_cmd_parse_call_message(
+    call_message_json: *const c_char,
+) -> *mut c_char {
+    let json = match c_str_arg(call_message_json, "call_message_json") {
+        Ok(j) => j,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+
+    match roundtrip(|reply| Command::ParseCallMessage { call_message_json: json, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Convert a call end reason to string. Returns string (free with core_free_string).
+#[no_mangle]
+pub extern "C" fn core_cmd_call_end_reason_to_string(
+    reason: i32,
+) -> *mut c_char {
+    match roundtrip(|reply| Command::CallEndReasonToString { reason, reply }) {
+        Ok(Ok(s)) => ok_string(s),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
     }
 }
 

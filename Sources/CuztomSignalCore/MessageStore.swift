@@ -21,6 +21,8 @@ public protocol MessageStoring: Actor {
     func totalMessageCount() async -> Int
     func searchConversations(query: String) async -> [Conversation]
     func deleteConversation(id: String) async
+    /// Delete all stored data (messages, conversations, attachments). Used on logout.
+    func clearAllData() async
 }
 
 /// M0 in-memory store. Implements `MessageStoring` so M2 can swap
@@ -145,6 +147,11 @@ public actor InMemoryMessageStore: MessageStoring {
     public func deleteConversation(id: String) async {
         conversations.removeValue(forKey: id)
         messages.removeValue(forKey: id)
+    }
+
+    public func clearAllData() async {
+        conversations.removeAll()
+        messages.removeAll()
     }
 }
 

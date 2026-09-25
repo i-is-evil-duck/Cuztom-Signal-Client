@@ -20,12 +20,16 @@ public final class ChatController: @unchecked Sendable {
     public private(set) var lastSentThread: String?
     /// Own ACI for quoting/authoring (resolved at link time).
     public private(set) var selfAci: String?
+    /// Monotonic selection token. Async history loads must not let an older
+    /// conversation selection overwrite a newer one.
+    private var selectionGeneration = 0
 
     private let service: any SignalService
     private var store: any MessageStoring
     private var observerTask: Task<Void, Never>?
     private var watchTask: Task<Void, Never>?
     private let pluginHost: PluginHost
+    private let contactResolver: ContactResolver
 
     public init(
         service: any SignalService,
@@ -35,6 +39,7 @@ public final class ChatController: @unchecked Sendable {
         self.service = service
         self.store = store
         self.pluginHost = pluginHost
+        self.contactResolver = ContactResolver()
     }
 
     public var isLinked: Bool {
@@ -164,29 +169,28 @@ public final class ChatController: @unchecked Sendable {
         }
     }
 
+    /// Callback for typing indicator updates (set by ViewModel for UI).
+    public var onTypingUpdate: ((String, String, Bool) -> Void)?
+
+    /// Resolve a display name for an ACI/UUID in a conversation.
+    public func displayName(for aci: String, in conversationId: String) async -> String {
+        await contactResolver.displayName(for: aci, in: conversationId, conversations: conversations)
+    }
+
     /// Apply a live typing indicator to the conversation.
     public func applyTyping(thread: String, senderName: String, started: Bool) async {
-        // Typing indicators are transient UI state; we don't persist them.
-        // The ChatViewModel handles displaying the indicator in the UI.
-        // We could emit a notification or update a typing state dictionary here.
         Log.info("typing \(started ? "started" : "stopped") by \(senderName) in \(thread)")
-        // TODO: Update a typing state dictionary for UI display
+        onTypingUpdate?(thread, senderName, started)
     }
 
 
-    /// Send a typing indicator.
+    /// Outgoing typing is currently disabled. The presage sender persists
+    /// TypingMessage as a normal content message and the Signal service
+    /// rejects that path; firing it on every keystroke also delays real sends.
+    /// Incoming typing updates remain fully supported.
     public func sendTyping(thread: String, started: Bool) async {
-        guard let live = service as? RustCoreService else {
-            lastError = "typing indicators need the live backend"
-            Log.error("typing: no live backend")
-            return
-        }
-        do {
-            try await live.sendTyping(thread: thread, started: started)
-        } catch {
-            lastError = String(describing: error)
-            Log.error("send typing failed: (error)")
-        }
+        _ = thread
+        _ = started
     }
 
     private func allThreadLists() async -> [(String, [ChatMessage])] {
@@ -253,9 +257,14 @@ public final class ChatController: @unchecked Sendable {
     }
 
     /// Upload + send a local file (`caption` = message body, may be empty).
-    public func sendAttachment(fileURL: URL, caption: String) async -> Bool {
+    public func sendAttachment(
+        fileURL: URL,
+        caption: String,
+        to requestedID: String? = nil
+    ) async -> Bool {
+        lastError = nil
         Log.info("attachment send start: \(fileURL.lastPathComponent) caption=\(caption.count) chars")
-        guard let id = selectedId else {
+        guard let id = requestedID ?? selectedId else {
             lastError = "no conversation selected"
             Log.error("attachment send: no conversation selected")
             return false
@@ -267,10 +276,14 @@ public final class ChatController: @unchecked Sendable {
         }
         do {
             let sent = try await live.sendAttachment(thread: id, path: fileURL.path, caption: caption)
-            let meta = AttachmentMeta(filename: sent.name, mimeType: sent.mime, byteCount: sent.size, localURL: fileURL)
+
+            // Copy sent attachment to permanent cache and register path for rendering
+            let cacheURL = live.cacheSentAttachment(thread: id, ts: sent.ts, sourceURL: fileURL, filename: sent.name)
+            let meta = AttachmentMeta(filename: sent.name, mimeType: sent.mime, byteCount: sent.size, localURL: cacheURL)
+
             let msg = ChatMessage(
                 conversationId: id,
-                author: SignalAddress(uuidString: "self"),
+                author: SignalAddress(uuidString: "self", threadId: id),
                 body: caption,
                 direction: .outgoing,
                 status: .sent,
@@ -279,7 +292,9 @@ public final class ChatController: @unchecked Sendable {
             )
             lastSentThread = id
             await store.saveMessage(msg)
-            messages = await store.messages(in: id)
+            if selectedId == id {
+                messages = await store.messages(in: id)
+            }
             conversations = await store.allConversations()
             Log.info("sent attachment \(sent.name) to \(id)")
             return true
@@ -292,6 +307,7 @@ public final class ChatController: @unchecked Sendable {
 
     /// Reply quoting another message.
     public func sendReply(body: String, to id: String, quote: ChatMessage) async {
+        lastError = nil
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard let live = service as? RustCoreService else {
@@ -304,7 +320,7 @@ public final class ChatController: @unchecked Sendable {
             let ts = try await live.sendReply(thread: id, body: trimmed, qTs: qTs, qAuthor: qAuthor, qBody: String(quote.body.prefix(200)))
             let msg = ChatMessage(
                 conversationId: id,
-                author: SignalAddress(uuidString: "self"),
+                author: SignalAddress(uuidString: "self", threadId: id),
                 body: trimmed,
                 direction: .outgoing,
                 status: .sent,
@@ -359,6 +375,9 @@ public final class ChatController: @unchecked Sendable {
         for conv in conversations where !conv.peer.isGroup {
             let looksBare = conv.title.count == 8 || conv.title.hasPrefix("+") || conv.title == conv.peer.uuidString
             guard looksBare, let uuid = conv.peer.uuidString else { continue }
+            if let selfAci, uuid.caseInsensitiveCompare(selfAci) == .orderedSame {
+                continue
+            }
             if let name = await live.profileName(uuid: uuid), !name.isEmpty {
                 await store.renameConversation(id: conv.id, title: name)
                 Log.info("resolved name for \(uuid): \(name)")
@@ -390,6 +409,14 @@ public final class ChatController: @unchecked Sendable {
             messages = await store.messages(in: id)
         }
         await enrichNames()
+
+        // Populate contact resolver from roster if using live backend
+        if let live = service as? RustCoreService,
+           let rosterData = try? await live.getRosterData() {
+            await contactResolver.populateFromRoster(rosterData.contacts)
+            await contactResolver.populateFromGroups(rosterData.groups)
+        }
+
         conversations = await store.allConversations()
         Log.info("refresh: \(conversations.count) conversations, \(await store.totalMessageCount()) messages")
     }
@@ -421,6 +448,23 @@ public final class ChatController: @unchecked Sendable {
         }
     }
 
+    /// Reset Swift-side state after the live service has already performed its
+    /// logout/data wipe. This avoids issuing a second FFI logout, which is
+    /// expected to return `not linked` after the first successful wipe.
+    public func resetAfterServiceLogout() {
+        observerTask?.cancel()
+        watchTask?.cancel()
+        store = MessageStore()
+        conversations = []
+        messages = []
+        selectedId = nil
+        linkQR = nil
+        lastSyncNote = nil
+        lastError = nil
+        connection = .unlinked
+        Log.info("local controller state reset after service logout")
+    }
+
     /// Log out of Signal (wipes keys/session) and reset local state.
     /// Next `link()` shows a fresh QR.
     public func logout() async -> Bool {
@@ -433,17 +477,29 @@ public final class ChatController: @unchecked Sendable {
                 return false
             }
         }
-        observerTask?.cancel()
-        watchTask?.cancel()
-        store = MessageStore()
+        resetAfterServiceLogout()
+        Log.info("logged out")
+        return true
+    }
+
+    /// Clear all local data (messages, conversations) without logging out from Signal.
+    /// Used as part of full logout flow.
+    public func clearAllData() async {
+        await store.clearAllData()
         conversations = []
         messages = []
         selectedId = nil
-        linkQR = nil
-        lastSyncNote = nil
-        connection = .unlinked
-        Log.info("logged out")
-        return true
+        Log.info("ChatController: cleared all local data")
+    }
+
+    /// Send delivery receipts for incoming messages.
+    public func sendDeliveryReceipts(for conversationId: String, timestamps: [Int64]) async throws {
+        guard let live = service as? RustCoreService else {
+            throw SignalError.unsupported("delivery receipts need the live backend")
+        }
+        if !timestamps.isEmpty {
+            try await live.sendReceipt(thread: conversationId, timestamps: timestamps, kind: "delivered")
+        }
     }
 
     /// Send read receipts for all unread messages in a conversation.
@@ -453,8 +509,8 @@ public final class ChatController: @unchecked Sendable {
         }
         // Get unread messages in this conversation
         let messages = await store.messages(in: conversationId)
-        let unreadMessages = messages.filter { 
-            $0.direction == .incoming && !$0.readBy.contains(selfAci ?? "") 
+        let unreadMessages = messages.filter {
+            $0.direction == .incoming && !$0.readBy.contains(selfAci ?? "")
         }
         // Extract timestamps
         let timestamps = unreadMessages.compactMap { $0.storeTs }
@@ -488,27 +544,43 @@ public final class ChatController: @unchecked Sendable {
     }
 
     public func select(_ id: String) async {
+        selectionGeneration += 1
+        let generation = selectionGeneration
         selectedId = id
         // Top up from the service so threads opened after sync (or with
         // arrivals since sync) are complete; saveMessage dedupes by id.
         if let history = try? await service.fetchMessages(conversationId: id, limit: 200) {
             for m in history { await store.saveMessage(m) }
         }
+        guard generation == selectionGeneration else { return }
         await store.markRead(conversationId: id)
+        guard generation == selectionGeneration else { return }
         messages = await store.messages(in: id)
+        guard generation == selectionGeneration else { return }
         if let idx = conversations.firstIndex(where: { $0.id == id }) {
             conversations[idx].unreadCount = 0
         }
+
+        // Auto-send read receipts for unread messages in this conversation
+        guard generation == selectionGeneration else { return }
+        do {
+            try await sendReadReceipts(for: id)
+        } catch {
+            Log.error("failed to send read receipts: \(error)")
+        }
     }
 
-    public func send(_ body: String) async {
+    public func send(_ body: String, to requestedID: String? = nil) async {
+        lastError = nil
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let id = selectedId else { return }
+        guard !trimmed.isEmpty, let id = requestedID ?? selectedId else { return }
         do {
             let msg = try await service.sendText(trimmed, to: id)
             lastSentThread = id
             await store.saveMessage(msg)
-            messages = await store.messages(in: id)
+            if selectedId == id {
+                messages = await store.messages(in: id)
+            }
             conversations = await store.allConversations()
             Log.info("sent \(trimmed.count) chars to \(id)")
         } catch {
@@ -592,6 +664,16 @@ public final class ChatController: @unchecked Sendable {
         if message.conversationId == selectedId {
             messages = await store.messages(in: message.conversationId)
         }
+
+        // Auto-send delivery receipt for incoming messages
+        if message.direction == .incoming, let sts = message.storeTs {
+            do {
+                try await sendDeliveryReceipts(for: message.conversationId, timestamps: [sts])
+            } catch {
+                Log.error("failed to send delivery receipt: \(error)")
+            }
+        }
+
         // Fan out to plugins (onMessage hooks) — capture actor-isolated values here
         let currentConversations = conversations
         let currentSelectedId = selectedId

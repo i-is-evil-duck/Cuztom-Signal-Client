@@ -122,6 +122,12 @@ final class ChatViewModel {
     // Typing indicator state
     var typingUsers: [String: (String, Bool)] = [:] // thread -> (sender, isTyping)
 
+    // Cached own ACI for name resolution
+    private var cachedSelfAci: String?
+    // Guards against an older async selection completing after a newer click.
+    private var selectionGeneration = 0
+    private var selectionInProgress = false
+
     func start() async {
         phase = .starting
         errorMessage = nil
@@ -146,6 +152,28 @@ final class ChatViewModel {
         let controller = ChatController(service: live, store: store, pluginHost: plugins)
         self.controller = controller
         self.liveService = live
+        // Install call callbacks before starting the receive loop; an incoming
+        // call can arrive immediately after the linked session resumes.
+        callController.onIncomingCallChanged = { [weak self] call in
+            guard let self else { return }
+            self.incomingCall = self.activeCall == nil ? call : nil
+        }
+        callController.onActiveCallChanged = { [weak self] call in
+            guard let self else { return }
+            self.activeCall = call
+            if call != nil { self.incomingCall = nil }
+        }
+        callController.configure(with: live, transport: live)
+        // Wire typing indicator callback to update ViewModel state
+        controller.onTypingUpdate = { [weak self] thread, sender, started in
+            Task { @MainActor in
+                if started {
+                    self?.typingUsers[thread] = (sender, true)
+                } else {
+                    self?.typingUsers.removeValue(forKey: thread)
+                }
+            }
+        }
         guard await controller.begin() else {
             fail(controller)
             return
@@ -159,8 +187,7 @@ final class ChatViewModel {
             fail(controller)
             return
         }
-        // Configure call controller with signal transport
-        callController.configure(with: live, transport: live)
+        // Configure call controller with the live native signaling/media core.
         succeed(controller)
     }
 
@@ -168,20 +195,34 @@ final class ChatViewModel {
         await start()
     }
 
-    func select(_ id: String) async {
+    func select(_ id: String) {
+        selectionGeneration += 1
+        let generation = selectionGeneration
+        selectionInProgress = true
+        // Update the visible target immediately; the history fetch can yield,
+        // but Send must never fall back to the previously selected contact.
+        selectedId = id
+        messages = []
         historyExhausted = false
-        await controller?.select(id)
-        // Auto-send read receipts when opening a conversation
-        if sendReadReceipts {
-            Task {
-                try? await controller?.sendReadReceipts(for: id)
+        Task { [weak self] in
+            guard let self, let controller = self.controller else { return }
+            await controller.select(id)
+            guard generation == self.selectionGeneration else { return }
+            self.selectionInProgress = false
+            // Auto-send read receipts when opening a conversation
+            if self.sendReadReceipts {
+                Task {
+                    try? await controller.sendReadReceipts(for: id)
+                }
             }
+            self.sync()
         }
-        sync()
     }
 
-    func send(_ body: String) async {
+    func send(_ body: String, to requestedID: String? = nil) async {
         guard let controller else { return }
+        let targetID = requestedID ?? selectedId
+        guard let targetID else { return }
         sendError = nil
         if body.hasPrefix("/") {
             await controller.sendOrCommand(body, plugins: plugins, ctx: pluginCtx())
@@ -197,7 +238,7 @@ final class ChatViewModel {
             for url in files {
                 let caption = first ? body : ""
                 first = false
-                await controller.sendAttachment(fileURL: url, caption: caption)
+                await controller.sendAttachment(fileURL: url, caption: caption, to: targetID)
             }
             sendingAttachment = false
             sendError = controller.lastError
@@ -205,14 +246,14 @@ final class ChatViewModel {
             try? FileManager.default.removeItem(at: pendingDir())
             return
         }
-        if let quote = replyingTo, let id = controller.selectedId {
+        if let quote = replyingTo {
             replyingTo = nil
-            await controller.sendReply(body: body, to: id, quote: quote)
+            await controller.sendReply(body: body, to: targetID, quote: quote)
             sendError = controller.lastError
             sync()
             return
         }
-        await controller.send(body)
+        await controller.send(body, to: targetID)
         sendError = controller.lastError
         sync()
     }
@@ -275,11 +316,7 @@ final class ChatViewModel {
 func sendTyping(started: Bool) async {
     guard let id = selectedId,
           let controller else { return }
-    do {
-        try await controller.sendTyping(thread: id, started: started)
-    } catch {
-        // Ignore typing errors silently
-    }
+    await controller.sendTyping(thread: id, started: started)
 }
 
     // MARK: - Calls (M4)
@@ -290,8 +327,7 @@ func sendTyping(started: Bool) async {
               let conv = conversations.first(where: { $0.id == id }),
               !conv.peer.isGroup else { return }
         do {
-            let call = try await callController.startCall(to: id, mediaType: .voice, peer: conv.peer)
-            activeCall = call
+            _ = try await callController.startCall(to: id, mediaType: .voice, peer: conv.peer)
         } catch {
             sendError = "Call failed: \(error.localizedDescription)"
             sync()
@@ -304,8 +340,7 @@ func sendTyping(started: Bool) async {
               let conv = conversations.first(where: { $0.id == id }),
               !conv.peer.isGroup else { return }
         do {
-            let call = try await callController.startCall(to: id, mediaType: .video, peer: conv.peer)
-            activeCall = call
+            _ = try await callController.startCall(to: id, mediaType: .video, peer: conv.peer)
         } catch {
             sendError = "Call failed: \(error.localizedDescription)"
             sync()
@@ -317,8 +352,10 @@ func sendTyping(started: Bool) async {
         guard let call = incomingCall else { return }
         do {
             try await callController.answerCall(call)
-            activeCall = call
+            // Keep the view-model transition deterministic even if the native
+            // RingRTC state callback arrives a little later.
             incomingCall = nil
+            activeCall = call
         } catch {
             sendError = "Answer failed: \(error.localizedDescription)"
             sync()
@@ -330,7 +367,6 @@ func sendTyping(started: Bool) async {
         guard let call = incomingCall else { return }
         do {
             try await callController.declineCall(call)
-            incomingCall = nil
         } catch {
             sendError = "Decline failed: \(error.localizedDescription)"
             sync()
@@ -342,8 +378,6 @@ func sendTyping(started: Bool) async {
         guard let call = activeCall ?? incomingCall else { return }
         do {
             try await callController.endCall(call)
-            activeCall = nil
-            incomingCall = nil
         } catch {
             sendError = "End call failed: \(error.localizedDescription)"
             sync()
@@ -462,8 +496,23 @@ func sendTyping(started: Bool) async {
 
     func logout() async {
         guard let c = controller else { return }
-        _ = await c.logout()
+        callController.reset()
+        // Clear all data from Rust core (DB, caches, keychain). This performs
+        // the service logout itself; do not issue a second logout afterward.
+        if let live = liveService {
+            do {
+                try await live.clearAllData()
+            } catch {
+                Log.error("service data wipe failed: \(error)")
+            }
+        }
+        // Clear the Swift-side store/controller after the service wipe.
+        await c.resetAfterServiceLogout()
         liveService = nil
+        cachedSelfAci = nil
+        selectionGeneration += 1
+        selectionInProgress = false
+        selectedId = nil
         sync()
         // Back to a fresh QR.
         phase = .starting
@@ -475,8 +524,8 @@ func sendTyping(started: Bool) async {
     private func succeed(_ controller: ChatController) {
         sync()
         phase = .linked
-        if let first = conversations.first {
-            Task { await self.select(first.id) }
+        if selectedId == nil, let first = conversations.first {
+            select(first.id)
         }
     }
 
@@ -486,11 +535,51 @@ func sendTyping(started: Bool) async {
         phase = .failed
     }
 
+    /// Resolve a friendly name for an ACI/UUID in a conversation.
+    /// UI-facing code should never fall back to a raw service identifier.
+    func displayName(for aci: String, in conversationId: String) -> String {
+        let bareID = aci.replacingOccurrences(of: "PNI:", with: "")
+        if aci == "self" || aci == "You" { return "You" }
+
+        let knownSelf = cachedSelfAci ?? controller?.selfAci
+        if let knownSelf, bareID.caseInsensitiveCompare(knownSelf) == .orderedSame {
+            return "You"
+        }
+
+        // Every synced contact has a canonical 1:1 conversation. Reuse its
+        // friendly title for group messages, receipts, and typing indicators.
+        if let contact = conversations.first(where: { conversation in
+            guard !conversation.peer.isGroup else { return false }
+            return conversation.peer.uuidString?.caseInsensitiveCompare(bareID) == .orderedSame
+                || conversation.peer.phone == aci
+        }) {
+            return contact.title
+        }
+
+        if let group = conversations.first(where: { $0.id == conversationId }),
+           group.peer.groupId?.caseInsensitiveCompare(bareID) == .orderedSame {
+            return group.title
+        }
+
+        return "Unknown"
+    }
+
+    /// Two-letter initials for group sender chips and sender labels.
+    func initials(for name: String) -> String {
+        let words = name
+            .split(whereSeparator: { $0 == " " || $0 == "-" || $0 == "_" })
+            .filter { !$0.isEmpty }
+        let letters = words.prefix(2).compactMap { $0.first.map(String.init) }
+        return letters.joined().uppercased()
+    }
+
     private func sync() {
         guard let controller else { return }
         conversations = controller.conversations
-        selectedId = controller.selectedId
-        messages = controller.messages
+        if !selectionInProgress {
+            selectedId = controller.selectedId
+            messages = controller.messages
+        }
         linkQR = controller.linkQR
         isLinked = controller.isLinked
         syncNote = controller.lastSyncNote ?? "none"
@@ -500,7 +589,10 @@ func sendTyping(started: Bool) async {
             diagnosticsText = await controller.diagnostics()
             if let live = liveService,
                let me = try? await live.whoami() {
-                accountLine = "\(me.number) · \(String(me.aci.prefix(8)))"
+                let friendlyName = (try? await live.profileName(uuid: me.aci))
+                    .flatMap { $0.isEmpty ? nil : $0 } ?? "You"
+                accountLine = "\(me.number) · \(friendlyName)"
+                cachedSelfAci = me.aci
             }
         }
     }

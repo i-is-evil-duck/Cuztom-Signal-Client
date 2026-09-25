@@ -14,7 +14,8 @@ use std::collections::HashMap;
 
 use presage::libsignal_service::content::{AttachmentPointer, Content, ContentBody};
 use presage::libsignal_service::proto::sync_message::Content as SyncContent;
-use presage::libsignal_service::protocol::{Aci, ServiceId};
+use presage::libsignal_service::proto::GroupContextV2;
+use presage::libsignal_service::protocol::{Aci, Pni, ServiceId};
 use presage::manager::Registered;
 use presage::model::messages::Received;
 use presage::store::{ContentsStore, StateStore, Thread};
@@ -35,6 +36,19 @@ fn service_uuid(sid: &ServiceId) -> String {
         ServiceId::Aci(aci) => aci.service_id_string(),
         other => other.service_id_string(),
     }
+}
+
+fn parse_service_id(value: &str) -> Result<ServiceId, String> {
+    let (is_pni, bare) = value
+        .strip_prefix("PNI:")
+        .map(|v| (true, v))
+        .unwrap_or((false, value));
+    let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
+    Ok(if is_pni {
+        ServiceId::Pni(Pni::from(parsed))
+    } else {
+        ServiceId::Aci(Aci::from(parsed))
+    })
 }
 
 fn display_name(names: &HashMap<String, String>, uuid: &str) -> String {
@@ -204,9 +218,7 @@ pub fn parse_thread(thread_id: &str) -> Result<Thread, String> {
         let arr: [u8; 32] = bytes.try_into().map_err(|_| "bad group id".to_string())?;
         Ok(Thread::Group(arr))
     } else if let Some(uuid) = thread_id.strip_prefix("contact:") {
-        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
-        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
-        Ok(Thread::Contact(ServiceId::Aci(Aci::from(parsed))))
+        Ok(Thread::Contact(parse_service_id(uuid)?))
     } else {
         Err("bad thread id".to_string())
     }
@@ -428,8 +440,11 @@ pub async fn whoami(store: &SqliteStore) -> Result<String, String> {
 pub fn received_event(r: &Received, self_aci: &str, names: &HashMap<String, String>) -> Option<String> {
     let v = match r {
         Received::Content(c) => {
-            if reaction_part(c, names).is_some() || receipt_part(c, names).is_some() {
-                // Reaction/receipt-only envelopes are emitted as their own
+            if reaction_part(c, names).is_some()
+                || receipt_part(c, names).is_some()
+                || call_signal_part(c, names).is_some()
+            {
+                // Reaction/receipt/call-only envelopes are emitted as their own
                 // events by the loop; they must not become message rows.
                 return None;
             }
@@ -469,6 +484,122 @@ pub fn reaction_part(content: &Content, names: &HashMap<String, String>) -> Opti
         "remove": reaction.remove.unwrap_or(false),
         "sender": sender,
         "sender_name": display_name(names, &sender),
+    }))
+}
+
+/// Call signaling envelope → {"type":"call_signal", …}.
+///
+/// Signal carries call offer/answer/ICE/hangup/busy as a `CallMessage`
+/// content body (not a `DataMessage`), so it never reaches `content_parts`.
+/// This lifts those envelopes out of the receive stream and onto the event
+/// channel so the call state machine on the Swift side can drive ringing,
+/// answer, ICE and hangup.
+///
+/// `opaque` is the RingRTC protobuf blob (base64 here) — Signal's call
+/// protocol does not carry raw SDP on the wire.
+pub fn call_signal_part(
+    content: &Content,
+    names: &HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    let call = match &content.body {
+        ContentBody::CallMessage(c) => c,
+        _ => return None,
+    };
+    let sender = service_uuid(&content.metadata.sender);
+    let thread = thread_of_content(content)?;
+    let ts = content.metadata.server_timestamp.timestamp_millis().max(0) as u64;
+    let sender_device_id: u32 = content.metadata.sender_device.into();
+
+    use base64::Engine as _;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    // Signal may put several ICE candidates in one CallMessage. Keep the
+    // first value in `opaque` for compatibility and expose the complete list
+    // in `opaques` so RingRTC does not lose candidates.
+    let (kind, call_id, media_type, opaque, opaques, hangup_type, device_id) =
+        if let Some(offer) = &call.offer {
+            let media = match offer.r#type.unwrap_or(0) {
+                1 => "video",
+                _ => "audio",
+            };
+            let value = offer.opaque.clone().unwrap_or_default();
+            (
+                "offer",
+                offer.id.unwrap_or(0),
+                Some(media),
+                Some(b64(&value)),
+                Vec::<String>::new(),
+                None,
+                None,
+            )
+        } else if let Some(answer) = &call.answer {
+            let value = answer.opaque.clone().unwrap_or_default();
+            (
+                "answer",
+                answer.id.unwrap_or(0),
+                None,
+                Some(b64(&value)),
+                Vec::<String>::new(),
+                None,
+                None,
+            )
+        } else if let Some(ice) = call.ice_update.first() {
+            let values: Vec<String> = call
+                .ice_update
+                .iter()
+                .filter_map(|candidate| candidate.opaque.as_ref())
+                .map(|value| b64(value))
+                .collect();
+            let first = values.first().cloned();
+            (
+                "ice",
+                ice.id.unwrap_or(0),
+                None,
+                first,
+                values,
+                None,
+                None,
+            )
+        } else if let Some(hangup) = &call.hangup {
+            (
+                "hangup",
+                hangup.id.unwrap_or(0),
+                None,
+                None,
+                Vec::<String>::new(),
+                Some(hangup.r#type.unwrap_or(0)),
+                hangup.device_id,
+            )
+        } else if let Some(busy) = &call.busy {
+            (
+                "busy",
+                busy.id.unwrap_or(0),
+                None,
+                None,
+                Vec::<String>::new(),
+                None,
+                None,
+            )
+        } else {
+            return None;
+        };
+
+    Some(serde_json::json!({
+        "type": "call_signal",
+        "kind": kind,
+        "thread": thread,
+        "sender": sender,
+        "destination": service_uuid(&content.metadata.destination),
+        "sender_name": display_name(names, &sender),
+        "sender_device_id": sender_device_id,
+        "destination_device_id": call.destination_device_id,
+        "call_id": call_id,
+        "media_type": media_type,
+        "opaque": opaque,
+        "opaques": opaques,
+        "hangup_type": hangup_type,
+        "device_id": device_id,
+        "ts": ts,
     }))
 }
 
@@ -536,26 +667,54 @@ pub async fn do_send_full(
     send_content(manager, thread, content_body, ts).await
 }
 
-async fn send_content(
+pub(crate) async fn send_content(
     manager: &mut StoredManager,
     thread: &str,
-    content_body: ContentBody,
+    mut content_body: ContentBody,
     ts: u64,
 ) -> Result<u64, String> {
     if let Some(hexkey) = thread.strip_prefix("group:") {
         let bytes = hex::decode(hexkey).map_err(|_| "bad group id".to_string())?;
-        eprintln!("[core] send group key_len={}", bytes.len());
+        let key: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "bad group id length".to_string())?;
+        let revision = manager
+            .store()
+            .group(key)
+            .await
+            .map_err(|e| format!("group metadata: {e}"))?
+            .map(|group| group.revision)
+            .unwrap_or(0);
+
+        // Presage's group sender broadcasts to each member, but it does not
+        // add GroupsV2 context to the DataMessage itself. Without this field
+        // Signal clients legitimately classify the message as a 1:1 message
+        // from the sender (often the first/only visible member). Set the
+        // canonical master-key context before handing it to the sender.
+        if let ContentBody::DataMessage(message) = &mut content_body {
+            message.group_v2 = Some(GroupContextV2 {
+                master_key: Some(bytes.clone()),
+                revision: Some(revision),
+                group_change: None,
+            });
+        }
+
+        eprintln!(
+            "[core] send group key_len={} revision={} with_group_context",
+            bytes.len(),
+            revision
+        );
         manager
             .send_message_to_group(&bytes, content_body, ts)
             .await
             .map(|_| ts)
             .map_err(|e| format!("send: {e}"))
     } else if let Some(uuid) = thread.strip_prefix("contact:") {
-        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
-        eprintln!("[core] send contact id={bare}");
-        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
+        eprintln!("[core] send contact id={uuid}");
+        let recipient = parse_service_id(uuid)?;
         manager
-            .send_message(ServiceId::Aci(Aci::from(parsed)), content_body, ts)
+            .send_message(recipient, content_body, ts)
             .await
             .map(|_| ts)
             .map_err(|e| format!("send: {e}"))
@@ -665,19 +824,6 @@ pub async fn send_receipt(
         _ => return Err("invalid receipt kind".to_string()),
     };
 
-    // Parse thread to get recipient ServiceId
-    let recipient = if let Some(uuid) = thread.strip_prefix("contact:") {
-        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
-        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
-        ServiceId::Aci(Aci::from(parsed))
-    } else if let Some(_hexkey) = thread.strip_prefix("group:") {
-        // For groups, send to self (multi-device sync will distribute)
-        // Receipts for groups are handled differently - just skip for now
-        return Err("group receipts not yet supported".to_string());
-    } else {
-        return Err("bad thread id".to_string());
-    };
-
     let receipt_msg = ReceiptMessage {
         r#type: Some(receipt_type),
         timestamp: timestamps.iter().map(|&ts| ts as u64).collect(),
@@ -689,65 +835,66 @@ pub async fn send_receipt(
         .map_err(|e| format!("time error: {e}"))?
         .as_millis() as u64;
 
-    // Use the manager's public send_message which accepts any ContentBody
-    manager
-        .send_message(recipient, content_body, timestamp)
-        .await
-        .map_err(|e| format!("send receipt: {e}"))?;
+    // Parse thread to determine how to send
+    if let Some(uuid) = thread.strip_prefix("contact:") {
+        // 1:1 contact - send directly to the ACI
+        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
+        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
+        let recipient = ServiceId::Aci(Aci::from(parsed));
+        manager
+            .send_message(recipient, content_body, timestamp)
+            .await
+            .map_err(|e| format!("send receipt: {e}"))?;
+    } else if let Some(hexkey) = thread.strip_prefix("group:") {
+        // Group - send to the group using send_message_to_group with master key
+        let group_key_bytes = hex::decode(hexkey).map_err(|_| "bad group id".to_string())?;
+        manager
+            .send_message_to_group(&group_key_bytes, content_body, timestamp)
+            .await
+            .map_err(|e| format!("send group receipt: {e}"))?;
+    } else {
+        return Err("bad thread id".to_string());
+    }
 
     Ok(())
 }
 
-/// M4: Call signaling stubs - to be implemented with RingRTC integration
-/// These are called from the sync loop when call signaling commands arrive
-
-/// Send a call offer (SDP) to the remote peer via Signal's websocket.
+/// Legacy SDP-shaped call commands are intentionally disabled. The native
+/// RingRTC path (`core_cmd_call_start`/accept/hangup) owns call signaling.
 pub async fn send_call_offer_inner(
     _manager: &mut StoredManager,
-    call_id: &str,
+    _call_id: &str,
     _to: &str,
-    media_type: &str,
-    sdp: &str,
+    _media_type: &str,
+    _sdp: &str,
 ) -> Result<(), String> {
-    eprintln!("[core] call offer: call_id={} media_type={} sdp_len={}", call_id, media_type, sdp.len());
-    // TODO: M4 - Use RingRTC to generate proper offer and send via Signal's call signaling
-    // For now, just log and return success
-    Ok(())
+    Err("legacy SDP calls are disabled; use the native call API".to_string())
 }
 
-/// Send a call answer (SDP) to the remote peer via Signal's websocket.
 pub async fn send_call_answer_inner(
     _manager: &mut StoredManager,
-    call_id: &str,
-    sdp: &str,
+    _call_id: &str,
+    _sdp: &str,
 ) -> Result<(), String> {
-    eprintln!("[core] call answer: call_id={} sdp_len={}", call_id, sdp.len());
-    // TODO: M4 - Use RingRTC to generate proper answer and send via Signal's call signaling
-    Ok(())
+    Err("legacy SDP calls are disabled; use the native call API".to_string())
 }
 
-/// Send an ICE candidate to the remote peer via Signal's websocket.
 pub async fn send_call_ice_inner(
     _manager: &mut StoredManager,
-    call_id: &str,
-    candidate: &str,
-    sdp_mid: &str,
-    sdp_m_line_index: u32,
+    _call_id: &str,
+    _candidate: &str,
+    _sdp_mid: &str,
+    _sdp_m_line_index: u32,
 ) -> Result<(), String> {
-    eprintln!("[core] call ice: call_id={} candidate={} mid={} m_line={}", call_id, candidate, sdp_mid, sdp_m_line_index);
-    // TODO: M4 - Send ICE candidate via Signal's call signaling
-    Ok(())
+    Err("legacy SDP calls are disabled; use the native call API".to_string())
 }
 
-/// Send a call hangup to the remote peer via Signal's websocket.
 pub async fn send_call_hangup_inner(
     _manager: &mut StoredManager,
-    call_id: &str,
-    reason: &str,
+    _call_id: &str,
+    _reason: &str,
 ) -> Result<(), String> {
-    eprintln!("[core] call hangup: call_id={} reason={}", call_id, reason);
-    // TODO: M4 - Send hangup via Signal's call signaling
-    Ok(())
+    Err("legacy SDP calls are disabled; use the native call API".to_string())
 }
 
 /// Send a message edit to the remote peer via Signal's websocket.
@@ -759,8 +906,6 @@ pub async fn send_message_edit(
 ) -> Result<u64, String> {
     use presage::libsignal_service::proto::EditMessage;
     use presage::libsignal_service::content::ContentBody;
-    use presage::libsignal_service::protocol::{Aci, ServiceId};
-
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| format!("time error: {e}"))?
@@ -768,9 +913,7 @@ pub async fn send_message_edit(
 
     // Parse thread to get recipient ServiceId
     let recipient = if let Some(uuid) = thread.strip_prefix("contact:") {
-        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
-        let parsed: uuid::Uuid = uuid.parse().map_err(|_| "bad contact id".to_string())?;
-        ServiceId::Aci(Aci::from(parsed))
+        parse_service_id(uuid)?
     } else if let Some(_hexkey) = thread.strip_prefix("group:") {
         return Err("group message edits not yet supported".to_string());
     } else {
@@ -804,12 +947,9 @@ pub async fn send_typing(
 ) -> Result<(), String> {
     use presage::libsignal_service::content::ContentBody;
     use presage::libsignal_service::proto::TypingMessage;
-    use presage::libsignal_service::protocol::{Aci, ServiceId};
 
     let recipient = if let Some(uuid) = thread.strip_prefix("contact:") {
-        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
-        let parsed: uuid::Uuid = uuid.parse().map_err(|_| "bad contact id".to_string())?;
-        ServiceId::Aci(Aci::from(parsed))
+        parse_service_id(uuid)?
     } else if let Some(_hexkey) = thread.strip_prefix("group:") {
         // For groups, typing indicators work similarly
         return Err("group typing not yet supported".to_string());

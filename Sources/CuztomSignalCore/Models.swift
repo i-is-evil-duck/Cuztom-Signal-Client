@@ -4,18 +4,42 @@ import Foundation
 public struct SignalAddress: Hashable, Sendable, Codable {
     public var uuidString: String?
     public var phone: String?
+    /// Group master key (hex) - only set for groups, not the full thread ID
     public var groupId: String?
+    /// Full thread identifier: "contact:<uuid>" or "group:<master_key_hex>"
+    public var threadId: String?
 
-    public init(uuidString: String? = nil, phone: String? = nil, groupId: String? = nil) {
+    public init(uuidString: String? = nil, phone: String? = nil, groupId: String? = nil, threadId: String? = nil) {
         self.uuidString = uuidString
         self.phone = phone
         self.groupId = groupId
+        self.threadId = threadId
     }
 
     public var isGroup: Bool { groupId != nil }
 
+    /// Key for display/lookup: group master key, or contact UUID/phone
     public var displayKey: String {
         groupId ?? uuidString ?? phone ?? "unknown"
+    }
+
+    /// Create a SignalAddress from a thread ID string
+    public static func from(threadId: String) -> SignalAddress {
+        if threadId.hasPrefix("group:") {
+            let masterKey = String(threadId.dropFirst(6)) // Remove "group:" prefix
+            return SignalAddress(groupId: masterKey, threadId: threadId)
+        } else if threadId.hasPrefix("contact:") {
+            let uuid = String(threadId.dropFirst(8)) // Remove "contact:" prefix
+            return SignalAddress(uuidString: uuid, threadId: threadId)
+        } else {
+            // Fallback - treat as UUID
+            return SignalAddress(uuidString: threadId, threadId: threadId)
+        }
+    }
+
+    /// Get the thread ID, deriving from components if not explicitly set
+    public var effectiveThreadId: String {
+        threadId ?? (groupId.map { "group:\($0)" } ?? uuidString.map { "contact:\($0)" } ?? "unknown")
     }
 }
 

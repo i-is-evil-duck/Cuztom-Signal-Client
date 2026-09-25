@@ -20,7 +20,7 @@ struct ContentView: View {
                     ZStack {
                         MessageListView()
                         // Incoming call overlay
-                        if let call = vm.incomingCall {
+                        if let call = vm.incomingCall, vm.activeCall == nil {
                             IncomingCallView(
                                 call: call,
                                 onAnswer: { Task { await vm.answerCall() } },
@@ -118,7 +118,7 @@ struct SidebarView: View {
                 .padding(.horizontal, 12).padding(.vertical, 6)
         }
         .onChange(of: vm.selectedId) { _, newId in
-            if let newId { Task { await vm.select(newId) } }
+            if let newId { vm.select(newId) }
         }
     }
 }
@@ -152,13 +152,14 @@ struct MessageListView: View {
                             .help("Voice call")
                             .disabled(vm.activeCall != nil || vm.incomingCall != nil)
 
-                            // Video call button
+                            // Video is intentionally not enabled yet; the native
+                            // audio path is the supported lightweight call mode.
                             Button { Task { await vm.startVideoCall() } } label: {
                                 Image(systemName: "video.fill")
                             }
                             .buttonStyle(.plain)
-                            .help("Video call")
-                            .disabled(vm.activeCall != nil || vm.incomingCall != nil)
+                            .help("Video calls are not available yet")
+                            .disabled(true)
                         }
                     }
                     .padding(.horizontal, 12).padding(.vertical, 4)
@@ -195,13 +196,29 @@ struct MessageListView: View {
                         .disabled(loadingMore)
                     }
                 }
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(vm.messages, id: \.id) { msg in
-                            MessageRow(msg: msg)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(vm.messages, id: \.id) { msg in
+                                MessageRow(msg: msg)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("message-bottom")
+                        }
+                        .padding()
+                    }
+                    .onAppear {
+                        proxy.scrollTo("message-bottom", anchor: .bottom)
+                    }
+                    .onChange(of: vm.messages.map(\.id)) { _, _ in
+                        // Covers both locally sent messages and live inbound
+                        // messages without changing the user's scroll position
+                        // while they are reading older history.
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo("message-bottom", anchor: .bottom)
                         }
                     }
-                    .padding()
                 }
                 Divider()
                 if let quote = vm.replyingTo {
@@ -314,11 +331,15 @@ struct MessageListView: View {
                 Text("Message info").font(.headline)
                 if !msg.readBy.isEmpty {
                     Text("Seen by").font(.caption).foregroundStyle(.secondary)
-                    ForEach(msg.readBy, id: \.self) { Text("✓ \($0)") }
+                    ForEach(msg.readBy, id: \.self) { aci in
+                        Text("✓ \(vm.displayName(for: aci, in: msg.conversationId))")
+                    }
                 }
                 if !msg.deliveredTo.isEmpty {
                     Text("Delivered to").font(.caption).foregroundStyle(.secondary)
-                    ForEach(msg.deliveredTo, id: \.self) { Text("✓ \($0)") }
+                    ForEach(msg.deliveredTo, id: \.self) { aci in
+                        Text("✓ \(vm.displayName(for: aci, in: msg.conversationId))")
+                    }
                 }
                 if msg.readBy.isEmpty && msg.deliveredTo.isEmpty {
                     Text("No receipts yet.").foregroundStyle(.secondary)
@@ -344,9 +365,12 @@ struct MessageListView: View {
 
     private func send() {
         let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty || !vm.pendingFiles.isEmpty else { return }
+        guard !body.isEmpty || !vm.pendingFiles.isEmpty,
+              let targetID = vm.selectedId else { return }
         draft = ""
-        Task { await vm.send(body) }
+        // Capture the destination at the moment Send is tapped. An async
+        // history refresh must never redirect this message to the old chat.
+        Task { await vm.send(body, to: targetID) }
     }
 }
 
@@ -360,39 +384,24 @@ struct MessageRow: View {
         msg.author.groupId != nil
     }
 
-    private var senderInitials: String {
-        // For group messages, show sender initials
-        if isGroupMessage {
-            if let authorName = msg.author.uuidString {
-                // Try to get initials from the ACI/UUID or use a hash-based approach
-                let name = msg.author.uuidString ?? "?"
-                let components = name.split(separator: " ")
-                if components.count >= 2 {
-                    return String(components[0].prefix(1)) + String(components[1].prefix(1))
-                } else {
-                    return String(name.prefix(2)).uppercased()
-                }
-            }
-        }
-        return ""
-    }
-
     var body: some View {
         HStack {
             if msg.direction == .outgoing { Spacer() }
             VStack(alignment: .leading, spacing: 4) {
                 // Sender name/initials for group messages (incoming only)
                 if isGroupMessage && msg.direction == .incoming {
+                    let senderName = vm.displayName(for: msg.author.uuidString ?? "", in: msg.conversationId)
+                    let initials = vm.initials(for: senderName)
                     HStack(spacing: 6) {
                         Circle()
                             .fill(Color.accentColor.opacity(0.3))
                             .frame(width: 24, height: 24)
                             .overlay {
-                                Text(senderInitials)
+                                Text(initials.isEmpty ? "?" : initials)
                                     .font(.system(size: 11, weight: .semibold))
                                     .foregroundStyle(.white)
                             }
-                        Text(msg.author.uuidString?.prefix(8) ?? "Unknown")
+                        Text(senderName)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -460,8 +469,14 @@ struct MessageRow: View {
 
     private var receiptLine: String {
         var parts: [String] = []
-        if !msg.readBy.isEmpty { parts.append("Seen by \(msg.readBy.joined(separator: ", "))") }
-        if !msg.deliveredTo.isEmpty { parts.append("Delivered to \(msg.deliveredTo.joined(separator: ", "))") }
+        if !msg.readBy.isEmpty {
+            let names = msg.readBy.map { vm.displayName(for: $0, in: msg.conversationId) }
+            parts.append("Seen by \(names.joined(separator: ", "))")
+        }
+        if !msg.deliveredTo.isEmpty {
+            let names = msg.deliveredTo.map { vm.displayName(for: $0, in: msg.conversationId) }
+            parts.append("Delivered to \(names.joined(separator: ", "))")
+        }
         return parts.joined(separator: " · ")
     }
 }
@@ -735,13 +750,13 @@ private func qrNSImage(_ string: String) -> NSImage? {
 struct LinkPreviewsView: View {
     let text: String
     @State private var previews: [URL: LinkPreview] = [:]
-    
+
     private var urls: [URL] {
         let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
         let matches = detector?.matches(in: text, range: NSRange(location: 0, length: text.utf16.count)) ?? []
         return matches.compactMap { $0.url }
     }
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(urls.prefix(3), id: \.self) { url in
@@ -754,7 +769,7 @@ struct LinkPreviewsView: View {
             }
         }
     }
-    
+
     private func fetchPreview(for url: URL) async {
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
@@ -768,7 +783,7 @@ struct LinkPreviewsView: View {
             // Silently fail for link previews
         }
     }
-    
+
     private func extractMeta(_ html: String, property: String) -> String? {
         let pattern = "<meta property=\"\(property)\" content=\"([^\"]+)\""
         let regex = try? NSRegularExpression(pattern: pattern)
@@ -777,7 +792,7 @@ struct LinkPreviewsView: View {
             Range($0.range(at: 1), in: html).map { String(html[$0]) }
         }
     }
-    
+
     private func extractTag(_ html: String, tag: String) -> String? {
         let pattern = "<\(tag)[^>]*>([^<]+)</\(tag)>"
         let regex = try? NSRegularExpression(pattern: pattern)
@@ -797,7 +812,7 @@ struct LinkPreview {
 struct LinkPreviewRow: View {
     let url: URL
     let preview: LinkPreview?
-    
+
     var body: some View {
         HStack(spacing: 8) {
             if let preview = preview,

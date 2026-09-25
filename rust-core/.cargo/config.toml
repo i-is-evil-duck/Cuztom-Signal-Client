@@ -1,0 +1,10 @@
+# ringrtc's `webrtc-sys` build script calls `bin/env.sh`, which probes for GNU
+# `realpath -e`. macOS ships realpath without `-e`, so the script falls back to
+# `grealpath` (Homebrew coreutils). `scripts/grealpath` is a dependency-free
+# shim, so we prepend it to PATH here instead of requiring `brew install
+# coreutils`.
+#
+# `relative = true` resolves against this file's directory (rust-core/), and
+# `force = false` keeps any existing PATH entries.
+[env]
+PATH = { value = "scripts", relative = true, force = false }

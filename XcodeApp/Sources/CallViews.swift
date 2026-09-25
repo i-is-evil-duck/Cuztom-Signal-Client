@@ -22,7 +22,7 @@ struct IncomingCallView: View {
                         .font(.title2)
                         .foregroundStyle(.white)
 
-                    Text(call.callRecord.remotePeer.phone ?? call.callRecord.remotePeer.uuidString ?? "Unknown")
+                    Text(callDisplayName(call))
                         .font(.system(size: 36, weight: .medium))
                         .foregroundStyle(.white)
                 }
@@ -61,6 +61,13 @@ struct IncomingCallView: View {
         .onAppear {
             // Ring ring sound would go here
         }
+    }
+
+    private func callDisplayName(_ call: ActiveCall) -> String {
+        if let uuid = call.callRecord.remotePeer.uuidString {
+            return vm.displayName(for: uuid, in: call.callRecord.conversationId)
+        }
+        return call.callRecord.remotePeer.phone ?? "Unknown"
     }
 }
 
@@ -145,6 +152,7 @@ struct VideoCallLayout: View {
 }
 
 struct VoiceCallLayout: View {
+    @Environment(ChatViewModel.self) private var vm
     let call: ActiveCall
 
     var body: some View {
@@ -157,12 +165,12 @@ struct VoiceCallLayout: View {
                     .fill(Color.accentColor.opacity(0.3))
                     .frame(width: 160, height: 160)
                     .overlay {
-                        Text(String(call.callRecord.remotePeer.phone?.prefix(1) ?? "?"))
-                            .font(.system(size: 64, weight: .light))
+                        Text(vm.initials(for: callDisplayName))
+                            .font(.system(size: 42, weight: .semibold))
                             .foregroundStyle(.white)
                     }
 
-                Text(call.callRecord.remotePeer.phone ?? call.callRecord.remotePeer.uuidString ?? "Unknown")
+                Text(callDisplayName)
                     .font(.title)
                     .foregroundStyle(.white)
 
@@ -171,14 +179,26 @@ struct VoiceCallLayout: View {
                     .foregroundStyle(.white.opacity(0.7))
 
                 if let connectTime = call.callRecord.connectTime {
-                    Text(formatDuration(Date().timeIntervalSince(connectTime)))
-                        .font(.system(.title, design: .monospaced))
-                        .foregroundStyle(.white)
+                    // A plain Date() in the view body is evaluated only when
+                    // another state change redraws the screen. TimelineView
+                    // keeps the elapsed call timer live without a timer task.
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        Text(formatDuration(max(0, timeline.date.timeIntervalSince(connectTime))))
+                            .font(.system(.title, design: .monospaced))
+                            .foregroundStyle(.white)
+                    }
                 }
             }
 
             Spacer()
         }
+    }
+
+    private var callDisplayName: String {
+        if let uuid = call.callRecord.remotePeer.uuidString {
+            return vm.displayName(for: uuid, in: call.callRecord.conversationId)
+        }
+        return call.callRecord.remotePeer.phone ?? "Unknown"
     }
 }
 
@@ -266,6 +286,7 @@ struct ControlButton: View {
 
 /// Call history row
 struct CallHistoryRow: View {
+    @Environment(ChatViewModel.self) private var vm
     let record: CallRecord
 
     var body: some View {
@@ -277,7 +298,9 @@ struct CallHistoryRow: View {
                 .frame(width: 44)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(record.remotePeer.phone ?? record.remotePeer.uuidString ?? "Unknown")
+                Text(record.remotePeer.uuidString.map {
+                    vm.displayName(for: $0, in: record.conversationId)
+                } ?? record.remotePeer.phone ?? "Unknown")
                     .font(.headline)
 
                 HStack(spacing: 8) {

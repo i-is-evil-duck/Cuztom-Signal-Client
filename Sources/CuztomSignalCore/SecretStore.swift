@@ -6,6 +6,8 @@ public protocol SecretStoring: Sendable {
     func load(key: String) async -> Data?
     func save(key: String, value: Data) async throws
     func delete(key: String) async
+    /// Delete all stored secrets. Used on logout.
+    func clearAll() async
 }
 
 public actor InMemorySecretStore: SecretStoring {
@@ -15,6 +17,7 @@ public actor InMemorySecretStore: SecretStoring {
     public func load(key: String) async -> Data? { bag[key] }
     public func save(key: String, value: Data) async throws { bag[key] = value }
     public func delete(key: String) async { bag.removeValue(forKey: key) }
+    public func clearAll() async { bag.removeAll() }
 }
 
 #if canImport(Security)
@@ -67,6 +70,14 @@ public struct KeychainSecretStore: SecretStoring {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    public func clearAll() async {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
         ]
         SecItemDelete(query as CFDictionary)
     }

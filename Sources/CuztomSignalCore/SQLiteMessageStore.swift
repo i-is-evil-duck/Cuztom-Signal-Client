@@ -304,6 +304,18 @@ public actor SQLiteMessageStore: MessageStoring {
             return 0
         }
     }
+
+    public func clearAllData() async {
+        do {
+            try await dbQueue.write { db in
+                try db.execute(sql: "DELETE FROM messages")
+                try db.execute(sql: "DELETE FROM conversations")
+            }
+            Log.info("SQLiteMessageStore: cleared all data")
+        } catch {
+            Log.error("clearAllData failed: \(error)")
+        }
+    }
 }
 
 // MARK: - GRDB Record Conformance
