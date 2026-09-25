@@ -372,30 +372,37 @@ impl<S: Store> Manager<S, Registered> {
         Ok(self.identified_websocket(false).await?.whoami().await?)
     }
 
-    /// Fetches raw ZK group auth credentials for a day range, as JSON.
+    /// Fetches raw ZK group auth credentials for a day range, as JSON, along
+    /// with the server's ZK public parameters.
     ///
-    /// Added for group calls. A group-call membership proof is derived from one
-    /// of these credentials, and the derivation is local
-    /// (`AuthCredentialWithPniZkc::present`), so only the credential itself has
-    /// to come from the server.
+    /// Added for group calls. A group-call membership proof is derived from an
+    /// auth credential, and that derivation is local
+    /// (`AuthCredentialWithPniZkc::present`), so only the credential and the
+    /// server parameters have to come from the service.
     ///
     /// The endpoint is `GET /v1/certificate/auth/group` with
     /// `zkcCredential=true`. `start_day`/`end_day` are day numbers since the
     /// Unix epoch, matching Signal's redemption-day addressing.
     ///
-    /// The body is returned unparsed on purpose: the response shape belongs to
-    /// the calling protocol rather than to presage, so it is decoded by the
-    /// caller where it can be tested. Non-2xx responses become an error rather
-    /// than being handed back as if they were credentials.
+    /// The credential body is returned unparsed on purpose: the response shape
+    /// belongs to the calling protocol rather than to presage, so it is decoded
+    /// by the caller where it can be tested. The server parameters are already
+    /// typed and are returned as-is.
+    ///
+    /// The server parameters are returned alongside rather than through a
+    /// separate accessor because `service_configuration` is private and this is
+    /// the only place they are needed.
     pub async fn group_auth_credentials_raw(
         &self,
         start_day: u64,
         end_day: u64,
-    ) -> Result<String, Error<S::Error>> {
+    ) -> Result<(String, libsignal_service::zkgroup::server_params::ServerPublicParams), Error<S::Error>> {
         use libsignal_service::configuration::Endpoint;
         use libsignal_service::prelude::ServiceError;
         use libsignal_service::push_service::HttpAuthOverride;
 
+        let server_public_params =
+            self.state.service_configuration().zkgroup_server_public_params;
         let service = self.identified_push_service();
         let path = format!(
             "/v1/certificate/auth/group?redemptionStartSeconds={start_day}&redemptionEndSeconds={end_day}&zkcCredential=true"
@@ -419,10 +426,11 @@ impl<S: Store> Manager<S, Registered> {
             }
             .into());
         }
-        response
+        let body = response
             .text()
             .await
-            .map_err(|e| Error::IoError(std::io::Error::other(e)))
+            .map_err(|e| Error::IoError(std::io::Error::other(e)))?;
+        Ok((body, server_public_params))
     }
 
     pub fn device_id(&self) -> DeviceId {

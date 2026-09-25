@@ -278,6 +278,16 @@ enum Command {
     GroupAuthCredentials {
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Build the CDN authorization for a group call membership proof.
+    ///
+    /// Takes the 32-byte ZK group identifier RingRTC asks about and returns the
+    /// `hex(groupPublicParams):hex(presentation)` value the CDN redeems. The
+    /// credential fetch and the presentation both happen in one step because the
+    /// ZK server public params are only reachable from the live manager.
+    GroupCallProofAuthorization {
+        group_id: Vec<u8>,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     /// Hand a group-call membership proof to RingRTC, unblocking the SFU join.
     GroupCallSetMembershipProof {
         client_id: u32,
@@ -472,6 +482,15 @@ enum LoopCtrl {
     GroupAuthCredentials {
         start_day: u64,
         end_day: u64,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Fetch and present a ZK group auth credential for one group.
+    ///
+    /// The loop is the only place that can do this: the credential request is
+    /// authenticated, and the server public params the presentation verifies
+    /// against come from the same live service configuration.
+    GroupCallProofAuthorization {
+        group_id: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     // Call signaling integration
@@ -888,6 +907,10 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::GroupAuthCredentials { reply } => {
                             let result = cmd_group_auth_credentials(&state).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallProofAuthorization { group_id, reply } => {
+                            let result = cmd_group_call_proof_authorization(&state, &group_id).await;
                             let _ = reply.send(result);
                         }
                         Command::GroupCallSetMembershipProof { client_id, token, reply } => {
@@ -1377,6 +1400,13 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                     // happen here.
                                     let r = manager
                                         .group_auth_credentials_raw(start_day, end_day)
+                                        .await
+                                        .map(|(body, _server_params)| body)
+                                        .map_err(|e| e.to_string());
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::GroupCallProofAuthorization { group_id, reply }) => {
+                                    let r = call::prepare_group_call_proof(&mut manager, &group_id, &self_aci)
                                         .await
                                         .map_err(|e| e.to_string());
                                     let _ = reply.send(r);
@@ -2252,6 +2282,40 @@ async fn cmd_group_auth_credentials(state: &WorkerState) -> Result<String, Strin
     reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
 }
 
+/// Build the CDN authorization for a group call membership proof.
+///
+/// `group_id` is the 32-byte ZK group identifier RingRTC reports. Everything
+/// that needs the live manager happens in one hop through the sync loop: the
+/// credential request is authenticated, and the ZK server public params the
+/// presentation verifies against are only reachable there. Swift then redeems
+/// the returned value at the CDN, which is the one part worth keeping testable
+/// on its own.
+async fn cmd_group_call_proof_authorization(
+    state: &WorkerState,
+    group_id: &[u8],
+) -> Result<String, String> {
+    if group_id.is_empty() {
+        return Err("group call proof needs a group id".to_string());
+    }
+    let sender = match state {
+        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
+            Some(sender) => sender,
+            None => return Err("sync loop is not running".to_string()),
+        },
+        _ => return Err("not linked".to_string()),
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    send_sync_ctrl_wait(
+        sender,
+        LoopCtrl::GroupCallProofAuthorization {
+            group_id: group_id.to_vec(),
+            reply: reply_tx,
+        },
+    )
+    .await?;
+    reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
+}
+
 /// Legacy SDP-shaped command retained for source compatibility. New clients
 /// use `core_cmd_call_start` and let RingRTC generate the opaque signaling.
 async fn cmd_send_call_offer(
@@ -2568,7 +2632,7 @@ async fn cmd_fetch_attachment(
 /// 3 adds `core_cmd_http_response`, which lets the host perform the SFU
 /// requests RingRTC raises. Older dylibs lack that symbol, so the loader
 /// rejects them rather than stalling group calls on unanswered SFU requests.
-pub const CORE_ABI_VERSION: u32 = 3;
+pub const CORE_ABI_VERSION: u32 = 4;
 
 #[no_mangle]
 pub extern "C" fn core_abi_version() -> u32 {
@@ -3460,6 +3524,40 @@ pub extern "C" fn core_cmd_group_auth_credentials() -> *mut c_char {
     }
 }
 
+/// Build the CDN authorization for a group call membership proof.
+///
+/// `group_id` is the 32-byte ZK group identifier RingRTC reports, as raw bytes.
+/// Returns the `hex(groupPublicParams):hex(presentation)` value that
+/// `GroupCallProofService` redeems at the CDN, as a NUL-terminated string the
+/// caller frees with `core_cmd_string_free`.
+///
+/// Nothing is returned when the account is not linked, when the sync loop is not
+/// running, or when the group is not one this device is a member of. There is no
+/// synthesized proof: without a real server-issued credential the SFU would
+/// reject the join, and faking it would make the failure look like a transport
+/// fault.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_proof_authorization(group_id: *const u8, group_id_len: u32) -> *mut c_char {
+    if group_id.is_null() {
+        set_last_error("group call proof needs a group id".to_string());
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(group_id, group_id_len as usize) }.to_vec();
+    match roundtrip(|reply| Command::GroupCallProofAuthorization { group_id: bytes, reply }) {
+        Ok(Ok(authorization)) => match std::ffi::CString::new(authorization) {
+            Ok(value) => value.into_raw(),
+            Err(_) => {
+                set_last_error("membership proof was not valid UTF-8".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Deliver an SFU HTTP response that the host performed for RingRTC.
 ///
 /// RingRTC raises SFU requests as `http_request` events and stalls until this
@@ -3793,7 +3891,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(core_abi_version(), 3);
+        assert_eq!(core_abi_version(), 4);
         assert_eq!(core_abi_version(), CORE_ABI_VERSION);
     }
 

@@ -45,6 +45,25 @@ pub enum GroupCallError {
     InvalidServiceId(String),
     Serialization(&'static str),
     EmptyGroupPublicParams,
+    /// The server sent no credential valid on the requested day. Not
+    /// substituted with a nearby one: that presents a credential the SFU will
+    /// reject, and the rejection reads like a transport fault.
+    NoCredentialForDay(u64),
+    /// The response carried no PNI to bind the credential to.
+    CredentialMissingPni,
+    /// The credential did not verify against the server's public params, so it
+    /// was not issued for this account, group, or time.
+    CredentialRejected,
+    /// A PNI was supplied where an ACI is required.
+    NotAnAci,
+    /// The response's `redemptionTime` is not a whole number of seconds.
+    ///
+    /// zkgroup timestamps are seconds, and the credential is bound to the exact
+    /// redemption instant, so a sub-second remainder would silently produce a
+    /// credential that fails to verify. The service sends day-aligned values, so
+    /// this means the response is not what it claims and is refused rather than
+    /// rounded.
+    MisalignedRedemptionTime(u64),
 }
 
 impl std::fmt::Display for GroupCallError {
@@ -56,6 +75,20 @@ impl std::fmt::Display for GroupCallError {
             GroupCallError::EmptyGroupPublicParams => {
                 write!(f, "group public params serialized to an empty buffer")
             }
+            GroupCallError::NoCredentialForDay(day) => {
+                write!(f, "no group auth credential for redemption day {day}")
+            }
+            GroupCallError::CredentialMissingPni => {
+                write!(f, "group credential response carried no PNI")
+            }
+            GroupCallError::CredentialRejected => {
+                write!(f, "group auth credential failed verification")
+            }
+            GroupCallError::NotAnAci => write!(f, "group call proof requires an ACI, not a PNI"),
+            GroupCallError::MisalignedRedemptionTime(ms) => write!(
+                f,
+                "group credential redemptionTime {ms}ms is not a whole number of seconds"
+            ),
         }
     }
 }
@@ -268,6 +301,101 @@ impl GroupCallIdentity {
             hex_encode(&presentation_bytes)
         ))
     }
+}
+
+/// Build the CDN authorization value for a group call membership proof.
+///
+/// This is the whole crypto half of a group-call join. The credential fetch and
+/// the CDN redemption are I/O and happen elsewhere; everything between them is
+/// here and is pure, so it can be tested offline.
+///
+/// 1. pick the credential whose redemption day is `day`,
+/// 2. base64-decode and deserialize the `AuthCredentialWithPniResponse`,
+/// 3. bind it to our ACI and the PNI the server echoed back,
+/// 4. present it with the group's secret params and the server's public params.
+///
+/// The PNI is taken from the *response* rather than from local state because the
+/// credential is bound to that specific (ACI, PNI) pair. A response without one
+/// is refused rather than guessed at: presenting a credential against the wrong
+/// identity produces an SFU rejection with no useful diagnostic.
+pub fn build_proof_authorization(
+    master_key: &[u8],
+    credentials_json: &str,
+    server_public_params: &ServerPublicParams,
+    our_aci: ServiceId,
+    day: u64,
+) -> Result<String, GroupCallError> {
+    use presage::libsignal_service::zkgroup::api::auth::{
+        AuthCredentialWithPni, AuthCredentialWithPniResponse,
+    };
+    use presage::libsignal_service::zkgroup::Timestamp;
+    use base64::Engine as _;
+
+    let identity = GroupCallIdentity::from_master_key(master_key)?;
+    let response: GroupAuthCredentialsResponse = serde_json::from_str(credentials_json)
+        .map_err(|_| GroupCallError::Serialization("group credential response"))?;
+    let entry = response
+        .credential_for_day(day)
+        .ok_or(GroupCallError::NoCredentialForDay(day))?;
+    let pni_text = response
+        .pni
+        .as_deref()
+        .ok_or(GroupCallError::CredentialMissingPni)?;
+    let pni_uuid = pni_text
+        .strip_prefix("PNI:")
+        .unwrap_or(pni_text)
+        .parse::<Uuid>()
+        .map_err(|_| GroupCallError::InvalidServiceId(pni_text.to_string()))?;
+    let aci = match our_aci {
+        ServiceId::Aci(aci) => aci,
+        // A PNI cannot be an ACI. Failing is the only safe answer: the
+        // credential would be presented against a different identity.
+        ServiceId::Pni(_) => return Err(GroupCallError::NotAnAci),
+    };
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&entry.credential)
+        .map_err(|_| GroupCallError::Serialization("group credential base64"))?;
+    let response = AuthCredentialWithPniResponse::new(&bytes)
+        .map_err(|_| GroupCallError::Serialization("group credential body"))?;
+    // The REST response is in milliseconds; zkgroup timestamps are seconds. The
+    // credential is bound to the exact instant, so a sub-second remainder is
+    // refused rather than rounded: rounding would yield a credential that fails
+    // to verify and reports as an unrelated rejection.
+    if entry.redemption_time % 1_000 != 0 {
+        return Err(GroupCallError::MisalignedRedemptionTime(entry.redemption_time));
+    }
+    let credential = response
+        .receive(
+            server_public_params,
+            aci,
+            pni_uuid.into(),
+            Timestamp::from_epoch_seconds(entry.redemption_time / 1_000),
+        )
+        .map_err(|_| GroupCallError::CredentialRejected)?;
+    // The enum has exactly one variant today. Unwrapping it explicitly means a
+    // future version fails here, in this file, rather than being presented
+    // through a version-wrapping helper that changes the bytes on the wire.
+    let credential = match credential {
+        AuthCredentialWithPni::Zkc(credential) => credential,
+    };
+    identity.membership_proof_authorization(
+        server_public_params,
+        &credential,
+        proof_randomness(),
+    )
+}
+
+/// Fresh randomness for one proof presentation.
+///
+/// `OsRng` panics if the OS cannot supply entropy, which is the correct outcome
+/// here: a predictable presentation would be sent to the SFU and would fail
+/// there with a diagnostic that points nowhere near the real cause.
+fn proof_randomness() -> RandomnessBytes {
+    use rand::RngCore as _;
+    let mut randomness: RandomnessBytes = [0u8; presage::libsignal_service::zkgroup::RANDOMNESS_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut randomness);
+    randomness
 }
 
 /// One member's identity as RingRTC's SFU client expects it.
@@ -523,5 +651,250 @@ mod tests {
     #[test]
     fn garbage_is_not_decoded_as_a_group_signal() {
         assert!(unwrap_group_call_signal(&[0xff, 0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---- membership proof construction ----
+    //
+    // A local ZK server issues credentials with the same code path the real
+    // service uses, so the whole chain (deserialize, bind, present, format the
+    // CDN authorization) is verified here without a network or a real account.
+    // This is the closest thing to an end-to-end check available offline.
+
+    use presage::libsignal_service::protocol::Pni;
+    use presage::libsignal_service::zkgroup::api::{
+        auth::{AuthCredentialWithPniResponse, AuthCredentialWithPniZkcResponse},
+        server_params::ServerSecretParams,
+    };
+    use presage::libsignal_service::zkgroup::Timestamp;
+    use base64::Engine as _;
+
+    const ACI: &str = "11111111-1111-1111-1111-111111111111";
+    const PNI: &str = "22222222-2222-2222-2222-222222222222";
+    /// A fixed day boundary, which is what the service issues credentials for.
+    const REDEMPTION_DAY: u64 = 19_675;
+    const REDEMPTION_SECS: u64 = REDEMPTION_DAY * 86_400;
+
+    fn aci(text: &str) -> Aci {
+        Aci::from(text.parse::<Uuid>().expect("uuid"))
+    }
+
+    fn pni(text: &str) -> Pni {
+        Pni::from(text.parse::<Uuid>().expect("uuid"))
+    }
+
+    /// A local server plus a credential it issued for (ACI, PNI) on the given
+    /// day, and the `GET /v1/certificate/auth/group` JSON that would carry it.
+    fn issued_credential(for_aci: &str, for_pni: &str, day: u64) -> (ServerPublicParams, String) {
+        let server_secret = ServerSecretParams::generate([1u8; 32]);
+        let server_public = server_secret.get_public_params();
+        let response = AuthCredentialWithPniResponse::Zkc(
+            AuthCredentialWithPniZkcResponse::issue_credential(
+                aci(for_aci),
+                pni(for_pni),
+                Timestamp::from_epoch_seconds(day * 86_400),
+                &server_secret,
+                [2u8; 32],
+            ),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(serialize(&response));
+        let json = format!(
+            r#"{{"pni":"PNI:{for_pni}","credentials":[{{"credential":"{encoded}","redemptionTime":{}}}]}}"#,
+            day * DAY_MS
+        );
+        (server_public, json)
+    }
+
+    #[test]
+    fn a_sub_second_redemption_time_is_refused_not_rounded() {
+        // The credential is bound to the exact instant, so rounding the
+        // milliseconds down to seconds would produce a credential that does not
+        // verify and reports as an unrelated rejection.
+        let (server_public, json) = issued_credential(ACI, PNI, REDEMPTION_DAY);
+        let json = json.replace(
+            &format!("\"redemptionTime\":{}", REDEMPTION_DAY * DAY_MS),
+            &format!("\"redemptionTime\":{}", REDEMPTION_DAY * DAY_MS + 500),
+        );
+        let result = build_proof_authorization(
+            &master_key(7),
+            &json,
+            &server_public,
+            ServiceId::Aci(aci(ACI)),
+            REDEMPTION_DAY,
+        );
+        assert!(matches!(
+            result,
+            Err(GroupCallError::MisalignedRedemptionTime(_))
+        ));
+    }
+
+    #[test]
+    fn a_membership_proof_is_built_from_a_real_credential() {        let day = REDEMPTION_DAY;
+        let (server_public, json) = issued_credential(ACI, PNI, day);
+        let key = master_key(7);
+        let identity = GroupCallIdentity::from_master_key(&key).expect("valid key");
+
+        let authorization =
+            build_proof_authorization(&key, &json, &server_public, ServiceId::Aci(aci(ACI)), day)
+                .expect("a server-issued credential produces a proof");
+
+        // The shape is exactly what the CDN basic-auth header needs: the group's
+        // public params, then the presentation, hex encoded and colon separated.
+        let (public_hex, presentation_hex) = authorization
+            .split_once(':')
+            .expect("authorization is params:presentation");
+        assert_eq!(
+            public_hex,
+            hex_encode(&identity.public_params_bytes()),
+            "the proof must be for the group it was asked about"
+        );
+        assert!(
+            presentation_hex.len() > 32,
+            "a presentation is not an empty or stub value, got {presentation_hex:?}"
+        );
+        assert!(
+            presentation_hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "presentation must be hex, got {presentation_hex:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_issued_to_another_account_is_refused() {
+        // Presenting someone else's credential produces an SFU rejection with no
+        // useful diagnostic, so it is caught here instead.
+        let day = REDEMPTION_DAY;
+        let (server_public, json) = issued_credential(
+            "33333333-3333-3333-3333-333333333333",
+            PNI,
+            day,
+        );
+        let result = build_proof_authorization(
+            &master_key(7),
+            &json,
+            &server_public,
+            ServiceId::Aci(aci(ACI)),
+            day,
+        );
+        assert!(matches!(result, Err(GroupCallError::CredentialRejected)));
+    }
+
+    #[test]
+    fn a_credential_for_another_day_is_not_borrowed() {
+        let day = REDEMPTION_DAY;
+        let (server_public, json) = issued_credential(ACI, PNI, day);
+        let result = build_proof_authorization(
+            &master_key(7),
+            &json,
+            &server_public,
+            ServiceId::Aci(aci(ACI)),
+            day + 1,
+        );
+        assert!(matches!(result, Err(GroupCallError::NoCredentialForDay(_))));
+    }
+
+    #[test]
+    fn a_credential_from_another_server_is_refused() {
+        // A credential from a different ZK server must not verify, otherwise any
+        // issuer could mint a proof.
+        let day = REDEMPTION_DAY;
+        let (_, json) = issued_credential(ACI, PNI, day);
+        let other_server = ServerSecretParams::generate([9u8; 32]).get_public_params();
+        let result = build_proof_authorization(
+            &master_key(7),
+            &json,
+            &other_server,
+            ServiceId::Aci(aci(ACI)),
+            day,
+        );
+        assert!(matches!(result, Err(GroupCallError::CredentialRejected)));
+    }
+
+    #[test]
+    fn a_proof_needs_a_pni_to_bind_the_credential_to() {
+        let day = REDEMPTION_DAY;
+        let (server_public, mut json) = issued_credential(ACI, PNI, day);
+        json = json.replace(&format!(r#""pni":"PNI:{PNI}""#), r#""pni":null"#);
+        let result = build_proof_authorization(
+            &master_key(7),
+            &json,
+            &server_public,
+            ServiceId::Aci(aci(ACI)),
+            day,
+        );
+        assert!(matches!(result, Err(GroupCallError::CredentialMissingPni)));
+    }
+
+    #[test]
+    fn a_malformed_credential_body_is_refused() {
+        let day = REDEMPTION_DAY;
+        let (server_public, json) = issued_credential(ACI, PNI, day);
+        // Valid base64, not a valid credential.
+        let json = json.replace(&"\"credential\":\"", "\"credential\":\"!!!!");
+        let result = build_proof_authorization(
+            &master_key(7),
+            &json,
+            &server_public,
+            ServiceId::Aci(aci(ACI)),
+            day,
+        );
+        assert!(matches!(result, Err(GroupCallError::Serialization(_))));
+    }
+
+    #[test]
+    fn a_pni_cannot_stand_in_for_the_aci() {
+        let day = REDEMPTION_DAY;
+        let (server_public, json) = issued_credential(ACI, PNI, day);
+        let result = build_proof_authorization(
+            &master_key(7),
+            &json,
+            &server_public,
+            ServiceId::Pni(pni(ACI)),
+            day,
+        );
+        assert!(matches!(result, Err(GroupCallError::NotAnAci)));
+    }
+
+    #[test]
+    fn a_proof_needs_a_32_byte_group_master_key() {
+        let day = REDEMPTION_DAY;
+        let (server_public, json) = issued_credential(ACI, PNI, day);
+        let result = build_proof_authorization(
+            &[0u8; 16],
+            &json,
+            &server_public,
+            ServiceId::Aci(aci(ACI)),
+            day,
+        );
+        assert!(matches!(result, Err(GroupCallError::InvalidMasterKey)));
+    }
+
+    #[test]
+    fn two_presents_of_one_credential_differ() {
+        // Fresh randomness per presentation: reusing one value would let an
+        // observer link two calls to the same credential.
+        let day = REDEMPTION_DAY;
+        let (server_public, json) = issued_credential(ACI, PNI, day);
+        let key = master_key(7);
+        let first = build_proof_authorization(
+            &key,
+            &json,
+            &server_public,
+            ServiceId::Aci(aci(ACI)),
+            day,
+        )
+        .expect("first presentation");
+        let second = build_proof_authorization(
+            &key,
+            &json,
+            &server_public,
+            ServiceId::Aci(aci(ACI)),
+            day,
+        )
+        .expect("second presentation");
+        assert_ne!(first, second, "each presentation must use fresh randomness");
+        // The group half is the same, because it identifies the group.
+        assert_eq!(
+            first.split_once(':').map(|(a, _)| a),
+            second.split_once(':').map(|(a, _)| a)
+        );
     }
 }

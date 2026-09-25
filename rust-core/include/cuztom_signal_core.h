@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CUZTOM_SIGNAL_CORE_ABI_VERSION 3u
+#define CUZTOM_SIGNAL_CORE_ABI_VERSION 4u
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,6 +77,14 @@ int32_t core_cmd_call_set_muted(int32_t muted);
  * membership proof from one of these. Returns a malloc'd JSON string to be
  * released with core_free_string(), or NULL on error. */
 char *core_cmd_group_auth_credentials(void);
+
+/* Build the CDN authorization for a group call membership proof.
+ * `group_id` is the 32-byte ZK group identifier RingRTC reports. Returns a
+ * malloc'd "hex(groupPublicParams):hex(presentation)" string to be released
+ * with core_free_string(), or NULL on error. Nothing is synthesized: with no
+ * server-issued credential there is no proof, and the join is refused. */
+char *core_cmd_group_call_proof_authorization(const uint8_t *group_id,
+                                             uint32_t group_id_len);
 
 /* Group call lifecycle. `group_id_hex` is the group's 32-byte ZK identifier in
  * hex; `sfu_url` may be NULL to use the production SFU and is never inferred.

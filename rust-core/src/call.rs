@@ -780,6 +780,37 @@ pub fn active_group_calls() -> Vec<ClientId> {
     ids
 }
 
+/// Fetch a ZK group auth credential and present it, producing the CDN
+/// authorization for a membership proof.
+///
+/// `group_id` is the 32-byte ZK group identifier RingRTC asks about. It is
+/// resolved to the local group master key by deriving each known group's
+/// identifier, so a signal about a group this device is not in fails here rather
+/// than being presented against the wrong group.
+///
+/// The credential is requested for today and tomorrow: the service decides which
+/// days are issued, and a credential only becomes usable as its day arrives.
+/// Today's is the only one that can be presented.
+pub async fn prepare_group_call_proof(
+    manager: &mut StoredManager,
+    group_id: &[u8],
+    our_aci: &str,
+) -> Result<String, String> {
+    let master_key = crate::sync::group_master_key_for_id(manager, group_id).await?;
+    let aci = crate::sync::parse_service_id(our_aci)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let day = crate::group_calls::current_redemption_day(now);
+    let (body, server_params) = manager
+        .group_auth_credentials_raw(day, day + 1)
+        .await
+        .map_err(|e| format!("group credential request: {e}"))?;
+    crate::group_calls::build_proof_authorization(&master_key, &body, &server_params, aci, day)
+        .map_err(|e| e.to_string())
+}
+
 /// Hand a group-call membership proof to RingRTC.
 pub fn set_group_membership_proof(client_id: u32, token: Vec<u8>) -> Result<(), String> {
     let manager = manager().ok_or_else(|| "call stack not initialized".to_string())?;
