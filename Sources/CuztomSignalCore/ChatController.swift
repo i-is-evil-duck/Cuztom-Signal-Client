@@ -39,7 +39,7 @@ public final class ChatController: @unchecked Sendable {
         self.service = service
         self.store = store
         self.pluginHost = pluginHost
-        self.contactResolver = ContactResolver()
+        self.contactResolver = ContactResolver(rustCore: service as? RustCoreService)
     }
 
     public var isLinked: Bool {
@@ -86,7 +86,7 @@ public final class ChatController: @unchecked Sendable {
             // Non-fatal: the roster still loads from the local store.
             if let live = service as? RustCoreService {
                 live.onSyncEvent = { [weak self] note in
-                    Task { await self?.noteSync(note) }
+                    Task { @MainActor in self?.noteSync(note) }
                 }
                 live.onReaction = { [weak self] thread, sts, emoji, remove, sender in
                     Task { await self?.applyReaction(thread: thread, targetSts: sts, emoji: emoji, remove: remove, senderName: sender) }
@@ -127,6 +127,21 @@ public final class ChatController: @unchecked Sendable {
     private func noteSync(_ note: String) {
         lastSyncNote = note
         Log.info("sync event: \(note)")
+
+        // `contacts_synced` is emitted after the Rust contact transaction has
+        // been observed. It is the authoritative point to reload the roster;
+        // `queue_empty` only means the websocket queue drained.
+        guard note == "contacts_synced" else { return }
+        rosterRefreshTask?.cancel()
+        rosterRefreshTask = Task { [weak self] in
+            guard let self, !Task.isCancelled, self.isLinked else { return }
+            do {
+                try await self.refresh()
+                self.onRosterChanged?()
+            } catch {
+                Log.error("roster refresh after contacts sync failed: \(error)")
+            }
+        }
     }
 
     /// Apply a live reaction to the targeted message (matched by store ts).
@@ -171,6 +186,12 @@ public final class ChatController: @unchecked Sendable {
 
     /// Callback for typing indicator updates (set by ViewModel for UI).
     public var onTypingUpdate: ((String, String, Bool) -> Void)?
+    /// Called after an inbound chat message is accepted by the store.
+    public var onIncomingMessage: ((ChatMessage) -> Void)?
+    /// Called after a contacts/groups sync refreshes the roster.
+    public var onRosterChanged: (() -> Void)?
+
+    private var rosterRefreshTask: Task<Void, Never>?
 
     /// Resolve a display name for an ACI/UUID in a conversation.
     public func displayName(for aci: String, in conversationId: String) async -> String {
@@ -283,7 +304,7 @@ public final class ChatController: @unchecked Sendable {
 
             let msg = ChatMessage(
                 conversationId: id,
-                author: SignalAddress(uuidString: "self", threadId: id),
+                author: SignalAddress(uuidString: selfAci ?? "self", threadId: id),
                 body: caption,
                 direction: .outgoing,
                 status: .sent,
@@ -320,7 +341,7 @@ public final class ChatController: @unchecked Sendable {
             let ts = try await live.sendReply(thread: id, body: trimmed, qTs: qTs, qAuthor: qAuthor, qBody: String(quote.body.prefix(200)))
             let msg = ChatMessage(
                 conversationId: id,
-                author: SignalAddress(uuidString: "self", threadId: id),
+                author: SignalAddress(uuidString: selfAci ?? "self", threadId: id),
                 body: trimmed,
                 direction: .outgoing,
                 status: .sent,
@@ -373,7 +394,11 @@ public final class ChatController: @unchecked Sendable {
     public func enrichNames() async {
         guard let live = service as? RustCoreService else { return }
         for conv in conversations where !conv.peer.isGroup {
-            let looksBare = conv.title.count == 8 || conv.title.hasPrefix("+") || conv.title == conv.peer.uuidString
+            let looksBare = conv.title == "Unknown"
+                || conv.title.isEmpty
+                || conv.title.count == 8
+                || conv.title.hasPrefix("+")
+                || conv.title == conv.peer.uuidString
             guard looksBare, let uuid = conv.peer.uuidString else { continue }
             if let selfAci, uuid.caseInsensitiveCompare(selfAci) == .orderedSame {
                 continue
@@ -451,9 +476,15 @@ public final class ChatController: @unchecked Sendable {
     /// Reset Swift-side state after the live service has already performed its
     /// logout/data wipe. This avoids issuing a second FFI logout, which is
     /// expected to return `not linked` after the first successful wipe.
-    public func resetAfterServiceLogout() {
+    public func resetAfterServiceLogout() async {
         observerTask?.cancel()
         watchTask?.cancel()
+        rosterRefreshTask?.cancel()
+        rosterRefreshTask = nil
+        // The Rust Signal database and the Swift presentation database are
+        // separate stores. Clear both so a relink cannot resurrect the prior
+        // account's conversations, unread counts, or message UUIDs.
+        await store.clearAllData()
         store = MessageStore()
         conversations = []
         messages = []
@@ -477,7 +508,7 @@ public final class ChatController: @unchecked Sendable {
                 return false
             }
         }
-        resetAfterServiceLogout()
+        await resetAfterServiceLogout()
         Log.info("logged out")
         return true
     }
@@ -643,7 +674,7 @@ public final class ChatController: @unchecked Sendable {
                 ts: sts,
                 index: index
             )
-            live.bindLocalPath(thread: stored.conversationId, ts: sts, path: url.path)
+            live.bindLocalPath(thread: stored.conversationId, ts: sts, index: index, path: url.path)
             await store.updateMessage(id: messageId) { $0.attachments[index].localURL = url }
             if stored.conversationId == selectedId {
                 messages = await store.messages(in: stored.conversationId)
@@ -659,7 +690,17 @@ public final class ChatController: @unchecked Sendable {
 
     /// Append an inbound message (websocket callback target in M1).
     public func receive(_ message: ChatMessage) async {
-        await store.saveMessage(message)
+        // Reactions/control envelopes are delivered separately by the native
+        // core. A legacy empty payload must never become a blank chat bubble.
+        if message.direction == .incoming,
+           message.body.isEmpty,
+           message.attachments.isEmpty {
+            return
+        }
+        let inserted = await store.saveMessage(message)
+        if inserted && message.direction == .incoming {
+            onIncomingMessage?(message)
+        }
         conversations = await store.allConversations()
         if message.conversationId == selectedId {
             messages = await store.messages(in: message.conversationId)
@@ -704,8 +745,16 @@ public final class ChatController: @unchecked Sendable {
                 if fetched >= maxFiles { break }
                 for idx in m.attachments.indices {
                     let att = m.attachments[idx]
-                    guard att.localURL == nil,
-                          att.mimeType.hasPrefix("image/") || att.mimeType.hasPrefix("video/") else { continue }
+                    if let localURL = att.localURL,
+                       !FileManager.default.fileExists(atPath: localURL.path) {
+                        await store.updateMessage(id: m.id) { message in
+                            message.attachments[idx].localURL = nil
+                        }
+                    }
+                    let stillHasFile = att.localURL.map {
+                        FileManager.default.fileExists(atPath: $0.path)
+                    } ?? false
+                    guard !stillHasFile, att.isImage || att.isVideo else { continue }
                     if await downloadAttachment(messageId: m.id, index: idx) {
                         fetched += 1
                     }

@@ -79,6 +79,108 @@ private let rosterFixture = """
     #expect(msg.body == "[attachment]")
 }
 
+@Test func duplicateReplayIsIdempotent() async {
+    let store = MessageStore()
+    let conversation = Conversation(
+        id: "contact:11111111-1111-1111-1111-111111111111",
+        title: "Alice",
+        peer: SignalAddress(uuidString: "11111111-1111-1111-1111-111111111111")
+    )
+    await store.upsertConversation(conversation)
+    let first = ChatMessage(
+        id: UUID(uuidString: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")!,
+        conversationId: conversation.id,
+        author: SignalAddress(uuidString: "11111111-1111-1111-1111-111111111111"),
+        body: "same message",
+        direction: .incoming,
+        sentAt: Date(timeIntervalSince1970: 1),
+        storeTs: 1234
+    )
+    let replay = ChatMessage(
+        id: UUID(uuidString: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")!,
+        conversationId: conversation.id,
+        author: first.author,
+        body: first.body,
+        direction: first.direction,
+        sentAt: first.sentAt,
+        storeTs: first.storeTs
+    )
+    #expect(await store.saveMessage(first))
+    #expect(!(await store.saveMessage(replay)))
+    #expect(await store.messageCount(in: conversation.id) == 1)
+    #expect(await store.allConversations().first?.unreadCount == 1)
+}
+
+@Test func attachmentPlaceholderReplayIsIdempotent() async {
+    let store = MessageStore()
+    let conversation = Conversation(
+        id: "contact:33333333-3333-3333-3333-333333333333",
+        title: "Media",
+        peer: SignalAddress(uuidString: "33333333-3333-3333-3333-333333333333")
+    )
+    await store.upsertConversation(conversation)
+    let attachment = AttachmentMeta(filename: "clip.gif", mimeType: "image/gif", byteCount: 10)
+    let empty = ChatMessage(
+        id: UUID(uuidString: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")!,
+        conversationId: conversation.id,
+        author: SignalAddress(uuidString: "33333333-3333-3333-3333-333333333333"),
+        body: "",
+        direction: .incoming,
+        sentAt: Date(timeIntervalSince1970: 3),
+        attachments: [attachment],
+        storeTs: 9999
+    )
+    let placeholder = ChatMessage(
+        id: UUID(uuidString: "ffffffff-ffff-ffff-ffff-ffffffffffff")!,
+        conversationId: conversation.id,
+        author: empty.author,
+        body: "[attachment]",
+        direction: .incoming,
+        sentAt: empty.sentAt,
+        attachments: [attachment],
+        storeTs: empty.storeTs
+    )
+    #expect(await store.saveMessage(empty))
+    #expect(!(await store.saveMessage(placeholder)))
+    #expect(await store.messageCount(in: conversation.id) == 1)
+}
+
+@Test func sqliteDeduplicatesDifferentLocalUUIDs() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cuztom-duplicate-test-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try SQLiteMessageStore(path: directory)
+    let conversation = Conversation(
+        id: "contact:22222222-2222-2222-2222-222222222222",
+        title: "Bob",
+        peer: SignalAddress(uuidString: "22222222-2222-2222-2222-222222222222")
+    )
+    await store.upsertConversation(conversation)
+    let author = SignalAddress(uuidString: conversation.peer.uuidString!)
+    let first = ChatMessage(
+        id: UUID(uuidString: "cccccccc-cccc-cccc-cccc-cccccccccccc")!,
+        conversationId: conversation.id,
+        author: author,
+        body: "one",
+        direction: .incoming,
+        sentAt: Date(timeIntervalSince1970: 2),
+        storeTs: 4321
+    )
+    let second = ChatMessage(
+        id: UUID(uuidString: "dddddddd-dddd-dddd-dddd-dddddddddddd")!,
+        conversationId: conversation.id,
+        author: author,
+        body: "one",
+        direction: .incoming,
+        sentAt: first.sentAt,
+        storeTs: first.storeTs
+    )
+    #expect(await store.saveMessage(first))
+    #expect(!(await store.saveMessage(second)))
+    #expect(await store.messageCount(in: conversation.id) == 1)
+    #expect(await store.allConversations().first?.unreadCount == 1)
+}
+
 @Test func storeUpdatesMessageInPlace() async {
     let store = MessageStore()
     let msg = ChatMessage(conversationId: "c1", author: SignalAddress(phone: "+1"),

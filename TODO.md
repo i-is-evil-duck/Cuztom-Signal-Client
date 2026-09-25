@@ -1,93 +1,60 @@
-# Core Polish + Calls Implementation Plan
+# Remaining work
 
-## Priority Order
-1. **Message Edits** - FFI + Swift UI
-2. **Typing Indicators** - FFI + Swift UI
-3. **Link Previews** - Swift metadata fetching
-4. **Read Receipts Polish** - Config + UI
-5. **Calls** - RingRTC native + full implementation
+_Last updated: 2026-09-24_
 
----
+The original polish/calls checklist has been completed substantially. This
+file now tracks the remaining product and reliability work rather than
+re-listing features that are already implemented.
 
-## 1. Message Edits
-### Rust FFI
-- [ ] Add `SendMessageEdit` command to lib.rs
-- [ ] Implement `send_message_edit_inner` in sync.rs using `ContentBody::EditMessage`
-- [ ] Add FFI `core_cmd_send_message_edit(thread, target_ts, new_body)`
+## P0 — Group calls
 
-### Swift
-- [ ] Add "Edit" to message context menu
-- [ ] Edit sheet with text field + save/cancel
-- [ ] Show "edited" badge on message
-- [ ] Update message in store via `updateMessage`
+- [ ] Retrieve and validate Signal external group membership proofs.
+- [ ] Derive RingRTC group IDs and accepted-member identities from the group
+  master key/membership ciphertext.
+- [ ] Implement RingRTC's HTTP delegate for SFU requests and responses.
+- [ ] Add opaque group-call signaling without changing the 1:1 path.
+- [ ] Add separate Rust FFI commands and Swift group-call state/UI.
+- [ ] Verify with two linked/native clients before enabling the group-call
+  button.
 
----
+## P1 — Reliability and background delivery
 
-## 2. Typing Indicators
-### Rust FFI
-- [ ] Add `SendTyping` command (thread, started: bool)
-- [ ] Implement `send_typing_inner` - send `TypingMessage` via sync
-- [ ] FFI `core_cmd_send_typing(thread, started)`
+- [ ] Fetch Signal's authenticated TURN relay list.
+- [ ] Investigate urgent-message delivery in the underlying Signal sender.
+- [ ] Add APNs/VoIP push and a secure provider path for killed-app delivery.
+- [ ] Add launch-at-login, reconnect policy, and background lifecycle handling.
+- [ ] Add CallKit/system call UI and lock-screen call actions.
+- [ ] Run a dedicated 500-message paging test and verify no gaps/duplicates.
+- [ ] Run large attachment, oversized-file, and cache-eviction tests.
 
-### Swift
-- [ ] Debounced typing detection in composer
-- [ ] Send typing start on first keystroke
-- [ ] Send typing stop after 2s idle
-- [ ] Show "X is typing…" in conversation header
-- [ ] Handle incoming typing events in drainEvents
+## P1 — Messaging/product features
 
----
+- [ ] Group administration: create/rename, avatar, member management, roles,
+  and leave group.
+- [ ] Full video calling, group video, and multi-call handling.
+- [ ] Disappearing-message timers.
+- [ ] Cross-thread message search.
+- [ ] Encrypted SQLite/keychain-backed protection for data at rest.
+- [ ] Backup/restore and crash reporting.
 
-## 3. Link Previews
-### Swift
-- [ ] Add `metadata` crate for og:title/og:image/og:description
-- [ ] Fetch preview when URL detected in message
-- [ ] Preview card UI (image + title + description)
-- [ ] Cache previews in SQLite
-- [ ] Show in message bubble
+## P2 — Release engineering
 
----
+- [ ] Reproducible signed/notarized DMG release script.
+- [ ] Sparkle or another signed update channel.
+- [ ] App Store/notarization licensing and privacy review.
+- [ ] macOS CI for full Xcode Swift tests and the RingRTC Rust build.
 
-## 4. Read Receipts Polish
-### Swift
-- [ ] Settings toggle: "Send Read Receipts" (on/off)
-- [ ] Settings toggle: "Send Delivery Receipts" (on/off)
-- [ ] Auto-send read receipt on `select()` when enabled
-- [ ] Message detail popover: show "Seen by" / "Delivered to" with timestamps
-- [ ] Visual indicator: single check = sent, double check = delivered, double check + color = read
+## Recently completed
 
----
+- [x] Native QR link/resume and websocket sync.
+- [x] Stable 1:1/group routing and friendly name resolution.
+- [x] SQLite duplicate suppression and startup cleanup.
+- [x] Group sender-run chip grouping.
+- [x] GIF/media rendering and attachment cache hardening.
+- [x] Local message/call notifications.
+- [x] Reactions, replies, edits, typing display, receipts, and link previews.
+- [x] Native 1:1 RingRTC voice calls.
+- [x] Idempotent logout/data wipe.
 
-## 5. Calls (RingRTC Native)
-### Rust
-- [ ] Enable `ringrtc` with `features = ["native"]` in Cargo.toml
-- [ ] Fix cmake + WebRTC prebuilt build
-- [ ] Implement `send_call_offer_inner` - real SDP via RingRTC
-- [ ] Implement `send_call_answer_inner` - real SDP via RingRTC
-- [ ] Implement `send_call_ice_inner` - ICE candidate via RingRTC
-- [ ] Implement `send_call_hangup_inner` - BYE via RingRTC
-- [ ] Audio: cubeb capture/playback, device picker
-- [ ] Video: AVCaptureSession capture/preview
-
-### Swift
-- [ ] Audio session config (`.playAndRecord`, `.allowBluetooth`)
-- [ ] Audio device picker (input/output)
-- [ ] Video preview layer (AVCaptureVideoPreviewLayer)
-- [ ] CallKit integration (CXProvider, CXCallController)
-- [ ] Lock screen call UI
-- [ ] Background call handling
-
----
-
-## Commands to Add to lib.rs
-
-```rust
-// Message Edits
-SendMessageEdit { thread: String, target_ts: u64, new_body: String, reply }
-
-// Typing Indicators
-SendTyping { thread: String, started: bool, reply }
-
-// Link previews - handled in Swift, no FFI needed
-
-// Read receipts - already have send_receipt, just add config
+See `IMPLEMENTATION_PLAN.md` for the detailed status matrix and
+`CALLS_PLAN.md` for the native call boundary.

@@ -1,171 +1,152 @@
 # Cuztom Signal — native macOS Signal client
 
-Lightweight SwiftUI Signal client for macOS. Linked-device only (phone stays primary).
-Successor to `signal-bridge-V2` (Python + `signal-cli-rest-api` Docker bot that forwarded
-Instagram reels to Signal groups). This repo is a clean, pure-Signal native app — no
-Instagram code, no Java, no Docker at runtime.
+Cuztom Signal is a lightweight, linked-device Signal client for macOS. The
+phone remains the primary device; this app uses Signal's native linked-device
+protocol through `presage`/`libsignal` rather than `signal-cli`, Docker, or a
+virtual audio device.
 
-Stack: **SwiftUI (Swift 6) + Rust core (`presage` + `libsignal`) + RingRTC (calls, M4)**.
+> **Legal/support note:** `libsignal` and `presage` are AGPLv3. Third-party
+> Signal clients are unsupported by Signal and may be rate-limited. This is not
+> an App Store product; distribution should use a signed/notarized build with
+> appropriate licensing disclosures.
 
-> Legal: `libsignal` and `presage` are AGPLv3 — distributing binaries requires
-> open-sourcing. Third-party clients are unsupported by Signal and risk rate-limits.
-> No App Store; ship as notarized DMG + Sparkle updates.
+## Current status — 2026-09-24
 
-## Code flow
+### Working
 
+- Native QR linking and resuming an existing linked session.
+- Native Signal websocket receive loop, contact/groups sync, roster refresh,
+  and reconnect-safe local persistence.
+- 1:1 and group text messaging with GroupsV2 context attached to outgoing
+  group messages.
+- Group conversation routing is canonicalized through
+  `contact:<service-id>` / `group:<master-key>` thread IDs.
+- SQLite message/conversation storage with logical message deduplication,
+  startup migration cleanup, unread-count protection, and persistent UUID/path
+  mappings.
+- Friendly contact/group names, group-member profile-key fallback resolution,
+  initials, Note to Self/You labeling, and sender-name hints from decrypted
+  envelopes.
+- Sender chips appear only on the first message in a contiguous incoming run
+  from the same group sender.
+- Reactions, replies, edits, delete-for-me/for-everyone, incoming typing
+  indicators, read/delivery receipt display, and link previews.
+- Attachment upload/download, metadata-only rows, on-demand downloads, image
+  and video rendering, animated GIF support (including extensionless legacy
+  cache files), and per-attachment cache paths.
+- Empty reaction/group-call/control envelopes are no longer rendered as blank
+  chat messages.
+- Local macOS notifications for newly received messages and incoming calls,
+  with notification settings and duplicate suppression.
+- Idempotent logout/data wipe covering Rust state, Swift SQLite state, UUID and
+  path maps, downloaded media, and keychain-backed session material.
+- Native RingRTC-backed 1:1 voice calls with ICE/DTLS, microphone capture,
+  mute, hangup, incoming/outgoing state, and elapsed time UI.
+
+### Not yet complete
+
+- Group calls. The 1:1 RingRTC path is intentionally isolated while Signal
+  membership-proof retrieval, group/member identity derivation, SFU HTTP
+  requests/responses, and opaque group-call signaling are implemented.
+- Authenticated TURN relay discovery and reliable calls to a fully offline
+  peer. The current sender does not expose Signal's urgent-message flag.
+- APNs/VoIP push, launch-at-login/background keepalive, and killed-app
+  notification delivery. Current notifications are local notifications while
+  the app process is running.
+- Group administration UI: create/rename groups, avatars, member add/remove,
+  roles, and leave-group flows.
+- Full video calling, group video, multi-call handling, CallKit integration,
+  and lock-screen call controls.
+- Disappearing-message timers, encrypted SQLite-at-rest, cross-thread message
+  search, backup/restore, notarized DMG/Sparkle distribution, and crash
+  reporting.
+- Signal does not sync pre-link history to a newly linked device; history
+  accumulates from link time forward.
+
+## Architecture
+
+```text
+SwiftUI Views (XcodeApp/Sources)
+  -> ChatViewModel (@Observable, main actor)
+    -> ChatController (Sources/CuztomSignalCore)
+      -> SignalService protocol
+        -> RustCoreService (dlopen/dlsym)
+          -> presage Manager + libsignal + Signal websocket
+          -> RingRTC native 1:1 call engine
+      -> MessageStore actor (SQLite/GRDB in production)
+      -> SecretStore (Keychain in production)
 ```
-SwiftUI Views (XcodeApp/Sources, full Xcode only)
-  -> ChatViewModel (thin @Observable wrapper)
-    -> ChatController (Sources/CuztomSignalCore, UI-agnostic, unit-tested)
-      -> SignalService protocol (Sources/CuztomSignalCore/SignalService.swift)
-        -> M0: MockSignalService (in-memory, deterministic)
-        -> M1+: RustCoreService (dlopen -> rust-core/ presage Manager)
-                  -> libsignal (crypto) + chat.signal.org (websocket)
-                  -> MessageStore (actor, idempotent save) + SecretStore (Keychain)
-```
 
-Boundaries are protocol-shaped so M1 swaps the backend without touching UI:
-`MessageStore` is already an actor with SQLite-compatible API; `SecretStoring`
-has `InMemorySecretStore` (tests) and `KeychainSecretStore` (prod).
+Important implementation areas:
 
-## Step-by-step plan
+- `Sources/CuztomSignalCore/RustCoreService.swift` — FFI seam, roster/message
+  mapping, UUID/path caches, attachments, sync callbacks, and data wipe.
+- `rust-core/src/sync.rs` — message normalization, stable timestamps, control
+  envelope filtering, attachment metadata, profile/group-member resolution,
+  and send helpers.
+- `Sources/CuztomSignalCore/SQLiteMessageStore.swift` — durable message store
+  and startup migration/deduplication.
+- `XcodeApp/Sources/Views.swift` — message list, sender-run chips, media
+  rendering, and scrolling.
+- `XcodeApp/Sources/NotificationManager.swift` — local macOS notifications.
+- `Sources/CuztomSignalCore/CallController.swift` — Swift call state machine.
 
-### M0 — Scaffold + mock chat (DONE)
-- [x] SwiftPM `CuztomSignalCore` (models/store/service/mock/keychain) + `XcodeApp` SwiftUI split view
-- [x] `ChatController` (UI-agnostic coordinator: link -> sync -> select -> send -> receive)
-- [x] `RustCoreService` seam (dlopen FFI, fails loudly until Manager lands)
-- [x] `MessageStore` extras (idempotent save, search, delete, totals)
-- [x] 12 unit tests (`swift test`), Rust 1.98 toolchain installed
-- Verify: `swift build`, `swift test`
+## Build and test
 
-### M1 — Link + 1:1 text (in progress)
-- [x] `rust-core/`: presage `Manager` on a LocalSet worker thread, C ABI
-  (`init` / `begin_link` / `poll_link` / `is_linked`), 3 `cargo test`s green
-- [x] Swift `RustCoreService`: real `dlopen`+`dlsym` calls, string marshaling,
-  offline `isLinkedAccount()` probe; `ChatViewModel` picks Live backend when
-  the dylib is present, Mock otherwise (indicator in sidebar footer)
-- [x] M1b roster/sync: `roster` (contacts+groups+recent msgs from sqlite),
-  `whoami`, `request_contacts`, background `receive_messages` loop with
-  control channel, `poll_event` queue, `send` (1:1 + groups); Swift decodes
-  to `Conversation`/`ChatMessage` with stable ids, live pump into the store
-- [x] 17+ `swift test`s (roster fixture mapping, stable ids, event decode),
-  `cargo test` incl. roster/whoami rejection on fresh stores
-- [x] UI phase gate (`starting → linking → linked | failed`): real QR from
-  the `sgnl://` URL; failures show Retry + Continue-with-demo
-- [x] Settings pane (app menu → Settings…): session/account, Log out
-  (wipes keys, back to QR), Refresh now, Request contact sync, live
-  diagnostics + log path (`~/Library/Logs/CuztomSignal/app.log`)
-- [x] Resume linked sessions (`alreadyLinked` skips QR); demo removed —
-  Live backend or an honest error
-- [x] Release dylib (~18 MB) bundled next to the binary → Live backend
-- [ ] Debug: sidebar empty on a live session — diagnostics + manual sync
-  added to narrow it down (see Settings)
-
-### M2 — Groups + attachments
-1. GroupsV2 (`zkgroup`) sync: member list, title/avatar, admin flags.
-2. Attachment CDN up/down with progress; cap 100 MB (same as bridge default `MAX_ATTACHMENT_MB`); thumbnails in list.
-3. Swap `MessageStore` backend to SQLite (GRDB or `presage-store-sqlite`); migration test from M0 in-memory snapshot.
-4. Tests: group send/receive, 25 MB video round-trip, quota of bridge (`DAILY_SEND_LIMIT`) not needed — pure client sends immediately.
-
-### M3 — Reactions / replies / edits / disappearing / receipts
-1. Message modifiers pipeline (idempotent apply, tombstones).
-2. Disappearing-message timers per conversation.
-3. Read/delivery receipts reflected in `MessageStatus`.
-4. Tests: out-of-order delivery, duplicate suppression, timer expiry.
-
-### M4 — Calls (RingRTC, heaviest milestone)
-1. Vendor `signalapp/ringrtc`, mic/camera/screen permissions, device picker.
-2. 1:1 + group call signaling over the existing websocket; CallKit-style macOS UI.
-3. Tests: mocked signaling handshake, no-media call setup/teardown, permission-denied path.
-
-### M5 — Ship
-Notarized DMG, Sparkle updater, crash reports, menu-bar badge, notifications, launch-at-login (websocket keepalive), docs.
-
-## Backlog — still to implement + test
-
-Honest status as of the M1b sync build. Checked = done, open = not yet.
-
-### History
-- [x] Roster seed: last 100 messages/thread from the local store
-- [x] `Load older messages` paging (`core_cmd_thread`, merged by stable key)
-- [ ] Known limit: **Signal never syncs pre-link history** to a new linked
-  device (protocol, not a bug). History accumulates from link time forward.
-- [ ] Test: page a 500-message thread end-to-end, verify no dupes/gaps
-
-### Attachments
-- [x] Metadata in every message (`name/mime/size`); auto-download ≤25 MB on
-  arrival into `~/Library/Caches/CuztomSignal`
-- [x] Inline image rendering; file chips with Download/Reveal
-- [x] On-demand fetch for roster-seeded rows (`core_cmd_fetch_attachment`)
-- [ ] Send path for attachments (camera/file picker → CDN upload) — M2
-- [ ] Test: 20 MB video round-trip; oversized file stays metadata-only;
-  reveal-in-Finder from a downloaded row
-
-### Plugins
-- [x] `PluginHost` + `ChatPlugin` protocol (`/help`, unknown-command reply)
-- [x] Built-in `InfoPlugin`: `/info /account /roster /diag /sync
-  /thread <id> [n] /log` — read-only except `/sync`
-- [x] Slash routing in the message field; replies are ephemeral (never stored/sent)
-- [ ] `onMessage` hooks used by a real plugin (e.g. keyword notifier)
-- [ ] Test: host with two plugins, command collision → first registered wins
-
-### Correctness / polish backlog
-- [ ] Reactions, replies, edits, disappearing timers, read receipts (M3)
-- [ ] Calls via RingRTC (M4 — biggest milestone, separate module)
-- [ ] Keychain-backed sqlite passphrase (currently unencrypted at rest)
-- [ ] Notarized DMG + Sparkle updates (M5)
-- [ ] Group admin ops (title/avatar/member add/remove)
-- [ ] Message search across threads
-- [ ] Notifications + badge + launch-at-login
-- [ ] `onMessage` plugin fan-out wired into the receive path
-
-### Test matrix
-| Layer | Command | Status |
-|---|---|---|
-| Swift unit (Core) | `swift test` | 28 tests, green with fresh dylib |
-| Rust unit (FFI) | `cargo test` (in `rust-core/`) | 3 tests, green |
-| Live link + resume | manual, real phone | done (user-verified) |
-| Roster + live receive | manual | done (6 convs, `queue_empty`) |
-| Routing (DM + group + self) | live probes 1–5 via `live_test` | done 5/5 (2026-09-23) |
-| 500-msg paging | manual | TODO |
-| Attachment round-trip | manual | TODO |
-| Logout → fresh QR | manual | TODO (Settings → Log out) |
-
-## Commands
+Full Xcode is required for the SwiftUI executable and Swift Testing macros.
+The core target can be built with the command-line tools.
 
 ```bash
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+
+# Core tests
+swift test
+
+# App executable
 swift build --product CuztomSignal
-swift test            # Core unit tests (28)
-cd rust-core && cargo test   # FFI unit tests (3)
+
+# Rust core (the repository includes a macOS realpath shim for RingRTC)
+cd rust-core
+PATH="$PWD/scripts:$PATH" cargo test
+PATH="$PWD/scripts:$PATH" cargo build --release
 ```
 
-> Full Xcode is required (SwiftUI + swift-testing macros don't expand under
-> CLT alone). The runnable app is the `CuztomSignal` executable; the
-> double-clickable `CuztomSignal.app` bundle is assembled by copying the
-> binary + `rust-core/target/release/libcuztom_signal_core.dylib` into
-> `CuztomSignal.app/Contents/MacOS/` and ad-hoc signing (bundle is
-> gitignored, rebuilt locally).
+The checked-in source does not include the local app bundle or user data.
+For a local runnable bundle, copy the built Swift executable and release dylib
+into `CuztomSignal.app/Contents/MacOS/`, then ad-hoc sign the bundle.
 
-## Repo layout
+## Verification status
 
+| Area | Status |
+|---|---|
+| Swift core tests | **38 passed** with full Xcode |
+| Rust library tests | **6 passed** |
+| Rust release build | Passed; produces the native dylib |
+| Swift app build | Passed with full Xcode |
+| QR link/resume | Manually verified |
+| Contacts/groups/name resolution | Manually verified after fresh reset |
+| 1:1/group text routing | Manually verified |
+| Duplicate/control-envelope cleanup | Verified against the local SQLite store |
+| 1:1 native voice call | Manually verified with two-way audio |
+| Group call | Not enabled; blocked on SFU/membership-proof work |
+| 500-message paging | Still needs a dedicated manual test |
+| Large attachment round-trip/limits | Still needs a dedicated manual test |
+
+## Repository layout
+
+```text
+Package.swift
+Sources/CuztomSignalCore/       Core models, services, stores, controllers
+XcodeApp/Sources/               SwiftUI app and macOS notification coordinator
+Tests/CuztomSignalCoreTests/    Swift Testing coverage
+rust-core/                      Rust presage/libsignal/RingRTC core and C ABI
+IMPLEMENTATION_PLAN.md           Detailed completion/open-work status
+CALLS_PLAN.md                    Native call implementation and limitations
+TODO.md                          Prioritized remaining work
 ```
-Package.swift                    SwiftPM (Core + Tests; builds on CLT)
-Sources/CuztomSignalCore/        Models, SignalService protocol, ChatController,
-                                 MessageStore actor, SecretStore (memory + Keychain),
-                                 MockSignalService, RustCoreService (dlopen seam)
-XcodeApp/Sources/                @main App, ChatViewModel (thin wrapper), split-view UI
-                                 (full Xcode only; SwiftUI macros don't load under CLT)
-Tests/CuztomSignalCoreTests/     12 tests (swift-testing): CoreTests + ControllerTests
-rust-core/                       Cargo crate stub -> presage Manager + C ABI (M1)
-```
 
-## Relation to signal-bridge-V2
+## License and distribution
 
-| | bridge-V2 | Cuztom Signal |
-|---|---|---|
-| Runtime | Docker, Java `signal-cli`, Python poller | Native binary, no Docker/Java |
-| Auth | `GET /v1/qrcodelink`, `data/signal/` bind mount | Native QR via presage, Keychain + `~/Library` |
-| Send | `POST /v2/send` + `base64_attachments` | libsignal encrypt + websocket + CDN |
-| Store | `/state/*.json`, Docker volumes | SQLite + Keychain |
-| Scope | IG-reel forwarder | Full chat client (+ calls M4) |
+Review the AGPLv3 obligations of `libsignal`/`presage` before distributing a
+binary. The current local bundle is ad-hoc signed and is not a notarized
+consumer release.

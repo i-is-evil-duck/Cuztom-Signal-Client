@@ -8,12 +8,22 @@ public struct SignalAddress: Hashable, Sendable, Codable {
     public var groupId: String?
     /// Full thread identifier: "contact:<uuid>" or "group:<master_key_hex>"
     public var threadId: String?
+    /// Best-effort friendly name supplied by the authenticated message or
+    /// call envelope. Roster/profile resolution may replace it later.
+    public var displayName: String?
 
-    public init(uuidString: String? = nil, phone: String? = nil, groupId: String? = nil, threadId: String? = nil) {
+    public init(
+        uuidString: String? = nil,
+        phone: String? = nil,
+        groupId: String? = nil,
+        threadId: String? = nil,
+        displayName: String? = nil
+    ) {
         self.uuidString = uuidString
         self.phone = phone
         self.groupId = groupId
         self.threadId = threadId
+        self.displayName = displayName
     }
 
     public var isGroup: Bool { groupId != nil }
@@ -62,6 +72,42 @@ public struct AttachmentMeta: Sendable, Codable, Hashable {
         self.mimeType = mimeType
         self.byteCount = byteCount
         self.localURL = localURL
+    }
+
+    /// MIME values from Signal/CDNs may include parameters or a generic
+    /// binary type. Normalize them and use the filename/cache extension as a
+    /// fallback for older roster rows.
+    public var normalizedMIMEType: String {
+        let raw = mimeType
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        if !raw.isEmpty && raw != "application/octet-stream" && raw != "binary/octet-stream" {
+            return raw
+        }
+        let ext = (localURL?.pathExtension ?? (filename as NSString).pathExtension).lowercased()
+        switch ext {
+        case "gif": return "image/gif"
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "webp": return "image/webp"
+        case "heic": return "image/heic"
+        case "mp4", "m4v", "mov": return "video/mp4"
+        case "webm": return "video/webm"
+        case "mp3", "m4a", "aac", "wav": return "audio/mpeg"
+        case "pdf": return "application/pdf"
+        default: return raw.isEmpty ? "application/octet-stream" : raw
+        }
+    }
+
+    public var isImage: Bool { normalizedMIMEType.hasPrefix("image/") }
+    public var isVideo: Bool { normalizedMIMEType.hasPrefix("video/") }
+    public var isGIF: Bool {
+        normalizedMIMEType == "image/gif"
+            || localURL?.pathExtension.lowercased() == "gif"
+            || (filename as NSString).pathExtension.lowercased() == "gif"
     }
 }
 

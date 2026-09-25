@@ -64,6 +64,9 @@ struct IncomingCallView: View {
     }
 
     private func callDisplayName(_ call: ActiveCall) -> String {
+        if let hint = call.callRecord.remotePeer.displayName, !hint.isEmpty {
+            return hint
+        }
         if let uuid = call.callRecord.remotePeer.uuidString {
             return vm.displayName(for: uuid, in: call.callRecord.conversationId)
         }
@@ -195,6 +198,9 @@ struct VoiceCallLayout: View {
     }
 
     private var callDisplayName: String {
+        if let hint = call.callRecord.remotePeer.displayName, !hint.isEmpty {
+            return hint
+        }
         if let uuid = call.callRecord.remotePeer.uuidString {
             return vm.displayName(for: uuid, in: call.callRecord.conversationId)
         }

@@ -29,6 +29,11 @@ struct SettingsView: View {
                     LabeledContent("Last error") { Text(err).font(.caption).monospaced() }
                 }
             }
+            Section("Notifications") {
+                Toggle("Message and call notifications", isOn: $vm.notificationsEnabled)
+                Text("Notifications are delivered locally while Cuztom Signal is running.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("Read Receipts") {
                 Toggle("Send Read Receipts", isOn: $vm.sendReadReceipts)
                     .disabled(!vm.isLinked)

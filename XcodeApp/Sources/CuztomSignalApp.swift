@@ -127,10 +127,29 @@ final class ChatViewModel {
     // Guards against an older async selection completing after a newer click.
     private var selectionGeneration = 0
     private var selectionInProgress = false
+    // SwiftUI can evaluate the root .task more than once while a window is
+    // being restored. Only one service/controller may be started at a time.
+    private var starting = false
+    private var notifiedCallIDs: Set<UUID> = []
+
+    var notificationsEnabled: Bool = NotificationManager.shared.enabled {
+        didSet {
+            NotificationManager.shared.enabled = notificationsEnabled
+            if notificationsEnabled {
+                Task { _ = await NotificationManager.shared.requestAuthorization() }
+            } else {
+                NotificationManager.shared.cancelAll()
+            }
+        }
+    }
 
     func start() async {
+        guard !starting else { return }
+        starting = true
+        defer { starting = false }
         phase = .starting
         errorMessage = nil
+        NotificationManager.shared.configure()
         // Live backend only — the demo is gone. Without the rust dylib
         // there is nothing to connect to, so fail loudly with Retry.
         let live = RustCoreService()
@@ -152,11 +171,33 @@ final class ChatViewModel {
         let controller = ChatController(service: live, store: store, pluginHost: plugins)
         self.controller = controller
         self.liveService = live
+        controller.onRosterChanged = { [weak self] in
+            self?.sync()
+        }
+        controller.onIncomingMessage = { [weak self] message in
+            self?.notifyIncomingMessage(message)
+        }
         // Install call callbacks before starting the receive loop; an incoming
         // call can arrive immediately after the linked session resumes.
         callController.onIncomingCallChanged = { [weak self] call in
             guard let self else { return }
-            self.incomingCall = self.activeCall == nil ? call : nil
+            let wasActive = self.activeCall != nil
+            self.incomingCall = wasActive ? nil : call
+            if let call, !wasActive, self.activeCall == nil,
+               self.notifiedCallIDs.insert(call.callRecord.id).inserted {
+                let peer = call.callRecord.remotePeer
+                let caller = peer.displayName
+                    ?? peer.uuidString.map { self.displayName(for: $0, in: call.callRecord.conversationId) }
+                    ?? peer.phone
+                    ?? "Unknown"
+                let title = self.conversations.first(where: { $0.id == call.callRecord.conversationId })?.title
+                    ?? "Call"
+                NotificationManager.shared.notifyIncomingCall(
+                    callerName: caller,
+                    conversationTitle: title,
+                    identifier: call.callRecord.id.uuidString
+                )
+            }
         }
         callController.onActiveCallChanged = { [weak self] call in
             guard let self else { return }
@@ -350,6 +391,7 @@ func sendTyping(started: Bool) async {
     /// Answer incoming call
     func answerCall() async {
         guard let call = incomingCall else { return }
+        NotificationManager.shared.cancelIncomingCall(identifier: call.callRecord.id.uuidString)
         do {
             try await callController.answerCall(call)
             // Keep the view-model transition deterministic even if the native
@@ -365,6 +407,7 @@ func sendTyping(started: Bool) async {
     /// Decline incoming call
     func declineCall() async {
         guard let call = incomingCall else { return }
+        NotificationManager.shared.cancelIncomingCall(identifier: call.callRecord.id.uuidString)
         do {
             try await callController.declineCall(call)
         } catch {
@@ -376,6 +419,7 @@ func sendTyping(started: Bool) async {
     /// End active call
     func endCall() async {
         guard let call = activeCall ?? incomingCall else { return }
+        NotificationManager.shared.cancelIncomingCall(identifier: call.callRecord.id.uuidString)
         do {
             try await callController.endCall(call)
         } catch {
@@ -484,19 +528,22 @@ func sendTyping(started: Bool) async {
         guard let c = controller else { return }
         syncNote = "sync requested…"
         if await c.requestSync() {
-            syncNote = "request sent, waiting for phone…"
+            syncNote = "request sent, waiting for contacts_synced…"
             Log.info("manual contact sync requested")
         } else {
             syncNote = "request failed"
             Log.error("manual sync failed")
         }
-        await c.refreshNow()
-        sync()
+        // The authoritative refresh is triggered by the backend's
+        // `contacts_synced` event; refreshing immediately would only reread
+        // the old roster and reintroduce Unknown names.
     }
 
     func logout() async {
         guard let c = controller else { return }
         callController.reset()
+        notifiedCallIDs.removeAll()
+        NotificationManager.shared.cancelAll()
         // Clear all data from Rust core (DB, caches, keychain). This performs
         // the service logout itself; do not issue a second logout afterward.
         if let live = liveService {
@@ -524,6 +571,9 @@ func sendTyping(started: Bool) async {
     private func succeed(_ controller: ChatController) {
         sync()
         phase = .linked
+        if notificationsEnabled {
+            Task { _ = await NotificationManager.shared.requestAuthorization() }
+        }
         if selectedId == nil, let first = conversations.first {
             select(first.id)
         }
@@ -533,6 +583,35 @@ func sendTyping(started: Bool) async {
         sync()
         errorMessage = controller.lastError ?? "unknown error"
         phase = .failed
+    }
+
+    private func notifyIncomingMessage(_ message: ChatMessage) {
+        // Avoid a banner for a conversation the user is already viewing, but
+        // keep notifications for all other conversations and for a running
+        // app in the background.
+        if selectedId == message.conversationId && NSApplication.shared.isActive {
+            return
+        }
+        let conversationTitle = conversations.first(where: { $0.id == message.conversationId })?.title
+            ?? "New message"
+        let sender: String
+        if let hint = message.author.displayName,
+           !hint.isEmpty,
+           hint != "Unknown",
+           hint != String((message.author.uuidString ?? "").prefix(8)) {
+            sender = hint
+        } else {
+            sender = message.author.uuidString.map {
+                displayName(for: $0, in: message.conversationId)
+            } ?? "Unknown"
+        }
+        NotificationManager.shared.notifyMessage(
+            threadID: message.conversationId,
+            conversationTitle: conversationTitle,
+            senderName: sender,
+            body: message.body,
+            storeTs: message.storeTs
+        )
     }
 
     /// Resolve a friendly name for an ACI/UUID in a conversation.
@@ -562,6 +641,16 @@ func sendTyping(started: Bool) async {
         }
 
         return "Unknown"
+    }
+
+    func displayName(for message: ChatMessage) -> String {
+        if let hint = message.author.displayName,
+           !hint.isEmpty,
+           hint != "Unknown",
+           hint != String((message.author.uuidString ?? "").prefix(8)) {
+            return hint
+        }
+        return displayName(for: message.author.uuidString ?? "", in: message.conversationId)
     }
 
     /// Two-letter initials for group sender chips and sender labels.

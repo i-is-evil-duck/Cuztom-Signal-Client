@@ -199,8 +199,8 @@ struct MessageListView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
-                            ForEach(vm.messages, id: \.id) { msg in
-                                MessageRow(msg: msg)
+                            ForEach(Array(vm.messages.enumerated()), id: \.element.id) { index, msg in
+                                MessageRow(msg: msg, showsSender: shouldShowSender(at: index))
                             }
                             Color.clear
                                 .frame(height: 1)
@@ -363,6 +363,21 @@ struct MessageListView: View {
         }
     }
 
+    private func shouldShowSender(at index: Int) -> Bool {
+        let message = vm.messages[index]
+        guard message.direction == .incoming, message.author.groupId != nil else {
+            return false
+        }
+        guard index > 0 else { return true }
+        let previous = vm.messages[index - 1]
+        let sameSender = previous.direction == .incoming
+            && previous.author.groupId != nil
+            && previous.author.uuidString == message.author.uuidString
+        let contiguous = sameSender
+            && message.sentAt.timeIntervalSince(previous.sentAt) < 5 * 60
+        return !contiguous
+    }
+
     private func send() {
         let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty || !vm.pendingFiles.isEmpty,
@@ -377,6 +392,7 @@ struct MessageListView: View {
 struct MessageRow: View {
     @Environment(ChatViewModel.self) private var vm
     var msg: ChatMessage
+    var showsSender = true
 
     private let quickEmojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
 
@@ -389,8 +405,8 @@ struct MessageRow: View {
             if msg.direction == .outgoing { Spacer() }
             VStack(alignment: .leading, spacing: 4) {
                 // Sender name/initials for group messages (incoming only)
-                if isGroupMessage && msg.direction == .incoming {
-                    let senderName = vm.displayName(for: msg.author.uuidString ?? "", in: msg.conversationId)
+                if isGroupMessage && msg.direction == .incoming && showsSender {
+                    let senderName = vm.displayName(for: msg)
                     let initials = vm.initials(for: senderName)
                     HStack(spacing: 6) {
                         Circle()
@@ -481,6 +497,33 @@ struct MessageRow: View {
     }
 }
 
+private enum AttachmentImageLoader {
+    /// Decode bytes rather than asking AppKit to infer a type from a cache
+    /// filename. Older inbound attachments were stored as extensionless
+    /// `...-attachment` files even when their MIME type was image/gif.
+    static func load(from url: URL) -> NSImage? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return NSImage(data: data)
+    }
+}
+
+struct AnimatedGIFView: NSViewRepresentable {
+    let image: NSImage
+
+    func makeNSView(context: Context) -> NSImageView {
+        let view = NSImageView()
+        view.imageScaling = .scaleProportionallyUpOrDown
+        view.animates = true
+        view.image = image
+        return view
+    }
+
+    func updateNSView(_ nsView: NSImageView, context: Context) {
+        nsView.image = image
+        nsView.animates = true
+    }
+}
+
 struct AttachmentRow: View {
     @Environment(ChatViewModel.self) private var vm
     var msg: ChatMessage
@@ -489,30 +532,36 @@ struct AttachmentRow: View {
 
     var body: some View {
         Group {
-            if att.mimeType.hasPrefix("image/"), let url = att.localURL,
-               let img = NSImage(contentsOf: url) {
-                Image(nsImage: img)
+            if isGIF, let url = existingURL,
+               let image = AttachmentImageLoader.load(from: url) {
+                AnimatedGIFView(image: image)
+                    .frame(maxWidth: .infinity, maxHeight: 240)
+                    .cornerRadius(6)
+                    .onTapGesture {
+                        vm.preview = PreviewItem(url: url, mime: att.normalizedMIMEType, filename: att.filename)
+                    }
+            } else if att.isImage, let url = existingURL,
+               let image = AttachmentImageLoader.load(from: url) {
+                Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(maxHeight: 240)
                     .cornerRadius(6)
                     .onTapGesture {
-                        vm.preview = PreviewItem(url: url, mime: att.mimeType, filename: att.filename)
+                        vm.preview = PreviewItem(url: url, mime: att.normalizedMIMEType, filename: att.filename)
                     }
-            } else if att.mimeType.hasPrefix("video/"), let url = att.localURL {
+            } else if att.isVideo, let url = existingURL {
                 VideoThumbnail(url: url, filename: att.filename)
             } else {
                 HStack(spacing: 8) {
                     Image(systemName: icon)
                     VStack(alignment: .leading) {
                         Text(att.filename).font(.subheadline).lineLimit(1)
-                        Text("\(att.mimeType) · \(sizeString)").font(.caption).foregroundStyle(.secondary)
+                        Text("\(att.normalizedMIMEType) · \(sizeString)").font(.caption).foregroundStyle(.secondary)
                     }
-                    if att.localURL != nil {
+                    if let url = existingURL {
                         Button("Reveal") {
-                            if let url = att.localURL {
-                                NSWorkspace.shared.activateFileViewerSelecting([url])
-                            }
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
                         }
                         .font(.caption)
                     } else {
@@ -529,9 +578,17 @@ struct AttachmentRow: View {
         }
     }
 
+    private var existingURL: URL? {
+        guard let url = att.localURL,
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+    }
+
+    private var isGIF: Bool { att.isGIF }
+
     private var icon: String {
-        if att.mimeType.hasPrefix("video/") { return "film" }
-        if att.mimeType.hasPrefix("audio/") { return "waveform" }
+        if att.isVideo { return "film" }
+        if att.normalizedMIMEType.hasPrefix("audio/") { return "waveform" }
         return "doc"
     }
 
@@ -550,11 +607,15 @@ struct AttachmentPreview: View {
         VStack(spacing: 12) {
             Text(item.filename).font(.headline).lineLimit(1)
             Group {
-                if item.mime.hasPrefix("image/"), let img = NSImage(contentsOf: item.url) {
-                    Image(nsImage: img)
+                let meta = AttachmentMeta(filename: item.filename, mimeType: item.mime, byteCount: 0, localURL: item.url)
+                if meta.isGIF, let image = AttachmentImageLoader.load(from: item.url) {
+                    AnimatedGIFView(image: image)
+                        .frame(maxWidth: .infinity, maxHeight: 460)
+                } else if meta.isImage, let image = AttachmentImageLoader.load(from: item.url) {
+                    Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                } else if item.mime.hasPrefix("video/") {
+                } else if meta.isVideo {
                     SheetVideoPlayer(url: item.url)
                 } else {
                     Image(systemName: "doc").font(.system(size: 64))

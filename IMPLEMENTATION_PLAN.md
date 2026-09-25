@@ -1,142 +1,131 @@
-# Implementation Plan: Fix All Issues (Easiest → Hardest)
+# Implementation status and next steps
 
-> **Status for `beta-1.4.0`:** message routing, group context, identity/name
-> resolution, logout wiping, attachment rendering, and native 1:1 calls are
-> implemented. Group calls are intentionally staged next because they require
-> Signal membership-proof and SFU HTTP support in addition to signaling.
+_Last updated: 2026-09-24_
 
-## Phase 1: Quick Wins (1-2 hours each) ✅ Start Here
+This document reflects the current `main` working tree after the native-call
+and messaging-hardening pass. The project is now a working linked-device
+client; the remaining work is primarily group calls, offline delivery,
+group administration, and release hardening.
 
-### 1.1 Fix Read Receipts Display - Show Usernames Not IDs
-**Files:** `XcodeApp/Sources/Views.swift` (lines 313-331)
-**Change:** Map ACI/UUID to display names in receipt popover using conversation peer info
+## Completed work
 
-### 1.2 Wire Typing Indicators to ViewModel
-**Files:** `Sources/CuztomSignalCore/ChatController.swift`, `XcodeApp/Sources/CuztomSignalApp.swift`
-**Change:** Connect `RustCoreService.onTyping` → `ChatViewModel.applyTyping` instead of `ChatController.applyTyping`
+### Core messaging and identity
 
-### 1.3 Auto-Send Read Receipts on Conversation Select
-**Files:** `XcodeApp/Sources/CuztomSignalApp.swift` (line 175-179)
-**Change:** Ensure `sendReadReceipts` setting is respected and called automatically
+- [x] Native QR linking and linked-session resume.
+- [x] Native Signal websocket receive loop and contact/groups sync.
+- [x] Canonical 1:1 and GroupsV2 thread IDs.
+- [x] GroupsV2 `masterKey`/`revision` context on outgoing group messages.
+- [x] Self/Note to Self labeling and stable canonical thread routing.
+- [x] Friendly contact and group names, sender hints, initials, and group
+  member profile-key fallback lookup.
+- [x] Contact sync refresh on the authoritative `contacts_synced` event.
+- [x] Resolved profile names are preserved when a later roster refresh has
+  only a blank/`Unknown` value.
 
-### 1.4 Fix Group Message Sender Name Display
-**Files:** `XcodeApp/Sources/Views.swift` (lines 385-398)
-**Change:** Use `msg.author.uuidString` to look up display name from roster instead of showing raw ACI
+### Storage and duplicate suppression
 
----
+- [x] SQLite/GRDB production message store with in-memory test store.
+- [x] Stable message identity based on thread, sender, and client/store
+  timestamp; server-clock differences no longer create a second UUID.
+- [x] UUID migration aliases for the previous server-clock key format.
+- [x] Logical deduplication in both in-memory and SQLite stores.
+- [x] Attachment-only message normalization (`""` vs `[attachment]`).
+- [x] Startup migration removes old duplicate rows and empty control-envelope
+  rows.
+- [x] Unread counts and notifications are not incremented by replayed rows.
+- [x] Startup reentrancy guard prevents multiple service/controller instances.
+- [x] Logout clears Rust state, Swift SQLite state, caches, attachments, UUID
+  mappings, path mappings, and keychain material.
 
-## Phase 2: Core Data Fixes (Half day each)
+### Messaging features
 
-### 2.1 Implement `clearAllData()` for Proper Logout
-**Files:**
-- `Sources/CuztomSignalCore/ChatController.swift` (logout function)
-- `Sources/CuztomSignalCore/RustCoreService.swift` (add clearData method)
-- `Sources/CuztomSignalCore/SecretStore.swift` (add clearAll)
-- `Sources/CuztomSignalCore/SQLiteMessageStore.swift` (add deleteDatabase)
-**Change:** Delete SQLite DB, Keychain entries, attachment caches, path cache on logout
+- [x] 1:1 and group text sending/receiving.
+- [x] Attachments: upload, metadata-only history rows, on-demand download,
+  image/video rendering, animated GIFs, Reveal in Finder, and stable cache
+  paths per attachment index.
+- [x] Reactions.
+- [x] Replies and message edits.
+- [x] Delete for me and delete for everyone.
+- [x] Incoming typing indicators. Outgoing typing remains intentionally
+  disabled because the current presage sender path is unsupported.
+- [x] Read/delivery receipt settings, sending, and display.
+- [x] Link previews.
+- [x] Message list scrolls to newest content on send/receive.
+- [x] Group sender chips only on the first message in a contiguous sender run.
 
-### 2.2 Fix SignalAddress Model - Separate groupId from threadId
-**Files:**
-- `Sources/CuztomSignalCore/Models.swift` (SignalAddress struct)
-- `Sources/CuztomSignalCore/RustCoreService.swift` (chatMessage, applyRoster)
-- `Sources/CuztomSignalCore/ChatController.swift` (send, sendReply, etc.)
-**Change:** Add `threadId` field, make `groupId` hold only master key hex
+### macOS integration
 
-### 2.3 Fix Message Deduplication - Persist UUID Mapping
-**Files:**
-- `Sources/CuztomSignalCore/RustCoreService.swift` (uuidCache persistence)
-- `Sources/CuztomSignalCore/SQLiteMessageStore.swift` (store wire key → UUID mapping)
-**Change:** Save `uuidCache` to disk, load on startup to prevent re-sync duplicates
+- [x] Native local notifications for newly received messages.
+- [x] Native local notifications for incoming calls, with duplicate
+  suppression and cancellation on answer/decline/hangup.
+- [x] Notification enable/disable setting.
+- [x] Incoming message notifications are suppressed for the currently viewed
+  conversation while the app is active.
+- [x] Ad-hoc signed local app bundle with the rebuilt native dylib.
 
-### 2.4 Canonicalize Thread ID Parsing
-**Files:** New `Sources/CuztomSignalCore/ThreadID.swift` + updates to all files
-**Change:** Single source of truth for `threadId` ↔ `SignalAddress` ↔ `groupId` conversions
+### Native 1:1 calls
 
----
+- [x] RingRTC native/prebuilt-WebRTC foundation.
+- [x] Native offer/answer/ICE/hangup/busy Signal signaling.
+- [x] 1:1 voice call state machine, microphone permission, mute, elapsed
+  timer, and incoming/outgoing UI.
+- [x] Call state and signaling bridge survives the current 1:1 path.
 
-## Phase 3: Message Flow Fixes (Full day each)
+## Current validation
 
-### 3.1 Wire Delivery Receipts on Message Receive
-**Files:**
-- `Sources/CuztomSignalCore/ChatController.swift` (receive function)
-- `Sources/CuztomSignalCore/RustCoreService.swift` (sendReceipt)
-- `rust-core/src/sync.rs` (send_receipt - add group support)
-**Change:** Auto-send "delivered" receipt when message received, "read" when viewed
+- Swift Testing: **38 tests passed**.
+- Rust library tests: **6 tests passed**.
+- `cargo check`: passed.
+- `cargo build --release`: passed.
+- `swift build --product CuztomSignal`: passed with full Xcode.
+- Local app bundle rebuilt, signed, and smoke-tested against a fresh link.
+- Fresh-reset verification confirmed contact/group names render and old
+  duplicate/control rows do not reappear.
 
-### 3.2 Fix Group DM Routing (Critical Bug)
-**Files:**
-- `Sources/CuztomSignalCore/Models.swift`
-- `Sources/CuztomSignalCore/RustCoreService.swift` (sendText, chatMessage)
-- `rust-core/src/sync.rs` (do_send, parse_thread)
-**Change:** Ensure group messages use correct thread parsing and group master key
+## Open work, in priority order
 
-### 3.3 Centralize Username/Display Name Resolution
-**Files:**
-- New `Sources/CuztomSignalCore/ContactResolver.swift`
-- `Sources/CuztomSignalCore/ChatController.swift` (enrichNames)
-- `Sources/CuztomSignalCore/RustCoreService.swift` (profileName)
-- `XcodeApp/Sources/Views.swift` (MessageRow)
-**Change:** Single service for resolving ACI/UUID → display name, with caching
+### P0 — Group calls
 
----
+Do not enable the group-call button until all of the following are complete:
 
-## Phase 4: Major Features (Multiple days each)
+1. Retrieve and validate Signal external group membership proofs.
+2. Derive RingRTC group and accepted-member identities from the group master
+   key and membership ciphertext.
+3. Implement RingRTC's HTTP delegate for SFU requests/responses.
+4. Add opaque group-call signaling without changing the working 1:1 path.
+5. Add separate Rust FFI commands and Swift group-call lifecycle/UI.
+6. Verify with two linked/native clients before shipping the button.
 
-### 4.1 Implement Group Management (Rust Side)
-**Files:** `rust-core/src/groups.rs`, `rust-core/src/lib.rs`
-**Change:** Implement all stub functions using presage's GroupsManager
+### P1 — Reliability and background delivery
 
-### 4.2 Implement Group Management (Swift Side)
-**Files:**
-- `Sources/CuztomSignalCore/RustCoreService.swift` (FFI calls)
-- `Sources/CuztomSignalCore/ChatController.swift` (group actions)
-- `XcodeApp/Sources/Views.swift` / new GroupManagementView
-**Change:** Wire up group creation, member management, settings
+- Fetch Signal's authenticated TURN relay list.
+- Expose/support urgent-message signaling where the underlying sender permits
+  it.
+- Add APNs registration and encrypted provider-backed ordinary/VoIP delivery.
+- Add launch-at-login, reconnect policy, and background lifecycle handling.
+- Add CallKit/system call UI and lock-screen actions for incoming calls.
+- Add a true 500-message paging test and larger attachment/limit tests.
 
-### 4.3 Implement Call Signaling (Rust + Swift)
-**Files:**
-- `rust-core/src/sync.rs` (call functions)
-- `rust-core/src/lib.rs` (FFI)
-- `Sources/CuztomSignalCore/CallController.swift`
-- `XcodeApp/Sources/CallViews.swift`
-**Change:** Integrate RingRTC for WebRTC calling
+### P1 — Product features
 
-### 4.4 Attachment Cache Lifecycle Management
-**Files:**
-- `Sources/CuztomSignalCore/RustCoreService.swift` (pathCache, localPaths)
-- `Sources/CuztomSignalCore/SQLiteMessageStore.swift`
-- New cleanup utility
-**Change:** LRU eviction, orphan cleanup, size limits
+- Group administration: create/rename, avatar, member management, roles, and
+  leave group.
+- Full video calling, group video, multi-call handling, and device selection.
+- Disappearing-message timers.
+- Cross-thread message search.
+- Encrypted SQLite/keychain-backed database protection at rest.
+- Backup/restore and crash reporting.
 
----
+### P2 — Release engineering
 
-## Phase 5: Polish & Testing
+- Signed and notarized DMG with a reproducible release script.
+- Sparkle or another signed update channel.
+- App Store/notarization licensing review and user-facing privacy disclosures.
+- CI running the full Xcode Swift tests and RingRTC Rust build on macOS arm64.
 
-### 5.1 Error Handling & User Feedback
-### 5.2 Integration Tests for Send/Receive Flow
-### 5.3 Message Search Implementation
-### 5.4 Backup/Restore
+## Definition of done for group calls
 
----
-
-## Execution Order (Start → Finish)
-
-| # | Task | Est. Time | Dependencies |
-|---|------|-----------|--------------|
-| 1 | Fix read receipts display | 1 hr | None |
-| 2 | Wire typing indicators | 1 hr | None |
-| 3 | Auto-send read receipts | 30 min | #1 |
-| 4 | Fix group sender name display | 1 hr | None |
-| 5 | Implement clearAllData() logout | 4 hrs | None |
-| 6 | Fix SignalAddress model | 4 hrs | #5 |
-| 7 | Persist UUID mapping | 3 hrs | #6 |
-| 8 | Canonicalize thread parsing | 3 hrs | #6 |
-| 9 | Wire delivery receipts | 4 hrs | #3, #6 |
-| 10 | Fix group DM routing | 6 hrs | #6, #8 |
-| 11 | Centralize name resolution | 4 hrs | #4, #6 |
-| 12 | Group management (Rust) | 2 days | #10 |
-| 13 | Group management (Swift) | 1 day | #12 |
-| 14 | Call signaling | 3 days | #10 |
-| 15 | Attachment cache cleanup | 1 day | #5 |
-
-**Total Estimate: ~2 weeks for Phases 1-3 (core fixes), ~2 more weeks for Phases 4-5**
+A group-call MVP is not complete until membership proof retrieval, SFU HTTP
+request/response handling, opaque group signaling, accepted-member key
+mapping, and a two-client native test all pass. The existing 1:1 call path must
+remain green throughout the work.

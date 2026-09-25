@@ -5,7 +5,7 @@
 //!            "groups":[{"id","title"}],"messages":[message…]}
 //!   message: {"key","thread","sender","sender_name","body","ts","outgoing"}
 //!     thread = "contact:<uuid>" | "group:<hex master key>"
-//!     key    = stable dedupe key "thread/ts/sender"
+//!     key    = stable dedupe key "thread/client_ts/sender"
 //!   event: {"type":"message","message":message}
 //!          {"type":"contacts_synced"} | {"type":"queue_empty"}
 //!          {"type":"sync_error","error":…} | {"type":"sync_ended"}
@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use presage::libsignal_service::content::{AttachmentPointer, Content, ContentBody};
 use presage::libsignal_service::proto::sync_message::Content as SyncContent;
 use presage::libsignal_service::proto::GroupContextV2;
+use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::protocol::{Aci, Pni, ServiceId};
 use presage::manager::Registered;
 use presage::model::messages::Received;
@@ -57,7 +58,22 @@ fn display_name(names: &HashMap<String, String>, uuid: &str) -> String {
             return n.clone();
         }
     }
-    uuid.chars().take(8).collect()
+    "Unknown".to_string()
+}
+
+fn content_store_timestamp(content: &Content) -> u64 {
+    if let ContentBody::SynchronizeMessage(sync) = &content.body {
+        if let Some(SyncContent::Sent(sent)) = &sync.content {
+            if let Some(timestamp) = sent.timestamp {
+                return timestamp;
+            }
+        }
+    }
+    content.metadata.client_timestamp.timestamp_millis().max(0) as u64
+}
+
+fn has_chat_content(body: &str, attachments: &[AttachmentPointer]) -> bool {
+    !body.is_empty() || !attachments.is_empty()
 }
 
 /// Convert one decrypted `Content` into a wire message plus its raw
@@ -71,7 +87,7 @@ pub fn content_parts(
     let meta = &content.metadata;
     let sender = service_uuid(&meta.sender);
     let ts = meta.server_timestamp.timestamp_millis().max(0) as u64;
-    let store_ts = meta.client_timestamp.timestamp_millis().max(0) as u64;
+    let store_ts = content_store_timestamp(content);
     match &content.body {
         ContentBody::DataMessage(m) => {
             let body = m.body.clone().unwrap_or_default();
@@ -90,6 +106,9 @@ pub fn content_parts(
                 Thread::Group(key) => format!("group:{}", hex::encode(key)),
             };
             let pointers = m.attachments.clone();
+            if !has_chat_content(&body, &pointers) {
+                return None;
+            }
             Some((message_json(&thread_id, &sender, names, &body, ts, outgoing, &pointers, store_ts), pointers))
         }
         ContentBody::SynchronizeMessage(s) => {
@@ -100,6 +119,9 @@ pub fn content_parts(
                 ),
                 _ => return None,
             };
+            if !has_chat_content(&body, &pointers) {
+                return None;
+            }
             // Canonical thread derivation (sync-sent, group, 1:1).
             let thread = Thread::try_from(content).ok()?;
             let thread_id = match &thread {
@@ -131,8 +153,12 @@ fn message_json(
     pointers: &[AttachmentPointer],
     store_ts: u64,
 ) -> serde_json::Value {
+    // The client/store timestamp is stable across roster pagination, live
+    // delivery, and linked-device sync. Server timestamps can differ between
+    // those paths and must not create a second UUID for the same message.
+    let identity_ts = if store_ts != 0 { store_ts } else { ts };
     serde_json::json!({
-        "key": format!("{thread}/{ts}/{sender}"),
+        "key": format!("{thread}/{identity_ts}/{sender}"),
         "thread": thread,
         "sender": sender,
         "sender_name": display_name(names, sender),
@@ -149,12 +175,81 @@ fn message_json(
 
 /// Metadata-only attachment descriptor (`path` filled after download).
 fn attachment_meta(p: &AttachmentPointer) -> serde_json::Value {
+    let mime = normalized_attachment_mime(p);
+    let name = effective_attachment_name(p, &mime);
     serde_json::json!({
-        "name": p.file_name.clone().unwrap_or_else(|| "attachment".to_string()),
-        "mime": p.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+        "name": name,
+        "mime": mime,
         "size": p.size.unwrap_or(0),
         "path": null,
     })
+}
+
+/// Signal occasionally reports a generic content type for CDN attachments.
+/// Infer the type from the filename so GIF/image/audio previews are not
+/// stranded behind a download button.
+fn normalized_attachment_mime(p: &AttachmentPointer) -> String {
+    let provided = p
+        .content_type
+        .as_deref()
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if provided.is_empty()
+        || provided == "application/octet-stream"
+        || provided == "binary/octet-stream"
+    {
+        guess_mime(std::path::Path::new(p.file_name.as_deref().unwrap_or("")))
+    } else {
+        provided
+    }
+}
+
+fn mime_extension(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/gif" => Some("gif"),
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/heic" => Some("heic"),
+        "video/mp4" => Some("mp4"),
+        "video/quicktime" => Some("mov"),
+        "video/webm" => Some("webm"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/mp4" => Some("m4a"),
+        "audio/aac" => Some("aac"),
+        "audio/wav" => Some("wav"),
+        "application/pdf" => Some("pdf"),
+        _ => None,
+    }
+}
+
+pub fn is_media_attachment(p: &AttachmentPointer) -> bool {
+    let mime = normalized_attachment_mime(p);
+    mime.starts_with("image/") || mime.starts_with("video/")
+}
+
+fn effective_attachment_name(p: &AttachmentPointer, mime: &str) -> String {
+    let supplied = p.file_name.as_deref().unwrap_or("").trim();
+    let base = if supplied.is_empty() {
+        "attachment".to_string()
+    } else {
+        std::path::Path::new(supplied)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment")
+            .to_string()
+    };
+    if std::path::Path::new(&base).extension().is_some() {
+        return base;
+    }
+    match mime_extension(mime) {
+        Some(ext) => format!("{base}.{ext}"),
+        None => base,
+    }
 }
 
 /// Max auto-download per attachment (25 MB); larger stay metadata-only.
@@ -194,7 +289,8 @@ pub async fn download_attachment(
     if size > MAX_AUTO_DOWNLOAD_BYTES {
         return Ok(None);
     }
-    let name = ptr.file_name.clone().unwrap_or_else(|| "attachment".to_string());
+    let mime = normalized_attachment_mime(ptr);
+    let name = effective_attachment_name(ptr, &mime);
     let dest = attachment_path(thread_id, ts, index, &name);
     if dest.exists() {
         return Ok(Some(dest.to_string_lossy().into_owned()));
@@ -284,10 +380,7 @@ pub async fn fetch_attachment(
     let content = msgs
         .iter()
         .rev()
-        .find(|m| {
-            let t = m.metadata.client_timestamp.timestamp_millis().max(0) as u64;
-            t <= sts
-        })
+        .find(|m| content_store_timestamp(m) <= sts)
         .ok_or_else(|| "message not found".to_string())?;
     let pointers: Vec<AttachmentPointer> = match &content.body {
         ContentBody::DataMessage(m) => m.attachments.clone(),
@@ -317,7 +410,10 @@ pub async fn load_names(store: &SqliteStore) -> HashMap<String, String> {
     for c in contacts {
         let id = c.uuid.to_string();
         let label = if c.name.is_empty() {
-            c.phone_number.as_ref().map(|p| p.to_string()).unwrap_or(id.clone())
+            c.phone_number
+                .as_ref()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "Unknown".to_string())
         } else {
             c.name.clone()
         };
@@ -326,26 +422,40 @@ pub async fn load_names(store: &SqliteStore) -> HashMap<String, String> {
     map
 }
 
+async fn group_member_profile_key(manager: &StoredManager, aci: Aci) -> Option<ProfileKey> {
+    let groups = manager.store().groups().await.ok()?;
+    for entry in groups {
+        let Ok((_, group)) = entry else { continue };
+        if let Some(member) = group.members.iter().find(|member| member.aci == aci) {
+            return Some(member.profile_key);
+        }
+    }
+    None
+}
+
 /// Display name from the Signal profile (for contacts added by phone
 /// number, whose synced contact row has no name). Needs the contact's
 /// profile key, which only exists after at least one message exchange —
 /// otherwise errors and the caller keeps the fallback label.
 pub async fn profile_name(manager: &mut StoredManager, uuid: &str) -> Result<String, String> {
-    let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
-    let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
-    let sid = ServiceId::Aci(Aci::from(parsed));
-    let key = manager
-        .store()
-        .profile_key(&sid)
-        .await
-        .map_err(|e| format!("profile key: {e}"))?
-        .ok_or_else(|| "no profile key yet".to_string())?;
+    let sid = parse_service_id(uuid)?;
+    let aci = match sid {
+        ServiceId::Aci(aci) => aci,
+        ServiceId::Pni(_) => return Err("PNI profile lookup needs an ACI alias".to_string()),
+    };
+    let key = match manager.store().profile_key(&ServiceId::Aci(aci)).await {
+        Ok(Some(key)) => key,
+        Ok(None) => group_member_profile_key(manager, aci)
+            .await
+            .ok_or_else(|| "no profile key yet".to_string())?,
+        Err(e) => return Err(format!("profile key: {e}")),
+    };
     let profile = manager
-        .retrieve_profile_by_uuid(Aci::from(parsed), key)
+        .retrieve_profile_by_uuid(aci, key)
         .await
         .map_err(|e| format!("profile: {e}"))?;
     let name = profile.name.ok_or_else(|| "no name set".to_string())?;
-    Ok(name.given_name)
+    Ok(name.to_string())
 }
 
 /// Offline snapshot: self + contacts + groups + last 50 messages per thread.
@@ -974,4 +1084,45 @@ pub async fn send_typing(
         .map_err(|e| format!("send typing: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_control_envelopes_are_not_chat_content() {
+        assert!(!has_chat_content("", &[]));
+        let pointer = AttachmentPointer {
+            content_type: Some("image/gif".to_string()),
+            ..Default::default()
+        };
+        assert!(has_chat_content("", &[pointer]));
+        assert!(has_chat_content("hello", &[]));
+    }
+
+    #[test]
+    fn gif_pointer_without_filename_gets_stable_name_and_mime() {
+        let pointer = AttachmentPointer {
+            content_type: Some("image/gif".to_string()),
+            file_name: None,
+            ..Default::default()
+        };
+        let mime = normalized_attachment_mime(&pointer);
+        assert_eq!(mime, "image/gif");
+        assert_eq!(effective_attachment_name(&pointer, &mime), "attachment.gif");
+        assert!(is_media_attachment(&pointer));
+    }
+
+    #[test]
+    fn generic_pointer_infers_mime_from_filename() {
+        let pointer = AttachmentPointer {
+            content_type: Some("application/octet-stream".to_string()),
+            file_name: Some("clip.GIF".to_string()),
+            ..Default::default()
+        };
+        let mime = normalized_attachment_mime(&pointer);
+        assert_eq!(mime, "image/gif");
+        assert!(is_media_attachment(&pointer));
+    }
 }

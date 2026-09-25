@@ -56,6 +56,35 @@ public actor SQLiteMessageStore: MessageStoring {
             t.column("deliveredTo_json", .text).notNull()
         }
         try db.create(index: "idx_messages_conversation_sentAt", on: "messages", columns: ["conversationId", "sentAt"], ifNotExists: true)
+        // Reaction, delete, and other control envelopes can be stored as
+        // empty DataMessages by older roster builders. They are not chat
+        // messages and must not acquire a sender chip in the UI.
+        try db.execute(sql: """
+            DELETE FROM messages
+            WHERE storeTs IS NOT NULL
+              AND body = ''
+              AND COALESCE(json_array_length(attachments_json), 0) = 0
+            """)
+        // Older builds could persist the same Signal message under two local
+        // UUIDs when roster and live delivery arrived during startup. Keep the
+        // earliest row for each stable message identity before the UI loads.
+        try db.execute(sql: """
+            DELETE FROM messages
+            WHERE storeTs IS NOT NULL
+              AND rowid NOT IN (
+                SELECT MIN(rowid) FROM messages
+                WHERE storeTs IS NOT NULL
+                GROUP BY conversationId, storeTs, direction,
+                    CASE
+                        WHEN body = '[attachment]' AND COALESCE(json_array_length(attachments_json), 0) > 0 THEN ''
+                        ELSE body
+                    END,
+                    CASE
+                        WHEN direction = 'outgoing' THEN ''
+                        ELSE lower(coalesce(json_extract(author_json, '$.uuidString'), ''))
+                    END
+              )
+            """)
     }
 
     // MARK: - Conversations
@@ -70,7 +99,18 @@ public actor SQLiteMessageStore: MessageStoring {
         }
     }
 
-    private static func upsertConversation(_ db: Database, _ c: Conversation) throws {
+    private static func upsertConversation(_ db: Database, _ conversation: Conversation) throws {
+        var c = conversation
+        let oldTitle = try String.fetchOne(
+            db,
+            sql: "SELECT title FROM conversations WHERE id = ?",
+            arguments: [c.id]
+        )
+        if let oldTitle,
+           isPlaceholderTitle(c.title),
+           !isPlaceholderTitle(oldTitle) {
+            c.title = oldTitle
+        }
         let peerData = try JSONEncoder().encode(c.peer)
         let peerJSON = String(data: peerData, encoding: .utf8)!
         try db.execute(
@@ -140,26 +180,85 @@ public actor SQLiteMessageStore: MessageStoring {
 
     // MARK: - Messages
 
-    public func saveMessage(_ message: ChatMessage) async {
+    @discardableResult
+    public func saveMessage(_ message: ChatMessage) async -> Bool {
         do {
-            try await dbQueue.write { db in
+            return try await dbQueue.write { db in
                 try Self.saveMessage(db, message)
             }
         } catch {
             Log.error("saveMessage failed: \(error)")
+            return false
         }
     }
 
-    private static func saveMessage(_ db: Database, _ m: ChatMessage) throws {
-        let authorData = try JSONEncoder().encode(m.author)
+    private static func saveMessage(_ db: Database, _ message: ChatMessage) throws -> Bool {
+        var messageToSave = message
+        var isNew = true
+
+        // First preserve an existing local UUID for the same stable message
+        // identity. Roster pagination and the live receive stream can deliver
+        // one Signal message with different generated UUIDs.
+        if let storeTs = message.storeTs {
+            let candidates = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM messages
+                WHERE conversationId = ? AND storeTs = ?
+                  AND direction = ?
+                """,
+                arguments: [message.conversationId, storeTs, message.direction.rawValue]
+            )
+            for row in candidates {
+                guard let id = UUID(uuidString: row["id"]) else { continue }
+                let authorJSON: String = row["author_json"]
+                guard let authorData = authorJSON.data(using: .utf8),
+                      let author = try? JSONDecoder().decode(SignalAddress.self, from: authorData) else {
+                    continue
+                }
+                let existingBody: String = row["body"]
+                let existingAttachmentsJSON: String = row["attachments_json"]
+                let existingBodyValue = Self.logicalBody(
+                    existingBody,
+                    attachmentsJSON: existingAttachmentsJSON
+                )
+                let messageBodyValue = Self.logicalBody(
+                    message.body,
+                    attachmentsJSON: String(
+                        data: (try? JSONEncoder().encode(message.attachments)) ?? Data("[]".utf8),
+                        encoding: .utf8
+                    ) ?? "[]"
+                )
+                guard existingBodyValue == messageBodyValue else { continue }
+                let sameAuthor = author.uuidString == message.author.uuidString
+                    || (message.direction == .outgoing
+                        && (author.uuidString == "self" || message.author.uuidString == "self"))
+                if sameAuthor {
+                    messageToSave.id = id
+                    isNew = false
+                    break
+                }
+            }
+        }
+
+        if isNew {
+            let existingIDCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM messages WHERE id = ?",
+                arguments: [message.id.uuidString]
+            ) ?? 0
+            isNew = existingIDCount == 0
+        }
+
+        let authorData = try JSONEncoder().encode(messageToSave.author)
         let authorJSON = String(data: authorData, encoding: .utf8)!
-        let attachmentsData = try JSONEncoder().encode(m.attachments)
+        let attachmentsData = try JSONEncoder().encode(messageToSave.attachments)
         let attachmentsJSON = String(data: attachmentsData, encoding: .utf8)!
-        let reactionsData = try JSONEncoder().encode(m.reactions)
+        let reactionsData = try JSONEncoder().encode(messageToSave.reactions)
         let reactionsJSON = String(data: reactionsData, encoding: .utf8)!
-        let readByData = try JSONEncoder().encode(m.readBy)
+        let readByData = try JSONEncoder().encode(messageToSave.readBy)
         let readByJSON = String(data: readByData, encoding: .utf8)!
-        let deliveredToData = try JSONEncoder().encode(m.deliveredTo)
+        let deliveredToData = try JSONEncoder().encode(messageToSave.deliveredTo)
         let deliveredToJSON = String(data: deliveredToData, encoding: .utf8)!
 
         try db.execute(
@@ -180,25 +279,26 @@ public actor SQLiteMessageStore: MessageStoring {
                 deliveredTo_json = excluded.deliveredTo_json
             """,
             arguments: [
-                m.id.uuidString,
-                m.conversationId,
+                messageToSave.id.uuidString,
+                messageToSave.conversationId,
                 authorJSON,
-                m.body,
-                m.direction.rawValue,
-                m.status.rawValue,
-                m.sentAt.timeIntervalSince1970,
+                messageToSave.body,
+                messageToSave.direction.rawValue,
+                messageToSave.status.rawValue,
+                messageToSave.sentAt.timeIntervalSince1970,
                 attachmentsJSON,
-                m.storeTs,
+                messageToSave.storeTs,
                 reactionsJSON,
                 readByJSON,
                 deliveredToJSON
             ]
         )
 
-        // Bump conversation lastActiveAt / preview / unread
-        let preview = String(m.body.prefix(120))
-        let lastActive = m.sentAt.timeIntervalSince1970
-        let unreadDelta = m.direction == .incoming ? 1 : 0
+        // Bump conversation lastActiveAt / preview / unread only for a new
+        // message. Replays must not inflate unread counts.
+        let preview = String(messageToSave.body.prefix(120))
+        let lastActive = messageToSave.sentAt.timeIntervalSince1970
+        let unreadDelta = isNew && messageToSave.direction == .incoming ? 1 : 0
         try db.execute(sql: """
             INSERT INTO conversations (id, title, peer_json, lastMessagePreview, lastActiveAt, unreadCount)
             VALUES (?, '', '{}', ?, ?, ?)
@@ -207,8 +307,9 @@ public actor SQLiteMessageStore: MessageStoring {
                 lastActiveAt = MAX(lastActiveAt, excluded.lastActiveAt),
                 unreadCount = unreadCount + excluded.unreadCount
             """,
-            arguments: [m.conversationId, preview, lastActive, unreadDelta]
+            arguments: [messageToSave.conversationId, preview, lastActive, unreadDelta]
         )
+        return isNew
     }
 
     public func markRead(conversationId: String) async {
@@ -270,7 +371,7 @@ public actor SQLiteMessageStore: MessageStoring {
                     return false
                 }
                 transform(&msg)
-                try Self.saveMessage(db, msg)
+                _ = try Self.saveMessage(db, msg)
                 return true
             }
         } catch {
@@ -292,6 +393,23 @@ public actor SQLiteMessageStore: MessageStoring {
             Log.error("deleteMessage failed: \(error)")
             return nil
         }
+    }
+
+    private static func logicalBody(_ body: String, attachmentsJSON: String) -> String {
+        let hasAttachments = (try? JSONDecoder().decode([AttachmentMeta].self, from: Data(attachmentsJSON.utf8)))?.isEmpty == false
+        if body == "[attachment]" && hasAttachments {
+            return ""
+        }
+        return body
+    }
+
+    private static func isPlaceholderTitle(_ title: String) -> Bool {
+        let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty
+            || value == "Unknown"
+            || value.hasPrefix("+")
+            || value.count == 8
+            || UUID(uuidString: value) != nil
     }
 
     public func totalMessageCount() async -> Int {

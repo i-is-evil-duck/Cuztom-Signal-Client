@@ -355,7 +355,12 @@ public final class CallController: ObservableObject {
         case .offer:
             Log.info("call UI: received offer while active=\(activeCall != nil)")
             guard activeCall == nil else { return }
-            let peer = SignalAddress.from(threadId: signal.thread)
+            var peer = SignalAddress.from(threadId: signal.thread)
+            if !signal.senderName.isEmpty,
+               signal.senderName != "Unknown",
+               signal.senderName != String(signal.sender.prefix(8)) {
+                peer.displayName = signal.senderName
+            }
             let nativeAlreadyConnected = nativeStates[signal.callId] == "connected"
             let record = CallRecord(
                 conversationId: signal.thread,

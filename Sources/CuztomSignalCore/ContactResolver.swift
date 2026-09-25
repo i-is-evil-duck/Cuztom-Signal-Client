@@ -3,7 +3,7 @@ import Foundation
 /// Centralized contact name resolution service.
 /// Provides consistent ACI/UUID → display name mapping across the app.
 public actor ContactResolver {
-    private let rustCore: RustCoreService?
+    private var rustCore: RustCoreService?
     private var nameCache: [String: String] = [:] // aci/uuid -> display name
     private var groupMemberCache: [String: [String: String]] = [:] // groupThreadId -> [aci -> name]
 
@@ -13,30 +13,28 @@ public actor ContactResolver {
 
     /// Set the RustCoreService for profile lookups
     public func setRustCore(_ rustCore: RustCoreService) {
-        // Note: Can't reassign due to actor isolation, would need a different pattern
+        self.rustCore = rustCore
     }
 
     /// Resolve display name for an ACI/UUID in a conversation context
     public func displayName(for aci: String, in conversationId: String, conversations: [Conversation]) -> String {
+        let key = Self.normalizedID(aci)
         // "You" for own messages
-        if aci == "self" || aci == "You" { return "You" }
+        if key == "self" || aci == "You" { return "You" }
 
         // Check conversation peer (1:1 chat)
         if let conv = conversations.first(where: { $0.id == conversationId }) {
             if !conv.peer.isGroup {
-                if conv.peer.uuidString == aci || conv.peer.phone == aci {
+                if Self.normalizedID(conv.peer.uuidString ?? "") == key || conv.peer.phone == aci {
                     return conv.title
                 }
-            } else {
-                // Group conversation - check group member cache
-                if let memberName = groupMemberCache[conversationId]?[aci] {
-                    return memberName
-                }
+            } else if let memberName = groupMemberCache[conversationId]?[key] {
+                return memberName
             }
         }
 
-        // Check global name cache
-        if let cached = nameCache[aci] {
+        // Check global name cache, including ACI/PNI aliases.
+        if let cached = nameCache[key] ?? nameCache[aci] {
             return cached
         }
 
@@ -46,28 +44,24 @@ public actor ContactResolver {
 
     /// Resolve display name with RustCore for profile lookups
     public func displayNameWithProfile(for aci: String, in conversationId: String, conversations: [Conversation], rustCore: RustCoreService) async -> String {
-        // Quick check first
         let quick = displayName(for: aci, in: conversationId, conversations: conversations)
-        if quick != String(aci.prefix(min(8, aci.count))) && quick != aci {
-            return quick
-        }
+        if quick != "Unknown" { return quick }
+        let key = Self.normalizedID(aci)
 
-        // Try profile lookup for contacts
+        // For a known 1:1 conversation, the roster title is authoritative.
         if let conv = conversations.first(where: { $0.id == conversationId }), !conv.peer.isGroup {
-            // For 1:1, we already have the name from roster
             return quick
         }
 
-        // For group members, try profile lookup
-        if let name = await rustCore.profileName(uuid: aci) {
-            nameCache[aci] = name
-            // Also cache in group member cache
+        // Group members may not have a contact row, but a profile key can
+        // become available after an authenticated message exchange.
+        if let name = await rustCore.profileName(uuid: aci), !name.isEmpty {
+            nameCache[key] = name
             if let conv = conversations.first(where: { $0.id == conversationId }), conv.peer.isGroup {
-                groupMemberCache[conversationId, default: [:]][aci] = name
+                groupMemberCache[conversationId, default: [:]][key] = name
             }
             return name
         }
-
         return quick
     }
 
@@ -76,11 +70,11 @@ public actor ContactResolver {
         for contact in contacts {
             let id = contact.id
             let label = if contact.name.isEmpty {
-                contact.phone.isEmpty ? id : contact.phone
+                contact.phone.isEmpty ? "Unknown" : contact.phone
             } else {
                 contact.name
             }
-            nameCache[id] = label
+            nameCache[Self.normalizedID(id)] = label
 
             // Also index by phone if available
             if !contact.phone.isEmpty {
@@ -101,5 +95,12 @@ public actor ContactResolver {
     public func clear() {
         nameCache.removeAll()
         groupMemberCache.removeAll()
+    }
+
+    private static func normalizedID(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "PNI:", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
 }

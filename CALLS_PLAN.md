@@ -1,85 +1,99 @@
-# Call Implementation Plan (RingRTC native, macOS)
+# Native call implementation status (RingRTC, macOS)
 
-## Goal
-Real 1:1 voice calls in the existing Rust-core + SwiftUI app. No `signal-cli`
-subprocess and no virtual-audio-device bridge. Group calls are now a staged
-follow-up; the current release keeps the working 1:1 path isolated while the
-Signal group-call transport and SFU bootstrap are implemented.
+_Last updated: 2026-09-24_
 
-## Foundation — complete
-- `ringrtc` builds with `features = ["native", "prebuilt_webrtc"]`.
-- Signal's prebuilt `libwebrtc.a` is fetched and linked for macOS arm64.
-- `scripts/grealpath` removes the GNU `realpath -e` build dependency.
-- The dylib links `CoreAudio`, `AudioToolbox`, `AudioUnit`, and `IOKit`.
-- `sync::call_signal_part` lifts `CallMessage` envelopes out of the receive
-  stream, including all ICE updates in one event.
+## Goal and scope
 
-## Phase A — Rust RingRTC platform layer — complete
-- Reuse ringrtc's public `NativePlatform` rather than reimplementing its large
-  `Platform` trait.
-- Implement `SignalingSender` to turn RingRTC offer/answer/ICE/hangup/busy
-  messages into Signal `CallMessage` protobufs.
-- Implement `CallStateHandler` and forward `proceed` actions to the core loop.
-- Initialize one `PeerConnectionFactory`, CoreAudio input/output selection,
-  audio track, and `CallManager` per process.
-- Set the local device id and self UUID from the linked registration.
+Cuztom Signal uses native RingRTC/WebRTC for calls. There is no `signal-cli`
+subprocess and no virtual-audio-device bridge.
 
-## Phase B — RingRTC ↔ libsignal bridge — complete
-- RingRTC's synchronous callback puts a `PendingCallSignal` on a thread-safe
-  unbounded channel.
-- A persistent bridge task forwards it to the current tokio `LocalSet` control
-  loop, which performs the asynchronous `Manager::send_message`; queued work
-  is discarded while logged out so it cannot cross account sessions.
-- RingRTC is notified with `message_sent` or `message_send_failure` after the
-  real send, so its signaling queue cannot stall or race ahead.
-- Inbound offer/answer/ICE/hangup/busy events are fed to RingRTC on the core
-  loop. ACI and PNI identity keys are looked up from the protocol store and
-  passed as raw 32-byte RingRTC keys.
+The supported release scope is **native 1:1 voice calling**. Group calls are
+intentionally disabled until Signal membership proofs, group/member identity
+derivation, SFU HTTP support, and opaque group signaling are implemented.
 
-## Phase C — C ABI / FFI — complete
-- `core_cmd_call_start(thread, media_type) -> u64` (`u64::MAX` on error).
-- `core_cmd_call_accept(call_id) -> i32`.
-- `core_cmd_call_hangup() -> i32`.
-- Legacy raw-SDP commands now fail explicitly instead of silently pretending
-  to send a call.
+## Completed foundation
 
-## Phase D — Swift integration — complete
-- `RustCoreService` resolves the native symbols and exposes start/accept/hangup.
-- `onCallSignal` and `onCallState` callbacks feed the rewritten `CallController`.
-- Outgoing/incoming/connecting/active/ended state is mapped to the existing
-  SwiftUI call overlays; call history is updated once per call.
-- The fake SDP generator is removed.
-- Microphone permission is requested through AVFoundation before placing or
-  answering a call.
-- `NSMicrophoneUsageDescription` is present in the app bundle.
+- `ringrtc` builds with `native` and `prebuilt_webrtc` features.
+- The macOS RingRTC build uses `rust-core/scripts/grealpath` to provide the
+  GNU-compatible `realpath -e` behavior required by RingRTC's build script.
+- The dylib links the required CoreAudio/AudioToolbox/AVFoundation pieces.
+- `sync::call_signal_part` lifts `CallMessage` envelopes out of the normal
+  chat receive path, including ICE updates.
+- Empty DataMessage control envelopes, including group-call updates, are
+  filtered before roster/history rows are created. They no longer appear as
+  blank messages with sender chips.
 
-## Message and identity hardening — complete
-- Group sends now include GroupsV2 `masterKey`/`revision` context so remote
-  Signal clients file them in the group instead of a sender DM.
-- Conversation selection is generation-guarded and Send captures its target
-  before asynchronous history work can complete.
-- Message lists scroll to the newest message on send/receive.
-- Friendly names and initials are used for group senders, receipts, calls, and
-  account labels; the logged-in account is labeled `Note to Self`/`You`.
-- Logout/data wipe is idempotent and clears Rust state, Swift state, caches,
-  attachments, UUID mappings, and keychain material.
+## Completed 1:1 path
 
-## Phase E — Verification
-- `cargo build --release` passes.
-- `swift build --product CuztomSignal` passes with the full Xcode toolchain.
-- The new dylib and app executable are deployed to `CuztomSignal.app`.
-- App startup smoke test reaches linked sync and logs
-  `native RingRTC calls initialized`.
-- FFI protobuf/build smoke tests pass without a linked account.
-- Real 1:1 voice calls have been manually verified with two-way audio and
-  microphone capture; group calls remain a staged follow-up.
+### Rust/RingRTC
 
-## Known limitations / follow-ups
-- ICE currently uses public STUN servers; Signal's authenticated TURN relay
-  list is not yet fetched from the server. The presage/libsignal websocket
-  sender also has no exposed urgent-message flag, so calls to a fully offline
-  phone may not produce a push notification.
-- Ringtone/ringback audio and system audio-route selection are not implemented.
-- Group/video calls, multi-call handling, and persistent call history remain
-  follow-up work. Group-call transport, membership proof, and SFU HTTP support
-  are intentionally not enabled in this release.
+- Native `PeerConnectionFactory` and audio device initialization.
+- Signal `CallMessage` offer/answer/ICE/hangup/busy signaling.
+- Persistent bridge between RingRTC callbacks and the Rust worker loop.
+- RingRTC `message_sent` / `message_send_failure` handling.
+- ACI/PNI identity-key lookup from the protocol store.
+- Native call start/accept/hangup C ABI commands.
+- Legacy raw-SDP commands fail explicitly rather than pretending to work.
+
+### Swift/macOS
+
+- `RustCoreService` resolves the native symbols.
+- `CallController` maps native signaling and state into a deterministic UI
+  state machine.
+- Incoming race handling for an offer that arrives before native `connected`.
+- Incoming/outgoing/connecting/active/ended overlays.
+- Mute, hangup, microphone permission, and elapsed connected time.
+- Friendly caller names and Note to Self/You identity handling.
+- Incoming-call local notification, deduplicated by call record and cancelled
+  on answer/decline/hangup.
+
+## Verification
+
+- `cargo check`: passed.
+- `cargo test --lib`: 6 tests passed.
+- `cargo build --release`: passed.
+- `swift build --product CuztomSignal`: passed with full Xcode.
+- `swift test`: 38 tests passed.
+- Fresh app/link smoke test reached linked sync and initialized native
+  RingRTC.
+- Two-client 1:1 voice call with microphone capture was manually verified.
+
+## Group-call blocker
+
+The group-call button remains disabled. The missing pieces are:
+
+1. Signal external group membership-proof retrieval and validation.
+2. RingRTC group ID and accepted-member ciphertext/key derivation.
+3. RingRTC HTTP delegate implementation for SFU requests/responses.
+4. Opaque group-call signaling transport.
+5. Separate group-call FFI commands and Swift lifecycle/UI.
+6. Two linked/native-client interoperability testing.
+
+Do not route group-call data through the normal `DataMessage` chat path; doing
+so would reintroduce the empty-control-envelope and group-routing class of
+bugs.
+
+## Known 1:1 limitations and follow-ups
+
+- ICE currently uses public STUN servers. Signal's authenticated TURN relay
+  list is not fetched yet.
+- The current sender does not expose Signal's urgent-message flag, so a call to
+  a fully offline phone may not produce a push notification.
+- Ringtone/ringback audio and full system audio-route selection are not
+  implemented.
+- Video calling is not enabled in the production UI; the current supported
+  call mode is voice.
+- Group/video calls, CallKit, lock-screen call actions, multi-call handling,
+  and persistent call history remain future work.
+- APNs/PushKit, launch-at-login, and killed-app call delivery require a
+  separate signed provider/APNs path and are not implemented.
+
+## Call-related regression checks
+
+Before changing call code, preserve:
+
+- 1:1 audio remains usable when group-call work is disabled.
+- Signal incoming call envelopes never become chat rows.
+- Empty group-call/control updates never become chat rows.
+- Incoming calls are deduplicated and notification state is cancelled when the
+  call is answered, declined, or ended.

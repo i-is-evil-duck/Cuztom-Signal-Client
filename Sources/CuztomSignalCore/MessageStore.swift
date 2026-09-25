@@ -8,7 +8,10 @@ import Foundation
 public protocol MessageStoring: Actor {
     func upsertConversation(_ conversation: Conversation) async
     func allConversations() async -> [Conversation]
-    func saveMessage(_ message: ChatMessage) async
+    /// Persist a message and return true only when it was not already
+    /// present. This is used to avoid duplicate live notifications.
+    @discardableResult
+    func saveMessage(_ message: ChatMessage) async -> Bool
     func markRead(conversationId: String) async
     func messages(in conversationId: String, limit: Int) async -> [ChatMessage]
     func messages(in conversationId: String) async -> [ChatMessage]
@@ -42,28 +45,54 @@ public actor InMemoryMessageStore: MessageStoring {
     }
 
     public func upsertConversation(_ conversation: Conversation) async {
-        conversations[conversation.id] = conversation
+        var updated = conversation
+        // A profile lookup may have produced a better title than the raw
+        // roster row. Do not replace that title with `Unknown`, a phone
+        // number, or a service-id prefix on the next refresh.
+        if let existing = conversations[conversation.id],
+           Self.isPlaceholderTitle(updated.title),
+           !Self.isPlaceholderTitle(existing.title) {
+            updated.title = existing.title
+        }
+        conversations[conversation.id] = updated
     }
 
     public func allConversations() async -> [Conversation] {
         conversations.values.sorted { $0.lastActiveAt > $1.lastActiveAt }
     }
 
-    public func saveMessage(_ message: ChatMessage) async {
-        // Idempotent: re-syncing a thread replaces existing rows by id.
-        if let idx = messages[message.conversationId]?.firstIndex(where: { $0.id == message.id }) {
-            messages[message.conversationId]?[idx] = message
+    @discardableResult
+    public func saveMessage(_ message: ChatMessage) async -> Bool {
+        // Re-syncs can present the same message with a newly generated local
+        // UUID. Prefer the store timestamp + author + content identity so the
+        // UI and unread count remain idempotent across startup refreshes.
+        let existingIndex = messages[message.conversationId]?.firstIndex { existing in
+            if existing.id == message.id { return true }
+            guard let storeTs = message.storeTs,
+                  existing.storeTs == storeTs,
+                  existing.direction == message.direction,
+                  Self.logicalBody(existing) == Self.logicalBody(message) else { return false }
+            return existing.author.uuidString == message.author.uuidString
+                || (message.direction == .outgoing
+                    && (existing.author.uuidString == "self" || message.author.uuidString == "self"))
+        }
+        let isNew = existingIndex == nil
+        if let idx = existingIndex {
+            var merged = message
+            merged.id = messages[message.conversationId]![idx].id
+            messages[message.conversationId]?[idx] = merged
         } else {
             messages[message.conversationId, default: []].append(message)
         }
         if var conv = conversations[message.conversationId] {
             conv.lastMessagePreview = String(message.body.prefix(120))
             conv.lastActiveAt = max(conv.lastActiveAt, message.sentAt)
-            if message.direction == .incoming {
+            if isNew && message.direction == .incoming {
                 conv.unreadCount += 1
             }
             conversations[message.conversationId] = conv
         }
+        return isNew
     }
 
     public func markRead(conversationId: String) async {
@@ -152,6 +181,24 @@ public actor InMemoryMessageStore: MessageStoring {
     public func clearAllData() async {
         conversations.removeAll()
         messages.removeAll()
+    }
+
+    private static func logicalBody(_ message: ChatMessage) -> String {
+        // Roster/live paths disagree on whether an attachment-only message has
+        // an empty body or the UI placeholder "[attachment]".
+        if message.body == "[attachment]" && !message.attachments.isEmpty {
+            return ""
+        }
+        return message.body
+    }
+
+    private static func isPlaceholderTitle(_ title: String) -> Bool {
+        let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty
+            || value == "Unknown"
+            || value.hasPrefix("+")
+            || value.count == 8
+            || UUID(uuidString: value) != nil
     }
 }
 

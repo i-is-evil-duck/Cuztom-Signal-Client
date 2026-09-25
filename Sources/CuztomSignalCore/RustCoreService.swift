@@ -55,7 +55,7 @@ public struct RosterPayload: Decodable, Sendable {
             key = try c.decode(String.self, forKey: .key)
             thread = try c.decode(String.self, forKey: .thread)
             sender = try c.decode(String.self, forKey: .sender)
-            senderName = try c.decode(String.self, forKey: .senderName)
+            senderName = try c.decodeIfPresent(String.self, forKey: .senderName) ?? "Unknown"
             body = try c.decode(String.self, forKey: .body)
             ts = try c.decode(Int64.self, forKey: .ts)
             // Older snapshots predate sts; fall back to display ts.
@@ -185,12 +185,17 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         try? data.write(to: uuidCacheURL, options: .atomic)
     }
 
-    /// Local override for on-demand downloads, keyed "thread/ts".
-    /// Consulted (and persisted) by `chatMessage`.
+    /// Local override for on-demand downloads, keyed by message and
+    /// attachment index. Keeping the index in the key prevents a message
+    /// with multiple files from pointing every attachment at the last file.
     private var localPaths: [String: String] = [:]
 
-    public func bindLocalPath(thread: String, ts: Int64, path: String) {
-        localPaths["\(thread)/\(ts)"] = path
+    private func localPathKey(thread: String, ts: Int64, index: Int) -> String {
+        "\(thread)/\(ts)/\(index)"
+    }
+
+    public func bindLocalPath(thread: String, ts: Int64, index: Int = 0, path: String) {
+        localPaths[localPathKey(thread: thread, ts: ts, index: index)] = path
     }
 
     /// Cache a sent attachment locally so it renders immediately and persists across restarts.
@@ -203,7 +208,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
         // Generate stable cache filename: thread-sanitized-ts-index-filename
         let safeThread = thread.replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
-        let cacheFilename = "\(safeThread)-\(ts)-0-\(filename)"
+        let safeFilename = URL(fileURLWithPath: filename).lastPathComponent
+            .replacingOccurrences(of: "/", with: "_")
+        let cacheFilename = "\(safeThread)-\(ts)-0-\(safeFilename)"
         let cacheURL = cacheDir.appendingPathComponent(cacheFilename)
 
         // Copy file to cache (use security-scoped access if needed)
@@ -217,18 +224,20 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             try? data.write(to: cacheURL)
         }
 
-        // Register in pathCache using message key format: "thread/ts/sender/index"
-        // For sent messages, sender is "self"
-        let messageKey = "\(thread)/\(ts)/self"
+        // Register using the same sender identity that roster messages use.
+        // Older builds used the literal "self"; retain that alias so already
+        // cached outgoing attachments remain discoverable.
+        let sender = selfAci ?? "self"
+        let messageKey = "\(thread)/\(ts)/\(sender)"
         let cacheKey = "\(messageKey)/0"
         rememberPath(key: cacheKey, path: cacheURL.path)
-        localPaths["\(thread)/\(ts)"] = cacheURL.path
+        rememberPath(key: "\(thread)/\(ts)/self/0", path: cacheURL.path)
+        localPaths[localPathKey(thread: thread, ts: ts, index: 0)] = cacheURL.path
 
-        // Also register with ThreadID-derived key for consistency
+        // Also register with ThreadID-derived key for consistency.
         let threadComponents = ThreadID.parse(thread)
         if let groupKey = threadComponents.groupMasterKey {
-            // For groups, also register with group master key
-            let groupCacheKey = "group:\(groupKey)/\(ts)/self/0"
+            let groupCacheKey = "group:\(groupKey)/\(ts)/\(sender)/0"
             rememberPath(key: groupCacheKey, path: cacheURL.path)
         }
 
@@ -757,9 +766,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             }
         }
         guard ts >= 0 else { throw SignalError.network("send failed: \(lastError(sym))") }
+        let sender = selfAci ?? "self"
         let msg = RosterPayload.Message(
-            key: "\(conversationId)/\(ts)/self",
-            thread: conversationId, sender: "self", senderName: "You",
+            key: "\(conversationId)/\(ts)/\(sender)",
+            thread: conversationId, sender: sender, senderName: "You",
             body: body, ts: ts, outgoing: true
         )
         return chatMessage(msg)
@@ -858,8 +868,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         try? FileManager.default.removeItem(at: dbURL.appendingPathExtension("wal"))
         try? FileManager.default.removeItem(at: dbURL.appendingPathExtension("shm"))
 
-        // 3. Delete attachment paths cache
+        // 3. Delete attachment paths cache and downloaded media
         try? FileManager.default.removeItem(at: pathCacheURL)
+        let cachesRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("CuztomSignal", isDirectory: true)
+        if let cachesRoot { try? FileManager.default.removeItem(at: cachesRoot) }
 
         // 4. Delete UUID cache
         try? FileManager.default.removeItem(at: uuidCacheURL)
@@ -972,7 +985,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     @discardableResult
     public func applyRoster(_ payload: RosterPayload) -> [Conversation] {
         for m in payload.messages {
-            messageCache[m.key] = m
+            messageCache[wireKey(for: m)] = m
         }
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm:ss"
@@ -1020,25 +1033,59 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         return convs.sorted { $0.lastActiveAt > $1.lastActiveAt }
     }
 
-    public func chatMessage(_ m: RosterPayload.Message) -> ChatMessage {
-        let id: UUID
-        if let existing = uuidCache[m.key] {
-            id = existing
-        } else {
-            let fresh = UUID()
-            uuidCache[m.key] = fresh
-            saveUUIDCache()
-            id = fresh
+    private func wireKey(for message: RosterPayload.Message) -> String {
+        let timestamp = message.sts != 0 ? message.sts : message.ts
+        return "\(message.thread)/\(timestamp)/\(message.sender)"
+    }
+
+    private func uuidForMessage(_ message: RosterPayload.Message) -> UUID {
+        let key = wireKey(for: message)
+        if let existing = uuidCache[key] {
+            return existing
         }
+        // Migrate UUIDs written by releases that keyed messages by the
+        // server timestamp. The new key uses the stable client timestamp;
+        // without this alias the first post-upgrade refresh would allocate a
+        // second local ID for every historical message.
+        let legacyKeys = [
+            "\(message.thread)/\(message.ts)/\(message.sender)",
+            "\(message.thread)/\(message.ts)/self"
+        ]
+        if let legacyKey = legacyKeys.first(where: { uuidCache[$0] != nil }),
+           let existing = uuidCache[legacyKey] {
+            uuidCache[key] = existing
+            if message.key != key { uuidCache[message.key] = existing }
+            saveUUIDCache()
+            return existing
+        }
+        let fresh = UUID()
+        uuidCache[key] = fresh
+        if message.key != key { uuidCache[message.key] = fresh }
+        saveUUIDCache()
+        return fresh
+    }
+
+    public func chatMessage(_ m: RosterPayload.Message) -> ChatMessage {
+        let id = uuidForMessage(m)
         let threadComponents = ThreadID.parse(m.thread)
         let groupMasterKey = threadComponents.groupMasterKey
         var metas: [AttachmentMeta] = []
         for (index, a) in m.attachments.enumerated() {
             // Newest source wins: live/on-demand override, then persisted
-            // cache, then the wire path. Missing files fall back to manual.
-            // Cache keys are per-attachment (message key + index).
-            let cacheKey = "\(m.key)/\(index)"
-            let candidate = localPaths["\(m.thread)/\(m.ts)"] ?? pathCache[cacheKey] ?? a.path
+            // cache, then the wire path. Cache keys are per-attachment.
+            let cacheKey = "\(wireKey(for: m))/\(index)"
+            let legacyCacheKey = "\(m.key)/\(index)"
+            let stablePathKey = localPathKey(thread: m.thread, ts: m.sts, index: index)
+            let legacyTsPathKey = localPathKey(thread: m.thread, ts: m.ts, index: index)
+            let candidate = localPaths[stablePathKey]
+                ?? localPaths[legacyTsPathKey]
+                ?? pathCache[cacheKey]
+                ?? pathCache[legacyCacheKey]
+                ?? pathCache["\(m.thread)/\(m.ts)/\(index)"]
+                ?? pathCache["\(m.thread)/\(m.ts)/\(m.sender)/\(index)"]
+                ?? pathCache["\(m.thread)/\(m.ts)/self/\(index)"]
+                ?? pathCache["\(m.thread)/\(m.sts)/\(index)"]
+                ?? a.path
             let resolved: URL? = {
                 guard let candidate, FileManager.default.fileExists(atPath: candidate) else { return nil }
                 return URL(fileURLWithPath: candidate)
@@ -1060,7 +1107,14 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             author: SignalAddress(
                 uuidString: m.outgoing ? (selfAci ?? "self") : m.sender,
                 groupId: groupMasterKey,
-                threadId: m.thread
+                threadId: m.thread,
+                displayName: m.outgoing ? nil : (
+                    m.senderName.isEmpty
+                        || m.senderName == "Unknown"
+                        || m.senderName == String(m.sender.prefix(8))
+                        ? nil
+                        : m.senderName
+                )
             ),
             body: m.body.isEmpty ? (metas.isEmpty ? "" : "[attachment]") : m.body,
             direction: m.outgoing ? .outgoing : .incoming,
@@ -1105,15 +1159,21 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             switch event.type {
             case "message":
                 if let msg = event.message {
-                    messageCache[msg.key] = msg
+                    messageCache[wireKey(for: msg)] = msg
                     let cm = chatMessage(msg)
                     // Persist any attachment paths that came from the live download
                     // so they survive across restarts and render immediately.
                     for (idx, att) in msg.attachments.enumerated() {
                         if let path = att.path, !path.isEmpty {
-                            let cacheKey = "\(msg.key)/\(idx)"
+                            let cacheKey = "\(wireKey(for: msg))/\(idx)"
                             rememberPath(key: cacheKey, path: path)
-                            localPaths["\(msg.thread)/\(msg.ts)"] = path
+                            if msg.key != wireKey(for: msg) {
+                                rememberPath(key: "\(msg.key)/\(idx)", path: path)
+                            }
+                            localPaths[localPathKey(thread: msg.thread, ts: msg.sts, index: idx)] = path
+                            if msg.sts != msg.ts {
+                                localPaths[localPathKey(thread: msg.thread, ts: msg.ts, index: idx)] = path
+                            }
                         }
                     }
                     incomingContinuation.yield(cm)
