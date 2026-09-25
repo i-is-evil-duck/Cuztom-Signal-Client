@@ -60,14 +60,39 @@ derivation, SFU HTTP support, and opaque group signaling are implemented.
 
 ## Group-call blocker
 
-The group-call button remains disabled. The missing pieces are:
+The group-call button remains disabled. **Research update 2026-09-25:** the
+membership proof — previously assumed to require an unimplemented calling
+server — is in fact obtainable. Traced from the installed Signal Desktop
+8.28.0 bundle (`app.asar` → `bundles/preload/main.js`):
 
-1. Signal external group membership-proof retrieval and validation.
-2. RingRTC group ID and accepted-member ciphertext/key derivation.
-3. RingRTC HTTP delegate implementation for SFU requests/responses.
-4. Opaque group-call signaling transport.
-5. Separate group-call FFI commands and Swift lifecycle/UI.
+1. Fetch ZK group credentials:
+   `GET {chatService}/v1/certificate/auth/group?redemptionStartSeconds=<s>&redemptionEndSeconds=<s>&zkcCredential=true`
+2. Build the ZK presentation locally:
+   `AuthCredentialWithPniZkc::present(server_params, group_secret_params, randomness)`
+3. Redeem it for a call token at the CDN:
+   `GET {cdn}/v2/groups/token` with
+   `Authorization: Basic base64(hex(groupPublicParamsHex + ":" + presentationHex))`
+   and `Content-Type: application/x-protobuf`
+4. Response is `ExternalGroupCredential { string token = 1 }` (already present in
+   `protobuf/Groups.proto`)
+5. Hand the token to RingRTC via `set_membership_proof`
+
+All cryptographic primitives already exist in the vendored crates
+(`zkgroup::AuthCredentialWithPniZkc::present`, `GroupSecretParams::get_group_identifier`,
+`GroupSecretParams::encrypt_service_id`). The remaining work is wiring:
+
+1. An authenticated chat-service GET for `/v1/certificate/auth/group`, and a
+   way to read today's credential out of presage (its `groups_manager()` is
+   private, so this may need a presage patch or a self-fetch).
+2. A CDN GET with ZK basic auth for `/v2/groups/token`.
+3. RingRTC group-ID/member derivation, the HTTP delegate, and SFU response FFI.
+4. Opaque group-call signaling transport over `CallMessage.opaque`.
+5. Group-call FFI commands and Swift lifecycle/UI.
 6. Two linked/native-client interoperability testing.
+
+Also discovered: `getIceServers` maps to `v2/calling/relays`, Signal's
+authenticated TURN relay list. Fetching it would replace the public-STUN-only
+ICE configuration currently used for 1:1 calls.
 
 Do not route group-call data through the normal `DataMessage` chat path; doing
 so would reintroduce the empty-control-envelope and group-routing class of
