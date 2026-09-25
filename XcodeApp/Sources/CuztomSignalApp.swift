@@ -201,6 +201,18 @@ final class ChatViewModel {
         }
     }
 
+    /// Link previews are opt-in because fetching a message URL reveals the
+    /// recipient's IP address and can expose message content to a remote site.
+    var linkPreviewsEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "linkPreviewsEnabled") as? Bool ?? false }
+        set { UserDefaults.standard.set(newValue, forKey: "linkPreviewsEnabled") }
+    }
+
+    var showNotificationPreviews: Bool {
+        get { NotificationManager.shared.showMessagePreviews }
+        set { NotificationManager.shared.showMessagePreviews = newValue }
+    }
+
     func start() async {
         guard !starting else { return }
         starting = true
@@ -757,6 +769,9 @@ func sendTyping(started: Bool) async {
         // The controller has already cleared the Swift-side store.
         liveService = nil
         cachedSelfAci = nil
+        // Diagnostics are account-scoped; do not retain identifiers or paths
+        // after the authoritative wipe succeeds.
+        Log.clear()
         draftsByConversation.removeAll()
         repliesByConversation.removeAll()
         pendingFilesByConversation.removeAll()

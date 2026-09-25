@@ -218,7 +218,19 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     }
 
     public func bindLocalPath(thread: String, ts: Int64, index: Int = 0, path: String) {
-        localPaths[localPathKey(thread: thread, ts: ts, index: index)] = path
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL
+        guard FileManager.default.fileExists(atPath: standardized.path) else { return }
+        let localKey = localPathKey(thread: thread, ts: ts, index: index)
+        localPaths[localKey] = standardized.path
+        // `bindLocalPath` is the authoritative path returned by an on-demand
+        // download. Persist the same lookup aliases used by roster hydration;
+        // otherwise a relaunch loses the manual download and shows Download
+        // again even though the file still exists in the cache.
+        rememberPath(key: localKey, path: standardized.path)
+        rememberPath(key: "\(thread)/\(ts)/self/\(index)", path: standardized.path)
+        if let selfAci, !selfAci.isEmpty {
+            rememberPath(key: "\(thread)/\(ts)/\(selfAci)/\(index)", path: standardized.path)
+        }
     }
 
     /// Cache a sent attachment locally so it renders immediately and persists across restarts.

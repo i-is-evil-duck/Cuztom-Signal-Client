@@ -86,6 +86,30 @@ private let rosterFixture = """
     #expect(message.reactions == ["👍", "👍", "❤️"])
 }
 
+@Test func manualAttachmentPathPersistsAcrossServiceInstances() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cuztom-path-test-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("downloaded.jpg")
+    try Data([0x01, 0x02]).write(to: file)
+
+    let first = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
+    first.bindLocalPath(thread: "contact:x", ts: 42, index: 0, path: file.path)
+
+    let json = """
+    {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],"messages":[{
+      "key":"contact:x/42/x","thread":"contact:x","sender":"x","sender_name":"X",
+      "body":"file","ts":41,"sts":42,"outgoing":false,
+      "attachments":[{"name":"downloaded.jpg","mime":"image/jpeg","size":2,"path":null}]
+    }]}
+    """
+    let payload = try JSONDecoder().decode(RosterPayload.self, from: Data(json.utf8))
+    let second = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
+    let message = second.chatMessage(payload.messages[0])
+    #expect(message.attachments.first?.localURL?.path == file.path)
+}
+
 @Test func attachmentMetadataMaps() throws {
     // chatMessage only links paths that exist on disk (stale cache prune).
     let real = FileManager.default.temporaryDirectory.appendingPathComponent("cuztom-test-photo.jpg")

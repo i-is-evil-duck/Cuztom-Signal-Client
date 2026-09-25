@@ -11,6 +11,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, @un
 
     private let center = UNUserNotificationCenter.current()
     private let defaultsKey = "notificationsEnabled"
+    private let previewDefaultsKey = "showNotificationPreviews"
 
     private override init() {
         super.init()
@@ -26,6 +27,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, @un
         set {
             UserDefaults.standard.set(newValue, forKey: defaultsKey)
         }
+    }
+
+    /// Lock-screen/message-banner content is opt-in. Keep the default false so
+    /// a notification never becomes an accidental plaintext message archive.
+    var showMessagePreviews: Bool {
+        get { UserDefaults.standard.bool(forKey: previewDefaultsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: previewDefaultsKey) }
     }
 
     func configure() {
@@ -57,12 +65,17 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, @un
     ) {
         guard enabled else { return }
         let content = UNMutableNotificationContent()
-        let safeSender = senderName.isEmpty || senderName == "Unknown" ? "New message" : senderName
-        content.title = conversationTitle.isEmpty ? safeSender : conversationTitle
-        if conversationTitle.isEmpty || safeSender != conversationTitle {
-            content.subtitle = safeSender
+        if showMessagePreviews {
+            let safeSender = senderName.isEmpty || senderName == "Unknown" ? "New message" : senderName
+            content.title = conversationTitle.isEmpty ? safeSender : conversationTitle
+            if conversationTitle.isEmpty || safeSender != conversationTitle {
+                content.subtitle = safeSender
+            }
+            content.body = body.isEmpty ? "[Attachment]" : String(body.prefix(240))
+        } else {
+            content.title = "New message"
+            content.body = "Open Cuztom Signal to read it"
         }
-        content.body = body.isEmpty ? "[Attachment]" : body
         content.sound = .default
         content.threadIdentifier = threadID
         content.userInfo = ["thread": threadID]
@@ -84,8 +97,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, @un
     func notifyIncomingCall(callerName: String, conversationTitle: String, identifier: String) {
         guard enabled else { return }
         let content = UNMutableNotificationContent()
-        content.title = "Incoming \(conversationTitle.isEmpty ? "call" : conversationTitle)"
-        content.body = callerName.isEmpty ? "Incoming voice call" : "Incoming voice call from \(callerName)"
+        if showMessagePreviews {
+            content.title = "Incoming \(conversationTitle.isEmpty ? "call" : conversationTitle)"
+            content.body = callerName.isEmpty ? "Incoming voice call" : "Incoming voice call from \(callerName)"
+        } else {
+            content.title = "Incoming call"
+            content.body = "Open Cuztom Signal to view the call"
+        }
         content.sound = .default
         content.categoryIdentifier = "INCOMING_CALL"
         center.add(

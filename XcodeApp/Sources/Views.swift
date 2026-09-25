@@ -5,6 +5,7 @@ import CoreMedia
 import CoreImage.CIFilterBuiltins
 import CuztomSignalCore
 import UniformTypeIdentifiers
+import Darwin
 
 struct ContentView: View {
     @Environment(ChatViewModel.self) private var vm
@@ -516,7 +517,7 @@ struct MessageRow: View {
                         .contextMenu {
                             Button("Copy") { NSPasteboard.general.setString(msg.body, forType: .string) }
                         }
-                    LinkPreviewsView(text: msg.body)
+                    LinkPreviewsView(text: msg.body, enabled: vm.linkPreviewsEnabled)
                 }
                 ForEach(Array(msg.attachments.enumerated()), id: \.offset) { idx, att in
                     AttachmentRow(msg: msg, index: idx, att: att)
@@ -1103,45 +1104,186 @@ private func qrNSImage(_ string: String) -> NSImage? {
     return NSImage(cgImage: cg, size: NSSize(width: 240, height: 240))
 }
 
-/// Extract URLs from text and display link previews
+private enum LinkPreviewPolicy {
+    static let maxResponseBytes = 1_000_000
+
+    static func hasSafeSyntax(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https",
+              url.user == nil,
+              url.password == nil,
+              let host = url.host?.lowercased(),
+              !host.isEmpty,
+              url.port == nil || url.port == 443 else {
+            return false
+        }
+        return true
+    }
+
+    static func allows(_ url: URL) -> Bool {
+        guard hasSafeSyntax(url), let host = url.host?.lowercased() else { return false }
+        return isPublicHost(host)
+    }
+
+    static func isPublicHost(_ host: String) -> Bool {
+        let lower = host.lowercased()
+        guard !lower.hasPrefix("localhost"),
+              !lower.hasSuffix(".localhost"),
+              !lower.hasSuffix(".local"),
+              !lower.hasSuffix(".internal"),
+              !lower.hasSuffix(".lan"),
+              !lower.hasSuffix(".home.arpa") else {
+            return false
+        }
+
+        var hints = addrinfo(
+            ai_flags: AI_ADDRCONFIG,
+            ai_family: AF_UNSPEC,
+            ai_socktype: SOCK_STREAM,
+            ai_protocol: IPPROTO_TCP,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil
+        )
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let first = result else {
+            return false
+        }
+        defer { freeaddrinfo(first) }
+
+        var foundAddress = false
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        while let info = cursor {
+            foundAddress = true
+            if info.pointee.ai_family == AF_INET {
+                var address = sockaddr_in()
+                withUnsafePointer(to: info.pointee.ai_addr) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                        address = $0.pointee
+                    }
+                }
+                let value = UInt32(bigEndian: address.sin_addr.s_addr)
+                let firstByte = (value >> 24) & 0xff
+                let secondByte = (value >> 16) & 0xff
+                let isPrivate = firstByte == 10
+                    || firstByte == 127
+                    || (firstByte == 169 && secondByte == 254)
+                    || (firstByte == 172 && (16...31).contains(secondByte))
+                    || (firstByte == 192 && secondByte == 168)
+                    || (firstByte == 100 && (64...127).contains(secondByte))
+                    || (firstByte == 198 && (secondByte == 18 || secondByte == 19))
+                    || firstByte >= 224
+                    || firstByte == 0
+                if isPrivate { return false }
+            } else if info.pointee.ai_family == AF_INET6 {
+                var address = sockaddr_in6()
+                withUnsafePointer(to: info.pointee.ai_addr) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                        address = $0.pointee
+                    }
+                }
+                let bytes = withUnsafeBytes(of: address.sin6_addr) { Array($0) }
+                let firstByte = bytes[0]
+                let secondByte = bytes[1]
+                let isUnspecified = bytes.allSatisfy { $0 == 0 }
+                let isLoopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes[15] == 1
+                let isPrivate = isUnspecified
+                    || isLoopback
+                    || firstByte == 0xff
+                    || (firstByte == 0xfe && (secondByte & 0xc0) == 0x80)
+                    || firstByte == 0xfc
+                    || firstByte == 0xfd
+                if isPrivate { return false }
+            }
+            cursor = info.pointee.ai_next
+        }
+        return foundAddress
+    }
+}
+
+private final class LinkPreviewSessionDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let url = request.url, LinkPreviewPolicy.allows(url) else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+}
+
+/// Extract URLs from text and display opt-in, bounded link previews.
 struct LinkPreviewsView: View {
     let text: String
+    let enabled: Bool
     @State private var previews: [URL: LinkPreview] = [:]
 
     private var urls: [URL] {
         let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
         let matches = detector?.matches(in: text, range: NSRange(location: 0, length: text.utf16.count)) ?? []
         return matches.compactMap { $0.url }
+            .filter { LinkPreviewPolicy.hasSafeSyntax($0) }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(urls.prefix(3), id: \.self) { url in
-                LinkPreviewRow(url: url, preview: previews[url])
-                    .onAppear {
-                        if previews[url] == nil {
-                            Task { await fetchPreview(for: url) }
-                        }
+        Group {
+            if enabled {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(urls.prefix(3), id: \.self) { url in
+                        LinkPreviewRow(url: url, preview: previews[url])
+                            .onAppear {
+                                if previews[url] == nil {
+                                    Task { await fetchPreview(for: url) }
+                                }
+                            }
                     }
+                }
+                .frame(maxWidth: 520, alignment: .leading)
             }
         }
-        .frame(maxWidth: 520, alignment: .leading)
         .task(id: text) {
             previews = [:]
         }
     }
 
     private func fetchPreview(for url: URL) async {
+        guard enabled, LinkPreviewPolicy.allows(url) else { return }
+        let delegate = LinkPreviewSessionDelegate()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 8
+        configuration.timeoutIntervalForResource = 15
+        configuration.httpMaximumConnectionsPerHost = 1
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            if let html = String(data: data, encoding: .utf8),
-               let title = extractMeta(html, property: "og:title") ?? extractTag(html, tag: "title"),
-               let image = extractMeta(html, property: "og:image") {
-                let preview = LinkPreview(title: title, imageURL: URL(string: image), url: url)
-                await MainActor.run { previews[url] = preview }
+            let (data, response) = try await session.data(from: url)
+            guard !Task.isCancelled,
+                  let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  http.expectedContentLength <= Int64(LinkPreviewPolicy.maxResponseBytes),
+                  data.count <= LinkPreviewPolicy.maxResponseBytes,
+                  let mime = http.mimeType,
+                  mime.hasPrefix("text/html") || mime.hasPrefix("application/xhtml+xml"),
+                  let html = String(data: data, encoding: .utf8),
+                  let title = extractMeta(html, property: "og:title") ?? extractTag(html, tag: "title") else {
+                return
+            }
+            let preview = LinkPreview(title: String(title.prefix(240)), url: url)
+            await MainActor.run {
+                guard !Task.isCancelled else { return }
+                previews[url] = preview
             }
         } catch {
-            // Silently fail for link previews
+            // Preview failures are intentionally silent and never block the
+            // message list or reveal the URL to an unapproved destination.
         }
     }
 
@@ -1166,7 +1308,6 @@ struct LinkPreviewsView: View {
 
 struct LinkPreview {
     let title: String
-    let imageURL: URL?
     let url: URL
 }
 
@@ -1177,16 +1318,14 @@ struct LinkPreviewRow: View {
     var body: some View {
         Link(destination: url) {
             HStack(spacing: 8) {
-                if let preview = preview,
-                   let imageURL = preview.imageURL {
-                    AsyncImage(url: imageURL) { image in
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    } placeholder: {
-                        Color.gray.opacity(0.2)
-                    }
-                    .frame(width: 60, height: 60)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                }
+                // Do not fetch og:image here: it is a second, unvalidated
+                // network request. The title and destination are enough to
+                // identify the link without leaking the message recipient's
+                // IP address to an image host.
+                Image(systemName: "safari")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, height: 28)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(preview?.title ?? url.host ?? url.absoluteString)
                         .font(.caption)

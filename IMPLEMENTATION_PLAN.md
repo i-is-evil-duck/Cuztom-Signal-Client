@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 48/48 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 49/49 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 8/8 passed |
@@ -264,6 +264,17 @@ attachment.
 **Required fix:** Persist manual paths through the same account-scoped path
 cache used for live/sent attachments, with validation and eviction.
 
+**Status:** Implemented with file-existence validation and persisted lookup
+aliases; account-scoped eviction/quotas remain part of the broader cache work.
+
+#### P1 tranche completed 2026-09-24
+
+- [x] Default link previews to off; fetch only approved public HTTPS pages,
+  reject unsafe redirects, avoid remote image fetches, and cap response size.
+- [x] Redact notification content by default and clear bounded diagnostics on
+  successful logout.
+- [x] Persist manual attachment paths and hydrate them after service restart.
+
 ### P2 — reliability, UX, and maintainability
 
 - Receipt settings do not control actual network behavior.
@@ -443,10 +454,11 @@ without crashing the worker.
 - [ ] Add identity-change verification/safety-number UI.
 - [ ] Bundle and sign the native dylib; remove user-writable search paths.
 - [ ] Verify native code signature/hash and ABI version before `dlopen()`.
-- [ ] Add notification preview redaction.
-- [ ] Redact, rotate, and cap diagnostic logs.
-- [ ] Make link previews opt-in and restrict them to safe public HTTPS hosts.
-- [ ] Add private-network/redirect/response-size protections.
+- [x] Add notification preview redaction with an explicit opt-in setting.
+- [x] Redact identifiers/paths, cap diagnostic logs, and clear them after a
+      successful account wipe.
+- [x] Make link previews opt-in and restrict them to safe public HTTPS hosts.
+- [x] Add private-network/redirect/response-size protections for link previews.
 - [ ] Define secure deletion and retention behavior for databases, media,
       logs, and notification content.
 

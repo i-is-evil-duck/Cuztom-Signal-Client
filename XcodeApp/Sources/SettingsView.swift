@@ -31,7 +31,13 @@ struct SettingsView: View {
             }
             Section("Notifications") {
                 Toggle("Message and call notifications", isOn: $vm.notificationsEnabled)
-                Text("Notifications are delivered locally while Cuztom Signal is running.")
+                Toggle("Show message/caller details", isOn: $vm.showNotificationPreviews)
+                Text("Details are hidden by default so notification lock screens do not expose message text or caller names.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Privacy") {
+                Toggle("Allow link previews", isOn: $vm.linkPreviewsEnabled)
+                Text("Link previews are disabled by default. When enabled, only bounded public HTTPS pages are fetched; private and local network addresses are blocked.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Read Receipts") {
