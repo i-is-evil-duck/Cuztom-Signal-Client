@@ -98,6 +98,68 @@ Do not route group-call data through the normal `DataMessage` chat path; doing
 so would reintroduce the empty-control-envelope and group-routing class of
 bugs.
 
+## Feasibility verification 2026-09-25
+
+Checked against the pinned dependency checkouts before committing to an
+approach. Results:
+
+- **`signal-cli` is not an option.** Its man page has no calling support of any
+  kind (no `call`, `startCall`, `mute`, or `joinCall` command). It is also a
+  Java project requiring JRE 25, licensed GPL-3.0. Messaging and group
+  administration only.
+- **Signal Desktop cannot be wrapped.** Its calling stack is a Node N-API addon
+  (`@signalapp/ringrtc` → `libringrtc-arm64.node`) plus app-internal
+  TypeScript. That addon is a packaging of the same `signalapp/ringrtc` crate we
+  already compile in, plus a N-API host and JS runtime we would have to embed.
+- **The credentials are not currently reachable, but only one patch away.**
+  presage never handles group credentials (no reference to them anywhere), and
+  `groups_manager()` is private and creates a fresh `InMemoryCredentialsCache`
+  per call, so nothing is cached. However `AccountManager` and
+  `PushService::request` already provide a generic *authenticated* chat-service
+  request, and presage constructs that service itself
+  (`self.identified_push_service()`). So one small `pub async fn` added to
+  presage is sufficient to issue
+  `GET /v1/certificate/auth/group?...&zkcCredential=true`.
+  `reqwest::RequestBuilder` is returned, so no new dependency is needed.
+  `service_error_for_status` is `pub(crate)`, so the status check is done
+  locally.
+
+## Hybrid implementation plan
+
+The split follows where the constraints actually fall. ZK group cryptography
+and Signal account auth cannot be done in Swift, so they stay in Rust; the CDN
+hop and all lifecycle/UI work are better in Swift.
+
+| # | Increment | Where | Independently verifiable? |
+|---|---|---|---|
+| 1 | Group id + member identities + proof auth string | Rust | **Done** — `group_calls.rs`, 6 offline tests |
+| 2 | Authenticated credential fetch | presage patch → Rust FFI | Needs a vendored presage (decision below) |
+| 3 | CDN token fetch (`GET /v2/groups/token`) | Swift | Yes, with a mock `URLProtocol` |
+| 4 | RingRTC HTTP delegate + SFU response FFI | Rust | Yes, with an injected synthetic response |
+| 5 | Group-call lifecycle + opaque signaling transport | Rust | Yes, with a fake SFU client |
+| 6 | `GroupCallController` + UI | Swift | Yes, against the fake bridge |
+
+Increment 3 exists early on purpose: a wrong basic-auth header is invisible
+until a real call connects, so it is the piece most worth proving with tests
+before anything else is built on top of it.
+
+### Open decision: how to carry the presage patch
+
+Increment 2 requires modifying presage, which is currently a pinned git
+dependency. Options:
+
+- **Vendor presage** into the repository and point Cargo at the path via
+  `[patch]`. Explicit and reproducible, but adds a large crate to the tree and
+  means carrying presage updates by hand. The project already anticipates this
+  for the protocol-store work.
+- **Track a presage fork.** Cleaner diffs, but needs a remote the project
+  controls.
+- **Skip increment 2** and ship the rest as a diagnostic-only path that reports
+  the missing credential honestly. No group calls, but no blocked work either.
+
+Increments 1, 3, 4, and 5 do not depend on this decision, so they can proceed
+while it is made.
+
 ## Known 1:1 limitations and follow-ups
 
 - ICE currently uses public STUN servers. Signal's authenticated TURN relay
