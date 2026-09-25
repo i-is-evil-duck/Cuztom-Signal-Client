@@ -1680,6 +1680,70 @@ pub fn receive_group_call_signal(event: &serde_json::Value) -> bool {
     true
 }
 
+/// Redeem a group membership proof for a call token at the configured CDN.
+///
+/// Returns the token bytes, or a message describing why it could not be
+/// redeemed. The response body is decoded here so a malformed credential is
+/// reported as such rather than being handed on as an empty token.
+///
+/// The `Authorization` header carries the membership proof, so neither the
+/// authorization nor the token is ever logged.
+pub async fn redeem_group_call_proof(
+    manager: &StoredManager,
+    authorization: &str,
+) -> Result<Vec<u8>, String> {
+    // The basic-auth value is the authorization string exactly. Signal's CDN
+    // expects `Authorization: Basic base64(<that>)`.
+    let basic = base64::engine::general_purpose::STANDARD.encode(authorization.as_bytes());
+    let header = format!("Basic {basic}");
+    // A request that never answers would leave the join hanging with nothing to
+    // show for it, so the whole set of hosts is bounded.
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        manager.cdn_group_token(&header),
+    )
+    .await
+    .map_err(|_| "the call service did not answer".to_string())?
+    .map_err(|e| format!("the call service could not be reached: {e}"))?;
+    if !(200..300).contains(&status) {
+        // The body can echo the request material, so it is not surfaced.
+        return Err(format!("the call service returned HTTP {status}"));
+    }
+    let token = decode_group_credential_token(body.as_bytes())
+        .ok_or("the call service did not return a group call credential".to_string())?;
+    if token.is_empty() {
+        return Err("the call service returned an empty group call credential".to_string());
+    }
+    eprintln!("[core] group call token redeemed: {} bytes", token.len());
+    Ok(token)
+}
+
+/// `ExternalGroupCredential { string token = 1 }`.
+///
+/// Hand-decoded to match the strictness of the rest of this file: an unexpected
+/// wire type or a truncated field is a refusal, not a partial read. A token that
+/// is wrong would be rejected by the SFU with a diagnostic that points nowhere
+/// near the cause.
+fn decode_group_credential_token(body: &[u8]) -> Option<Vec<u8>> {
+    use prost::Message as _;
+    // Reuse the SignalService-defined message rather than a hand-rolled reader.
+    // It is the same wire shape, and using the generated type means a field added
+    // upstream is a compile error rather than a silently dropped byte.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ExternalGroupCredential {
+        #[prost(string, tag = "1")]
+        token: ::prost::alloc::string::String,
+    }
+    let decoded = ExternalGroupCredential::decode(body).ok()?;
+    // Absent and present-but-empty are the same thing here: a credential with no
+    // token is not a credential, and reporting success with an empty value would
+    // push that distinction onto every caller.
+    if decoded.token.is_empty() {
+        return None;
+    }
+    Some(decoded.token.into_bytes())
+}
+
 /// Send a group call signal to every member of the group.
 async fn send_group_call_signal(
     manager: &mut StoredManager,
@@ -1715,4 +1779,33 @@ async fn send_group_call_signal(
         )
         .await
         .map_err(|e| format!("group call send: {e}"))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+#[test]
+fn a_group_credential_token_decodes_only_from_a_well_formed_body() {
+    use prost::Message as _;
+    // The CDN's `ExternalGroupCredential { string token = 1 }`. A token that
+    // is misread here is rejected by the SFU with a diagnostic that points
+    // nowhere near the cause, so anything unexpected is refused.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ExternalGroupCredential {
+        #[prost(string, tag = "1")]
+        token: String,
+    }
+    let body = ExternalGroupCredential { token: "secret-token".to_string() }
+        .encode_to_vec();
+    assert_eq!(
+        decode_group_credential_token(&body),
+        Some(b"secret-token".to_vec())
+    );
+    // An empty body carries no token field.
+    assert_eq!(decode_group_credential_token(&[]), None);
+    // Garbage is not partially read into a token.
+    assert_eq!(decode_group_credential_token(&[0xff, 0xff, 0xff]), None);
+}
 }

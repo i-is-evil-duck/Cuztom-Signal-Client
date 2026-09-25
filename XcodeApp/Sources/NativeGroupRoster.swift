@@ -92,20 +92,22 @@ public final class NativeGroupRoster: GroupRosterProviding, @unchecked Sendable 
     }
 }
 
-/// Redeems a group membership proof at the CDN, using the hosts the native
-/// service configuration declares.
+/// Redeems a group membership proof at the CDN, natively.
 ///
-/// The host is deliberately not hardcoded here. Signal's service configuration
-/// lists the CDN hosts that exist for the current environment, and they differ
-/// between staging and production; a client that picks one is wrong half the
-/// time and finds out as an unreachable endpoint.
+/// The request is made by the native core rather than by `URLSession` because
+/// Signal's CDN serves a certificate from Signal's own authority, not the system
+/// roots. A host HTTP client rejects that; the native client, already built with
+/// the service configuration's certificate authority, accepts it. The chat
+/// service is reachable from both, which is what makes this a trust-path
+/// problem rather than a guess.
+///
+/// The CDN hosts also come from the service configuration, so a staging build
+/// does not talk to production.
 public struct NativeGroupCallRedeemer: GroupCallController.ProofRedeeming {
     private let service: RustCoreService
-    private let fallback: GroupCallProofService
 
-    public init(service: RustCoreService, fallback: GroupCallProofService = GroupCallProofService()) {
+    public init(service: RustCoreService) {
         self.service = service
-        self.fallback = fallback
     }
 
     public func cdnBaseURLs() async throws -> [URL] {
@@ -125,10 +127,9 @@ public struct NativeGroupCallRedeemer: GroupCallController.ProofRedeeming {
         authorization: String,
         groupIdHex: String
     ) async throws -> GroupCallProofService.Proof {
-        try await fallback.fetchToken(
-            cdnBaseURL: cdnBaseURL,
-            authorization: authorization,
-            groupIdHex: groupIdHex
-        )
+        // The host is resolved natively so the request uses the right trust
+        // path. `cdnBaseURL` is only used to describe which host answered.
+        Log.info("[group-call] redeeming proof at \(cdnBaseURL.host ?? "?")")
+        return try await service.groupCallRedeemProof(authorization: authorization)
     }
 }

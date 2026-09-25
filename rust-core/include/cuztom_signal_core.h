@@ -54,6 +54,18 @@ int32_t core_cmd_send_typing(const char *thread, int32_t started);
 
 char *core_cmd_group_get_info(const char *master_key_hex);
 
+/* Redeem a group membership proof for a call token at the configured CDN.
+ * `authorization` is the hex(groupPublicParams):hex(presentation) value from
+ * core_cmd_group_call_proof_authorization. Returns malloc'd JSON
+ * {"tokenB64":"..."} or NULL.
+ *
+ * Performed natively because the CDN's certificate comes from Signal's own
+ * authority rather than the system roots: a host HTTP client rejects it while
+ * this one, already built with the service configuration's certificate
+ * authority, accepts it. The proof travels in the Authorization header and is
+ * never logged. */
+char *core_cmd_group_call_redeem_proof(const char *authorization);
+
 /* The CDN base URLs this account's service configuration declares, as
  * [{"id":0,"url":"https://..."}, ...]. Returns malloc'd JSON, or NULL.
  *

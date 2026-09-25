@@ -152,6 +152,14 @@ enum Command {
     CdnUrls {
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Redeem a group membership proof for a call token at the configured CDN.
+    ///
+    /// Native because the CDN's certificate comes from Signal's own authority
+    /// rather than the system roots, so a host HTTP client rejects it.
+    GroupCallRedeemProof {
+        authorization: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     /// Every ZK group id this device belongs to, mapped to its master key.
     GroupIdMap {
         reply: oneshot::Sender<Result<String, String>>,
@@ -430,6 +438,11 @@ enum LoopCtrl {
     },
     /// The CDN base URLs the service configuration declares.
     CdnUrls {
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Redeem a group membership proof for a call token at the configured CDN.
+    GroupCallRedeemProof {
+        authorization: String,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Every ZK group id this device belongs to, mapped to its master key.
@@ -831,6 +844,10 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::CdnUrls { reply } => {
                             let result = cmd_cdn_urls(&state).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallRedeemProof { authorization, reply } => {
+                            let result = cmd_group_call_redeem_proof(&state, &authorization).await;
                             let _ = reply.send(result);
                         }
                         Command::GroupIdMap { reply } => {
@@ -1381,6 +1398,25 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(LoopCtrl::GroupRoster { master_key_hex, reply }) => {
                                     let r = groups::group_roster(&mut manager, &master_key_hex).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::GroupCallRedeemProof { authorization, reply }) => {
+                                    let r = match call::redeem_group_call_proof(&manager, &authorization)
+                                        .await
+                                    {
+                                        Ok(token) => {
+                                            // Base64 so the token survives a C
+                                            // string boundary intact; it is
+                                            // arbitrary bytes, not text.
+                                            serde_json::to_string(&serde_json::json!({
+                                                "tokenB64":
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .encode(&token),
+                                            }))
+                                            .map_err(|e| format!("token json: {e}"))
+                                        }
+                                        Err(e) => Err(e),
+                                    };
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::CdnUrls { reply }) => {
@@ -2071,6 +2107,36 @@ async fn cmd_get_group_info(
         }
         _ => Err("not linked".to_string()),
     }
+}
+
+/// Redeem a group membership proof at the configured CDN.
+///
+/// Routed through the loop because the CDN hosts and the service's certificate
+/// authority both live on the live manager.
+async fn cmd_group_call_redeem_proof(
+    state: &WorkerState,
+    authorization: &str,
+) -> Result<String, String> {
+    if authorization.is_empty() {
+        return Err("a membership proof authorization is required".to_string());
+    }
+    let sender = match state {
+        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
+            Some(sender) => sender,
+            None => return Err("sync loop is not running".to_string()),
+        },
+        _ => return Err("not linked".to_string()),
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    send_sync_ctrl_wait(
+        sender,
+        LoopCtrl::GroupCallRedeemProof {
+            authorization: authorization.to_string(),
+            reply: reply_tx,
+        },
+    )
+    .await?;
+    reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
 }
 
 /// The CDN base URLs from the service configuration.
@@ -3231,6 +3297,29 @@ pub extern "C" fn core_cmd_group_get_info(
         Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
     };
     match roundtrip(|reply| Command::GetGroupInfo { master_key_hex: mk, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Redeem a group membership proof for a call token at the configured CDN.
+///
+/// `authorization` is the `hex(groupPublicParams):hex(presentation)` value from
+/// `core_cmd_group_call_proof_authorization`. Returns a JSON
+/// `{"status":200,"body":"<base64>"}`, or NULL on a transport failure.
+///
+/// Performed natively because the CDN's certificate comes from Signal's own
+/// authority rather than the system roots: a host HTTP client rejects it while
+/// this one, already built with the service configuration's certificate
+/// authority, accepts it. The proof travels in the `Authorization` header and is
+/// never logged.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_redeem_proof(authorization: *const c_char) -> *mut c_char {
+    let authorization = match c_str_arg(authorization, "authorization") {
+        Ok(value) => value,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+    match roundtrip(|reply| Command::GroupCallRedeemProof { authorization, reply }) {
         Ok(Ok(json)) => ok_string(json),
         Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
     }

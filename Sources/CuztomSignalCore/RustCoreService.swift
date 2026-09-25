@@ -993,6 +993,48 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         public let memberAciUUIDs: [String]
     }
 
+    /// Redeem a group membership proof for a call token at the configured CDN.
+    ///
+    /// Performed natively because Signal's CDN serves a certificate from
+    /// Signal's own authority rather than the system roots: `URLSession` rejects
+    /// it, while the native client is already built with the service
+    /// configuration's certificate authority. Each configured host is tried in
+    /// order; a transport failure moves to the next, and any HTTP status is
+    /// returned because that is a real answer.
+    ///
+    /// The proof travels in the `Authorization` header and is never logged, here
+    /// or natively.
+    public func groupCallRedeemProof(authorization: String) async throws -> GroupCallProofService.Proof {
+        guard !authorization.isEmpty, authorization.contains(":") else {
+            throw SignalError.crypto("a membership proof authorization is required")
+        }
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let result = authorization.withCString { value in
+                sym.groupCallRedeemProof(value)
+            }
+            guard let pointer = result else {
+                throw SignalError.network(
+                    "membership proof redemption failed: \(Self.lastError(sym))"
+                )
+            }
+            defer { sym.freeString(pointer) }
+            let json = String(cString: pointer)
+            guard let data = json.data(using: .utf8) else {
+                throw SignalError.storage("redemption response was not UTF-8")
+            }
+            struct Payload: Decodable {
+                let tokenB64: String
+            }
+            guard let payload = try? JSONDecoder().decode(Payload.self, from: data),
+                  let token = Data(base64Encoded: payload.tokenB64),
+                  !token.isEmpty else {
+                throw SignalError.network("the call service did not return a group call credential")
+            }
+            return GroupCallProofService.Proof(groupIdHex: "", token: [UInt8](token))
+        }
+    }
+
     /// The CDN base URLs the service configuration declares.
     ///
     /// A group membership proof is redeemed at a CDN, and the host belongs to
@@ -2018,6 +2060,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let groupAuthCredentials: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let groupRoster: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let cdnUrls: @convention(c) () -> UnsafeMutablePointer<CChar>?
+        let groupCallRedeemProof: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let groupIdMap: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let groupCallProofAuthorization: @convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?
         let groupCallGroupId: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -2678,6 +2721,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cgac = dlsym(handle, "core_cmd_group_auth_credentials"),
               let cgr = dlsym(handle, "core_cmd_group_roster"),
               let ccdn = dlsym(handle, "core_cmd_cdn_urls"),
+              let cgrp = dlsym(handle, "core_cmd_group_call_redeem_proof"),
               let cgim = dlsym(handle, "core_cmd_group_id_map"),
               let cgcpa = dlsym(handle, "core_cmd_group_call_proof_authorization"),
               let cgcid = dlsym(handle, "core_cmd_group_call_group_id"),
@@ -2734,6 +2778,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             groupAuthCredentials: unsafeBitCast(cgac, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             groupRoster: unsafeBitCast(cgr, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             cdnUrls: unsafeBitCast(ccdn, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
+            groupCallRedeemProof: unsafeBitCast(cgrp, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             groupIdMap: unsafeBitCast(cgim, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             groupCallProofAuthorization: unsafeBitCast(cgcpa, to: (@convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?).self),
             groupCallGroupId: unsafeBitCast(cgcid, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
