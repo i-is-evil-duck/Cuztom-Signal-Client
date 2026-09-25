@@ -48,7 +48,7 @@ pub enum GroupCallError {
     /// The server sent no credential valid on the requested day. Not
     /// substituted with a nearby one: that presents a credential the SFU will
     /// reject, and the rejection reads like a transport fault.
-    NoCredentialForDay(u64),
+    NoCredentialForDay { day: u64, available: Vec<u64> },
     /// The response carried no PNI to bind the credential to.
     CredentialMissingPni,
     /// The credential did not verify against the server's public params, so it
@@ -75,8 +75,18 @@ impl std::fmt::Display for GroupCallError {
             GroupCallError::EmptyGroupPublicParams => {
                 write!(f, "group public params serialized to an empty buffer")
             }
-            GroupCallError::NoCredentialForDay(day) => {
-                write!(f, "no group auth credential for redemption day {day}")
+            GroupCallError::NoCredentialForDay { day, available } => {
+                if available.is_empty() {
+                    write!(
+                        f,
+                        "no group auth credential was issued to this account for redemption day {day}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "no group auth credential for redemption day {day}; the service returned days {available:?}"
+                    )
+                }
             }
             GroupCallError::CredentialMissingPni => {
                 write!(f, "group credential response carried no PNI")
@@ -123,6 +133,24 @@ pub fn redemption_day_start_seconds(day: u64) -> u64 {
 pub fn credential_window_seconds(day: u64) -> (u64, u64) {
     let start = redemption_day_start_seconds(day);
     let end = redemption_day_start_seconds(day.saturating_add(1));
+    (start, end)
+}
+
+/// How many days either side of today to ask for.
+///
+/// A credential is issued per day and only becomes usable once its day arrives,
+/// so the service commonly holds a small range around now rather than exactly
+/// today. Asking for today alone can therefore come back empty on a day the
+/// credential does exist, which looks identical to never having been issued one.
+/// The surrounding days are only ever used to describe what is available: a
+/// credential is still only ever presented for its own day.
+pub const CREDENTIAL_DAYS_BEFORE: u64 = 1;
+pub const CREDENTIAL_DAYS_AFTER: u64 = 2;
+
+/// The window to request for `day`, widened either side.
+pub fn credential_request_window_seconds(day: u64) -> (u64, u64) {
+    let start = redemption_day_start_seconds(day.saturating_sub(CREDENTIAL_DAYS_BEFORE));
+    let end = redemption_day_start_seconds(day.saturating_add(CREDENTIAL_DAYS_AFTER));
     (start, end)
 }
 
@@ -361,7 +389,10 @@ pub fn build_proof_authorization(
         .map_err(|_| GroupCallError::Serialization("group credential response"))?;
     let entry = response
         .credential_for_day(day)
-        .ok_or(GroupCallError::NoCredentialForDay(day))?;
+        .ok_or_else(|| GroupCallError::NoCredentialForDay {
+            day,
+            available: response.days(),
+        })?;
     let pni_text = response
         .pni
         .as_deref()
@@ -901,6 +932,25 @@ mod tests {
     }
 
     #[test]
+    fn the_request_window_brackets_today() {
+        // Asking for today alone can come back empty on a day a credential does
+        // exist, which looks identical to never having been issued one.
+        let (start, end) = credential_request_window_seconds(19_675);
+        assert_eq!(start, (19_675 - CREDENTIAL_DAYS_BEFORE) * 86_400);
+        assert_eq!(end, (19_675 + CREDENTIAL_DAYS_AFTER) * 86_400);
+        // Today is strictly inside the requested window.
+        assert!(start < 19_675 * 86_400);
+        assert!(end > 19_676 * 86_400);
+    }
+
+    #[test]
+    fn the_request_window_does_not_invert_at_the_epoch() {
+        // Saturating subtraction keeps the window ordered at day zero.
+        let (start, end) = credential_request_window_seconds(0);
+        assert!(start <= end);
+    }
+
+    #[test]
     fn a_credential_for_another_day_is_not_borrowed() {
         let day = REDEMPTION_DAY;
         let (server_public, json) = issued_credential(ACI, PNI, day);
@@ -911,7 +961,10 @@ mod tests {
             ServiceId::Aci(aci(ACI)),
             day + 1,
         );
-        assert!(matches!(result, Err(GroupCallError::NoCredentialForDay(_))));
+        assert!(matches!(
+            result,
+            Err(GroupCallError::NoCredentialForDay { day: d, .. }) if d == day + 1
+        ));
     }
 
     #[test]

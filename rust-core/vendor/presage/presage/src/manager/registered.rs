@@ -446,7 +446,47 @@ impl<S: Store> Manager<S, Registered> {
         let body = response
             .text()
             .await
-            .map_err(|e| Error::IoError(std::io::Error::other(e)))?;
+            .map_err(|e| {
+                eprintln!("[core] group credential response body failed: {e}");
+                Error::IoError(std::io::Error::other(e))
+            })?;
+        // The *shape* is logged, never the content. Whether the service returned
+        // a credential at all, and for which days, is the difference between
+        // "this account has no ZK auth credential" and "we are reading the
+        // response wrong", and those two look identical from outside. The
+        // credential itself is secret and is not logged.
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) => {
+                let keys: Vec<String> = value
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect())
+                    .unwrap_or_default();
+                let count = value
+                    .get("credentials")
+                    .and_then(|c| c.as_array())
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                let days: Vec<i64> = value
+                    .get("credentials")
+                    .and_then(|c| c.as_array())
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|e| e.get("redemptionTime").and_then(|v| v.as_i64()))
+                            .map(|ms| ms / 86_400_000)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                eprintln!(
+                    "[core] group credential response: {} bytes, keys={keys:?}, credentials={count}, days={days:?}",
+                    body.len()
+                );
+            }
+            Err(e) => eprintln!(
+                "[core] group credential response was not JSON ({e}): {} bytes",
+                body.len()
+            ),
+        }
         Ok((body, server_public_params))
     }
 

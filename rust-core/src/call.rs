@@ -809,8 +809,10 @@ pub async fn prepare_group_call_proof(
         .map_err(|e| e.to_string())?
         .as_secs();
     let day = crate::group_calls::current_redemption_day(now);
-    let (start_secs, end_secs) = crate::group_calls::credential_window_seconds(day);
-    eprintln!("[core] group call proof: requesting ZK auth credentials");
+    let (start_secs, end_secs) = crate::group_calls::credential_request_window_seconds(day);
+    eprintln!(
+        "[core] group call proof: requesting ZK auth credentials for day {day} (window {start_secs}..{end_secs})"
+    );
     // A request that never answers would otherwise stall the whole join with no
     // diagnostic at all, which is indistinguishable from a network problem. The
     // credential is short-lived, so waiting longer than this cannot help.
