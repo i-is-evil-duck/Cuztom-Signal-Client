@@ -144,7 +144,16 @@ struct MessageListView: View {
                         Text("To: \(title)")
                             .font(.caption).foregroundStyle(.secondary)
                         Spacer()
-                        if !isGroup {
+                        if isGroup {
+                            // Group calls only. A 1:1 group call would need a
+                            // call id, and RingRTC has none for a group message.
+                            Button { Task { await vm.startGroupCall() } } label: {
+                                Image(systemName: "person.3.fill")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Group call")
+                            .disabled(vm.groupCall != nil)
+                        } else {
                             // Voice call button
                             Button { Task { await vm.startVoiceCall() } } label: {
                                 Image(systemName: "phone.fill")
@@ -165,6 +174,16 @@ struct MessageListView: View {
                     }
                     .padding(.horizontal, 12).padding(.vertical, 4)
                     .background(Color.gray.opacity(0.08))
+
+                    // A group call in progress, with the reason it is not
+                    // working when there is one. Shown here rather than as a
+                    // separate window so a call that failed says so next to the
+                    // conversation instead of disappearing.
+                    if let call = vm.groupCall {
+                        GroupCallBanner(call: call) {
+                            Task { await vm.endGroupCall() }
+                        }
+                    }
                 }
                 // Typing indicator
                 if let id = vm.selectedId,
@@ -1418,3 +1437,61 @@ struct LinkPreviewRow: View {
         .accessibilityIdentifier("link-preview")
     }
     }
+
+/// The group call in progress, and the reason it is not working when there is
+/// one.
+///
+/// The phase is spelled out rather than implied by a spinner. A call that cannot
+/// get a membership proof cannot connect, and that is not something to hide
+/// behind a spinner that never resolves: showing "connecting" forever would be a
+/// claim this build has not verified.
+struct GroupCallBanner: View {
+    let call: GroupCallState
+    let onEnd: () -> Void
+
+    private var statusText: String {
+        switch call.phase {
+        case .connecting:
+            return call.isOutgoing ? "Connecting to the call…" : "Joining the call…"
+        case .connected:
+            return "Connected"
+        case .ended:
+            return call.failure.map { "Call ended: \($0)" } ?? "Call ended"
+        case .failed:
+            return call.failure ?? "The call could not be connected"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if call.phase == .connecting {
+                ProgressView().controlSize(.small)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(call.title.isEmpty ? "Group call" : call.title)
+                    .font(.callout.weight(.medium))
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(call.phase == .failed ? Color.red : Color.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            if call.phase == .connected || call.phase == .failed {
+                Button("End", action: onEnd)
+                    .buttonStyle(.plain)
+            } else if call.phase == .ended {
+                // An ended call stays on screen with its reason, so a call that
+                // failed is not the same as a call the user never made.
+                Button("Dismiss", action: onEnd)
+                    .buttonStyle(.plain)
+            } else {
+                Button("End", action: onEnd)
+                    .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.gray.opacity(0.12))
+        .accessibilityIdentifier("group-call-banner")
+    }
+}

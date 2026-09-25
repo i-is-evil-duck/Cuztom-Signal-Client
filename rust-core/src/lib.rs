@@ -143,6 +143,15 @@ enum Command {
         master_key_hex: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// A group's title and member ACIs, which a group call's roster needs.
+    GroupRoster {
+        master_key_hex: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Every ZK group id this device belongs to, mapped to its master key.
+    GroupIdMap {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     UpdateGroupTitle {
         master_key_hex: String,
         title: String,
@@ -408,6 +417,15 @@ enum LoopCtrl {
     // M2: Group management
     GetGroupInfo {
         master_key_hex: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// A group's title and member ACIs, which a group call's roster needs.
+    GroupRoster {
+        master_key_hex: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Every ZK group id this device belongs to, mapped to its master key.
+    GroupIdMap {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     UpdateGroupTitle {
@@ -797,6 +815,14 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         // M2: Group management
                         Command::GetGroupInfo { master_key_hex, reply } => {
                             let result = cmd_get_group_info(&mut state, &master_key_hex).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupRoster { master_key_hex, reply } => {
+                            let result = cmd_group_roster(&state, &master_key_hex).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupIdMap { reply } => {
+                            let result = cmd_group_id_map(&state).await;
                             let _ = reply.send(result);
                         }
                         Command::UpdateGroupTitle { master_key_hex, title, reply } => {
@@ -1339,6 +1365,14 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 // M2: Group management
                                 Some(LoopCtrl::GetGroupInfo { master_key_hex, reply }) => {
                                     let r = groups::get_group_info(&mut manager, &master_key_hex).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::GroupRoster { master_key_hex, reply }) => {
+                                    let r = groups::group_roster(&mut manager, &master_key_hex).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::GroupIdMap { reply }) => {
+                                    let r = groups::group_id_map(&mut manager).await;
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::UpdateGroupTitle { master_key_hex, title, reply }) => {
@@ -2013,6 +2047,46 @@ async fn cmd_get_group_info(
         }
         _ => Err("not linked".to_string()),
     }
+}
+
+/// A group's title and member ACIs, for the group call roster.
+///
+/// Routed through the sync loop because that is where the live manager lives:
+/// once the loop is running, `LinkedState.manager` is `None`.
+async fn cmd_group_roster(state: &WorkerState, master_key_hex: &str) -> Result<String, String> {
+    let sender = match state {
+        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
+            Some(sender) => sender,
+            None => return Err("sync loop is not running".to_string()),
+        },
+        _ => return Err("not linked".to_string()),
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    send_sync_ctrl_wait(
+        sender,
+        LoopCtrl::GroupRoster {
+            master_key_hex: master_key_hex.to_string(),
+            reply: reply_tx,
+        },
+    )
+    .await?;
+    reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
+}
+
+/// Map each ZK group id this device belongs to back to its master key.
+///
+/// Also routed through the loop, for the same reason as the roster.
+async fn cmd_group_id_map(state: &WorkerState) -> Result<String, String> {
+    let sender = match state {
+        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
+            Some(sender) => sender,
+            None => return Err("sync loop is not running".to_string()),
+        },
+        _ => return Err("not linked".to_string()),
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    send_sync_ctrl_wait(sender, LoopCtrl::GroupIdMap { reply: reply_tx }).await?;
+    reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
 }
 
 /// Update group title
@@ -3116,6 +3190,34 @@ pub extern "C" fn core_cmd_group_get_info(
         Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
     };
     match roundtrip(|reply| Command::GetGroupInfo { master_key_hex: mk, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// A group's title and member ACIs, which a group call's roster needs.
+/// Returns malloc'd JSON, or NULL.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_roster(master_key_hex: *const c_char) -> *mut c_char {
+    let mk = match c_str_arg(master_key_hex, "master_key_hex") {
+        Ok(m) => m,
+        Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+    };
+    match roundtrip(|reply| Command::GroupRoster { master_key_hex: mk, reply }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
+    }
+}
+
+/// Map each ZK group id this device belongs to back to its master key.
+/// Returns malloc'd JSON, or NULL.
+///
+/// A group call names a group by identifier, and a call for a group this device
+/// is not in is not receivable, so this is what tells the host which inbound
+/// calls it can answer.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_id_map() -> *mut c_char {
+    match roundtrip(|reply| Command::GroupIdMap { reply }) {
         Ok(Ok(json)) => ok_string(json),
         Ok(Err(e)) | Err(e) => { set_last_error(e); std::ptr::null_mut() }
     }

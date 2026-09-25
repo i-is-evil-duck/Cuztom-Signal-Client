@@ -164,8 +164,8 @@ friction (see Milestone 7).
 
 | Area | Status |
 |---|---|
-| Swift core tests | **117 passed** with full Xcode |
-| Rust library tests | **34 passed** |
+| Swift core tests | **144 passed** with full Xcode |
+| Rust library tests | **52 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |
 | Ad-hoc signed bundle | Built and launched; embedded dylib passes in-bundle/signature/hash/ABI checks |

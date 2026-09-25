@@ -16,7 +16,16 @@ bundle=${1:-"$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/build/CuztomSignal.
 dylib="$bundle/Contents/MacOS/libcuztom_signal_core.dylib"
 exe="$bundle/Contents/MacOS/CuztomSignal"
 framework="$bundle/Contents/Frameworks/SQLCipher.framework"
-expected_abi=2
+# Read the expected ABI from the header rather than hardcoding it. A stale
+# literal here silently passes or fails for the wrong reason every time the ABI
+# moves, and the check is only worth having if it tracks the real contract.
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+header="$repo_root/rust-core/include/cuztom_signal_core.h"
+expected_abi=$(sed -n 's/^#define CUZTOM_SIGNAL_CORE_ABI_VERSION \([0-9]*\)u$/\1/p' "$header")
+[ -n "$expected_abi" ] || {
+    echo "could not read CUZTOM_SIGNAL_CORE_ABI_VERSION from $header" >&2
+    exit 1
+}
 fail=0
 
 note() { printf '    %s\n' "$1"; }

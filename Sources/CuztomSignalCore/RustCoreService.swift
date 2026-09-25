@@ -987,6 +987,72 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
     }
 
+    /// A group's title and the ACIs of its members.
+    public struct GroupRoster: Sendable, Equatable, Decodable {
+        public let title: String
+        public let memberAciUUIDs: [String]
+    }
+
+    /// Read a group's title and membership.
+    ///
+    /// A group call needs the member ACIs because the SFU maps the opaque
+    /// participant ids in call traffic back to people through this group's
+    /// encrypted-UID ciphertexts. Throws when this device is not a member: an
+    /// empty roster reads as "you are alone in this group", which is a different
+    /// statement and the wrong one.
+    public func groupRoster(masterKeyHex: String) async throws -> GroupRoster {
+        let key = masterKeyHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let result = key.withCString { masterKey in sym.groupRoster(masterKey) }
+            guard let pointer = result else {
+                throw SignalError.network("group roster failed: \(Self.lastError(sym))")
+            }
+            defer { sym.freeString(pointer) }
+            let json = String(cString: pointer)
+            guard let data = json.data(using: .utf8) else {
+                throw SignalError.storage("group roster was not UTF-8")
+            }
+            do {
+                return try JSONDecoder().decode(GroupRoster.self, from: data)
+            } catch {
+                throw SignalError.storage("group roster was malformed")
+            }
+        }
+    }
+
+    /// Map each ZK group id this device belongs to back to its master key.
+    ///
+    /// An inbound group call names a group by identifier, and a call for a group
+    /// this device is not in is not receivable, so this is what the host uses to
+    /// decide which inbound calls it can answer.
+    public func groupIdMap() async throws -> [String: String] {
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            guard let pointer = sym.groupIdMap() else {
+                throw SignalError.network("group id map failed: \(Self.lastError(sym))")
+            }
+            defer { sym.freeString(pointer) }
+            let json = String(cString: pointer)
+            guard let data = json.data(using: .utf8),
+                  let entries = try? JSONDecoder().decode(
+                    [GroupIdMapEntry].self,
+                    from: data
+                  ) else {
+                throw SignalError.storage("group id map was malformed")
+            }
+            return Dictionary(
+                entries.map { ($0.groupIdHex, $0.masterKeyHex) },
+                uniquingKeysWith: { first, _ in first }
+            )
+        }
+    }
+
+    private struct GroupIdMapEntry: Decodable {
+        let groupIdHex: String
+        let masterKeyHex: String
+    }
+
     /// A group member as the SFU identifies them.
     public struct GroupMember: Sendable, Equatable {
         /// Raw 16-byte service id.
@@ -1917,6 +1983,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let callSetMuted: @convention(c) (Int32) -> Int32
         let httpResponse: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupAuthCredentials: @convention(c) () -> UnsafeMutablePointer<CChar>?
+        let groupRoster: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let groupIdMap: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let groupCallProofAuthorization: @convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?
         let groupCallGroupId: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let groupCallMemberIdentities: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -1951,6 +2019,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private var _onCallState: ((CallStateEvent) -> Void)?
     private var _onHTTPRequest: ((PendingHTTPRequest) -> Void)?
     private var _onGroupCallUpdate: ((GroupCallUpdate) -> Void)?
+    private var _onGroupCallSignal: ((GroupCallSignalEvent) -> Void)?
     private var _onReaction: ((String, Int64, String, Bool, String) -> Void)?
     private var _onReceipt: ((String, String, [Int64]) -> Void)?
     private var _onReceiptScoped: ((String?, String, String, [Int64]) -> Void)?
@@ -1975,6 +2044,15 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     public var onCallState: ((CallStateEvent) -> Void)? {
         get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onCallState }
         set { callbackLock.lock(); _onCallState = newValue; callbackLock.unlock() }
+    }
+    /// An inbound group call signal.
+    ///
+    /// A separate callback from `onCallSignal` because a group message is not 1:1
+    /// signaling: it has no thread, no call id, and RingRTC parses it itself. It
+    /// is also never a chat row, so it must not reach the message path.
+    public var onGroupCallSignal: ((GroupCallSignalEvent) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onGroupCallSignal }
+        set { callbackLock.lock(); _onGroupCallSignal = newValue; callbackLock.unlock() }
     }
     /// An SFU request that RingRTC raised and is blocked on. The host performs
     /// it and responds with `deliverHTTPResponse(requestId:status:body:)`.
@@ -2032,6 +2110,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         _onCallState = nil
         _onHTTPRequest = nil
         _onGroupCallUpdate = nil
+        _onGroupCallSignal = nil
         _onReaction = nil
         _onReceipt = nil
         _onReceiptScoped = nil
@@ -2257,6 +2336,13 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                    sessionEpoch.isCurrent(token),
                    let pending = request.pendingRequest() {
                     onHTTPRequest?(pending)
+                }
+                continue
+            }
+            if event.type == "group_call_signal" {
+                if let signal = try? JSONDecoder().decode(GroupCallSignalEvent.self, from: data),
+                   sessionEpoch.isCurrent(token) {
+                    onGroupCallSignal?(signal)
                 }
                 continue
             }
@@ -2555,6 +2641,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let csm = dlsym(handle, "core_cmd_call_set_muted"),
               let chr = dlsym(handle, "core_cmd_http_response"),
               let cgac = dlsym(handle, "core_cmd_group_auth_credentials"),
+              let cgr = dlsym(handle, "core_cmd_group_roster"),
+              let cgim = dlsym(handle, "core_cmd_group_id_map"),
               let cgcpa = dlsym(handle, "core_cmd_group_call_proof_authorization"),
               let cgcid = dlsym(handle, "core_cmd_group_call_group_id"),
               let cgcmi = dlsym(handle, "core_cmd_group_call_member_identities"),
@@ -2608,6 +2696,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             callSetMuted: unsafeBitCast(csm, to: (@convention(c) (Int32) -> Int32).self),
             httpResponse: unsafeBitCast(chr, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupAuthCredentials: unsafeBitCast(cgac, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
+            groupRoster: unsafeBitCast(cgr, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            groupIdMap: unsafeBitCast(cgim, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             groupCallProofAuthorization: unsafeBitCast(cgcpa, to: (@convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?).self),
             groupCallGroupId: unsafeBitCast(cgcid, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             groupCallMemberIdentities: unsafeBitCast(cgcmi, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),

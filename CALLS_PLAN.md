@@ -137,18 +137,65 @@ hop and all lifecycle/UI work are better in Swift.
 | 3 | CDN token fetch (`GET /v2/groups/token`) | Swift | Mock transport | **Done** — 13 tests | ✅ |
 | 4 | SFU request/response bridge | Rust + Swift | Injected synthetic response | **Done** — ABI 3, 6 tests | ✅ |
 | 5 | Group-call lifecycle + signaling transport | Rust | Fake SFU client | **Code complete** | ✅ |
-| 6 | `GroupCallController` + UI | Swift | Against the fake bridge | Not started | ⬜ |
+| 6 | `GroupCallController` + UI | Swift | Against the fake bridge | **Code complete** — 25 tests | ✅ |
+| 7 | Real two-client verification | On device | A second Signal client | **Not started** | ⬜ |
 
 Increments 3 and 4 come early on purpose: a wrong basic-auth header or a
 stalled SFU request is invisible until a real call connects, so both are the
 pieces most worth proving with tests before anything is built on top of them.
 
-### ABI 3
+### ABI 4
 
-`core_cmd_http_response` is new in ABI 3. Older dylibs lack the symbol, so the
-Swift loader rejects them at `core_abi_version` instead of loading a core that
-would leave every SFU request unanswered. A pre-ABI-3 bundle therefore fails
-loudly at startup rather than hanging on join.
+ABI 3 added `core_cmd_http_response`, the SFU request/response bridge. ABI 4
+adds what a group call needs to actually join:
+
+| Symbol | Why |
+|---|---|
+| `core_cmd_group_call_proof_authorization` | Fetches the ZK credential and presents it in one hop. Without a real credential there is no proof, and the join is refused. |
+| `core_cmd_group_call_group_id` | The ZK identifier a room is keyed on, derived from the master key a group thread id is built of. Without it a group call cannot be started. |
+| `core_cmd_group_call_member_identities` | The roster the SFU needs to map opaque participant ids back to people. |
+| `core_cmd_group_roster` | A group's title and member ACIs, which the roster is built from. |
+| `core_cmd_group_id_map` | Maps an inbound group id back to a group on this device, deciding which calls are receivable at all. |
+
+Older dylibs lack these symbols, so the Swift loader rejects them at
+`core_abi_version` instead of loading a core that would fail later with a
+misleading error. A pre-ABI-4 bundle therefore fails loudly at startup rather
+than hanging on join.
+
+### Increment 6: complete
+
+`GroupCallController` owns the sequence, which is the only part where a bug can
+leave a call silently half-connected:
+
+1. `join` raises `request_membership_proof` and **blocks** the SFU join until a
+   proof is presented.
+2. The proof is a ZK credential, so it cannot be fabricated. No credential means
+   the call fails; it never joins "unverified" and never reports success.
+3. `request_group_members` supplies the roster, without which a call connects
+   but nobody is identifiable.
+4. The SFU's HTTP requests are answered by request id, including on failure, or
+   RingRTC stalls forever.
+
+Three findings worth keeping:
+
+- **RingRTC does not create a group client from inbound signaling.** It routes a
+  message to an existing active client and otherwise drops it with "unknown
+  group ID". A host therefore cannot receive a group call it has not already
+  joined, and the group has to be read out of the payload
+  (`group_call_message.group_id`) before a client exists. That is why the inbound
+  event carries `group_id`.
+- **The credential is bound to the exact redemption instant.** The offline
+  round-trip test caught this: converting the REST milliseconds to zkgroup's
+  seconds must not lose anything, so a sub-second remainder is refused with its
+  own error rather than rounded into a credential that fails to verify and
+  reports as an unrelated rejection.
+- **State names must be matched whole.** RingRTC's are `NotConnected`,
+  `Connecting`, `Connected`, `Reconnecting`, so a `contains("connected")` test
+  reads three of the four as connected. The mapping is pinned per state.
+
+Inbound calls for a group this device is not in are not joined: a call for such a
+group is not receivable, and guessing would create a client for a room that
+cannot exist.
 
 ### Increment 5: complete
 
@@ -189,18 +236,27 @@ where the shape is tested. See `rust-core/vendor/README.md` and
 `rust-core/vendor/presage/CHANGELOG-VENDOR.md` for the exact change and how to
 re-apply it after an upstream update.
 
-## Known 1:1 limitations and follow-ups
+## Known call limitations and follow-ups
 
 - ICE currently uses public STUN servers. Signal's authenticated TURN relay
-  list is not fetched yet.
+  list is not fetched yet, which is a real limit on 1:1 connectivity between
+  restrictive networks.
 - The current sender does not expose Signal's urgent-message flag, so a call to
   a fully offline phone may not produce a push notification.
 - Ringtone/ringback audio and full system audio-route selection are not
   implemented.
 - Video calling is not enabled in the production UI; the current supported
-  call mode is voice.
-- Group/video calls, CallKit, lock-screen call actions, multi-call handling,
-  and persistent call history remain future work.
+  call mode is voice. Group calls are likewise voice-only in the UI.
+- Group call participants are shown as a count, not a named roster. The SFU
+  supplies participant ids rather than names, and mapping them needs a
+  per-participant profile key exchange that is not implemented. Speaking
+  indicators and reactions are received but not surfaced for the same reason.
+- Ad-hoc "group rings" (RingRTC's `ring_intention` path) are refused. They need
+  the ZK group send-token flow, which is a different protocol from Signal group
+  calls.
+- CallKit, lock-screen call actions, multi-call handling, and persistent call
+  history remain future work. Only one call is live at a time; starting a second
+  is refused rather than silently replacing the first.
 - APNs/PushKit, launch-at-login, and killed-app call delivery require a
   separate signed provider/APNs path and are not implemented.
 
@@ -211,5 +267,11 @@ Before changing call code, preserve:
 - 1:1 audio remains usable when group-call work is disabled.
 - Signal incoming call envelopes never become chat rows.
 - Empty group-call/control updates never become chat rows.
+- A group call is only ever reported `connected` when the native side said so.
+  `NotConnected` and `Reconnecting` must not read as connected.
+- A group call with no server-issued credential fails visibly. It never joins
+  unverified.
+- A group signal never claims a 1:1 `kind`, and an SFU request is always
+  answered even when it could not be performed.
 - Incoming calls are deduplicated and notification state is cancelled when the
   call is answered, declined, or ended.

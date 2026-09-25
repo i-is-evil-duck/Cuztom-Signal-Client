@@ -90,6 +90,13 @@ enum LinkPhase: Equatable {
 final class ChatViewModel {
     private var controller: ChatController?
     private let callController = CallController.shared
+    private let groupCallController = GroupCallController.shared
+    private var groupRoster: NativeGroupRoster?
+
+    /// The group call in progress, or nil. Kept as a plain mirror of the
+    /// controller's own state so the views can render it without reaching into
+    /// a second observable.
+    var groupCall: GroupCallState?
 
     var phase = LinkPhase.starting
     var conversations: [Conversation] = []
@@ -302,6 +309,31 @@ final class ChatViewModel {
             if call != nil { self.incomingCall = nil }
         }
         await callController.configure(with: live, transport: live)
+        // Group calls need a roster and the ZK group id map, both from the same
+        // store, so they are configured together.
+        let roster = NativeGroupRoster(service: live)
+        groupRoster = roster
+        groupCallController.configure(with: live)
+        // An inbound group call names a group by identifier, and one for a group
+        // this device is not in cannot be joined, so the map is what decides
+        // whether a ringing call is answerable at all.
+        live.onGroupCallSignal = { [weak self] signal in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.groupCallController.receive(event: signal)
+                self.groupCall = self.groupCallController.current
+                self.sync()
+            }
+        }
+        Task {
+            do {
+                try await roster.loadGroupIdMap()
+            } catch {
+                // Reported rather than fatal: an inbound call that cannot be
+                // resolved is skipped, and an outgoing one still works.
+                Log.error("[group-call] group id map unavailable: \(error.localizedDescription)")
+            }
+        }
         // Wire typing indicator callback to update ViewModel state
         controller.onTypingUpdateWithID = { [weak self] thread, senderID, senderName, started in
             Task { @MainActor in
@@ -570,6 +602,48 @@ func sendTyping(started: Bool) async {
         }
     }
 
+    // MARK: - Group calls
+
+    /// Start a group call in the selected conversation.
+    ///
+    /// The roster is read first, on purpose. A call placed without it connects
+    /// with nobody identifiable in it, and the failure only shows up later as
+    /// unidentified participants, so an unreadable group fails here instead.
+    func startGroupCall() async {
+        guard let id = selectedId,
+              let conv = conversations.first(where: { $0.id == id }),
+              conv.peer.isGroup,
+              let masterKey = ThreadID.parse(id).groupMasterKey else { return }
+        guard let roster = groupRoster else {
+            sendError = "Group calls are not ready yet"
+            return
+        }
+        do {
+            _ = try await roster.load(masterKeyHex: masterKey)
+            groupCall = try await groupCallController.startCall(
+                masterKeyHex: masterKey,
+                title: conv.title
+            )
+        } catch {
+            sendError = "Group call failed: \(GroupCallController.describe(error))"
+        }
+        sync()
+    }
+
+    /// End the group call in progress.
+    func endGroupCall() async {
+        await groupCallController.end()
+        groupCall = nil
+        sync()
+    }
+
+    /// Place a group call to a specific conversation, from its list row.
+    func startGroupCall(conversationId: String) async {
+        selectedId = conversationId
+        sync()
+        await startGroupCall()
+    }
+
     /// Answer incoming call
     func answerCall() async {
         guard let call = incomingCall else { return }
@@ -795,6 +869,12 @@ func sendTyping(started: Bool) async {
         await oldDiagnostics?.value
         await oldSelection?.value
         await callController.resetAndAwait()
+        // A group call must not survive an account boundary: native clients are
+        // torn down on logout, so a live handle would be refused and the UI
+        // would show a call that no longer exists.
+        await groupCallController.resetAndAwait()
+        groupRoster?.reset()
+        groupCall = nil
         notifiedCallIDs.removeAll()
         NotificationManager.shared.cancelAll()
 

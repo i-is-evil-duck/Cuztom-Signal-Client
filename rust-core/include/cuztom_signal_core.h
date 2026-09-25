@@ -53,6 +53,16 @@ int64_t core_cmd_send_message_edit(const char *thread, uint64_t target_ts,
 int32_t core_cmd_send_typing(const char *thread, int32_t started);
 
 char *core_cmd_group_get_info(const char *master_key_hex);
+
+/* A group's title and member ACIs, which a group call's roster needs. Returns
+ * malloc'd JSON, or NULL. A group this device is not a member of is refused
+ * rather than reported as empty: an empty roster reads as "you are alone". */
+char *core_cmd_group_roster(const char *master_key_hex);
+
+/* Map each ZK group id this device belongs to back to its master key. Returns
+ * malloc'd JSON, or NULL. A group call names a group by identifier, and a call
+ * for a group this device is not in is not receivable. */
+char *core_cmd_group_id_map(void);
 int32_t core_cmd_group_update_title(const char *master_key_hex, const char *title);
 int32_t core_cmd_group_update_avatar(const char *master_key_hex,
                                      const uint8_t *avatar_data, size_t avatar_len);
