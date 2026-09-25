@@ -114,7 +114,7 @@ struct SidebarView: View {
         }
         .navigationTitle("Cuztom Signal")
         .safeAreaInset(edge: .bottom) {
-            Text("backend: \(vm.backendName)")
+            Text("build: \(vm.buildVersionTag)")
                 .font(.caption2).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 12).padding(.vertical, 6)

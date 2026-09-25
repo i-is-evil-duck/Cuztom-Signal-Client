@@ -85,6 +85,8 @@ Important implementation areas:
   data wipe.
 - `Sources/CuztomSignalCore/SerialNativeExecutor.swift` — process-wide serial
   queue for blocking native Signal/RingRTC calls and teardown ordering.
+- `Sources/CuztomSignalCore/BuildInfo.swift` — bundle/CI build tag used by the
+  UI and diagnostics.
 - `Sources/CuztomSignalCore/AsyncOperationGate.swift` and
   `NativeProcessState.swift` — process-wide lifecycle serialization,
   shared database-path session epochs, and cross-instance wipe-poison
@@ -127,13 +129,15 @@ The checked-in source does not include the local app bundle or user data.
 The SQLCipher XCFramework is resolved as a pinned SwiftPM binary dependency and
 must be embedded/signed with the app. For a local runnable bundle, copy the
 built Swift executable and release dylib into `CuztomSignal.app/Contents/MacOS/`,
-then ad-hoc sign the bundle.
+then ad-hoc sign the bundle. The UI build tag comes from
+`CFBundleShortVersionString`/`CFBundleVersion`; local SwiftPM runs show
+`Build dev`, and CI can override it with `CUZTOM_SIGNAL_BUILD_TAG`.
 
 ## Verification status
 
 | Area | Status |
 |---|---|
-| Swift core tests | **65 passed** with full Xcode |
+| Swift core tests | **66 passed** with full Xcode |
 | Rust library tests | **11 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |

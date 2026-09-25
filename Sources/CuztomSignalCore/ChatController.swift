@@ -858,14 +858,15 @@ public final class ChatController: @unchecked Sendable {
             "messages: \(msgCount)",
             "selected: \(selectedId ?? "none")",
         ]
+        lines.append("build: \(BuildInfo.displayTag)")
         if let live = service as? RustCoreService {
-            lines.append("backend: live (\(live.libraryPath ?? "?"))")
+            lines.append("native: loaded (\(live.libraryPath ?? "?"))")
             lines.append("roster: \(live.lastRosterSummary)")
             if let me = try? await live.whoami() {
                 lines.append("account: \(me.number) (\(String(me.aci.prefix(8))))")
             }
         } else {
-            lines.append("backend: mock")
+            lines.append("native: mock")
         }
         lines.append("last sync: \(lastSyncNote ?? "none")")
         lines.append("last sent to: \(lastSentThread ?? "none")")

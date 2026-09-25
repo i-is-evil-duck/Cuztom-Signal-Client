@@ -10,7 +10,7 @@ public struct InfoPlugin: ChatPlugin {
 
     public var commands: [PluginCommand] {
         [
-            PluginCommand(name: "info", description: "app + backend versions"),
+            PluginCommand(name: "info", description: "build + backend versions"),
             PluginCommand(name: "account", description: "linked account identity"),
             PluginCommand(name: "roster", description: "cached contacts/groups/message counts"),
             PluginCommand(name: "diag", description: "full diagnostics dump"),
@@ -26,7 +26,7 @@ public struct InfoPlugin: ChatPlugin {
     public func handle(command: String, args: String, ctx: PluginContext) async -> String? {
         switch command {
         case "info":
-            return "CuztomSignal 0.1.0 · Swift 6 + presage/libsignal core"
+            return "CuztomSignal · \(BuildInfo.displayTag) · Swift 6 + presage/libsignal core"
         case "account":
             return await ctx.account()
         case "roster":

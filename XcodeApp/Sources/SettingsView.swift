@@ -9,7 +9,7 @@ struct SettingsView: View {
         @Bindable var vm = vm
         Form {
             Section("Session") {
-                LabeledContent("Backend", value: vm.backendName)
+                LabeledContent("Build", value: vm.buildVersionTag)
                 LabeledContent("Connection", value: vm.connectionText)
                 LabeledContent("Account", value: vm.accountLine)
                 Button("Log out…", role: .destructive) {

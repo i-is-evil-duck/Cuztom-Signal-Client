@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 65/65 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 66/66 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 11/11 passed |
@@ -468,6 +468,7 @@ metadata survives replay.
       allowing relink.
 - [ ] Guard call startup so rapid taps cannot create duplicate native calls.
 - [ ] Track and await all controller/service tasks.
+- [x] Track app selection/diagnostics tasks and await them before retry/logout.
 - [ ] Cancel watcher, refresh, selection, auto-fetch, and diagnostic tasks
       before logout/retry.
 - [x] Make `clearAllData()` throw on any failure and never continue relinking

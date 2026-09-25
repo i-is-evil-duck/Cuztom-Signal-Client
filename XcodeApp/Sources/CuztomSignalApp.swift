@@ -97,7 +97,7 @@ final class ChatViewModel {
     var messages: [ChatMessage] = []
     var linkQR: LinkQR?
     var isLinked = false
-    var backendName = "…"
+    var buildVersionTag = BuildInfo.displayTag
     var errorMessage: String?
     var connectionText = "starting"
     var syncNote = "none"
@@ -193,6 +193,7 @@ final class ChatViewModel {
     private var starting = false
     private var notifiedCallIDs: Set<UUID> = []
     private var diagnosticsTask: Task<Void, Never>?
+    private var selectionTask: Task<Void, Never>?
 
     var notificationsEnabled: Bool = NotificationManager.shared.enabled {
         didSet {
@@ -221,19 +222,27 @@ final class ChatViewModel {
         guard !starting else { return }
         starting = true
         defer { starting = false }
+        let oldDiagnostics = diagnosticsTask
+        let oldSelection = selectionTask
+        diagnosticsTask = nil
+        selectionTask = nil
+        oldDiagnostics?.cancel()
+        oldSelection?.cancel()
+        await oldDiagnostics?.value
+        await oldSelection?.value
+        selectionInProgress = false
         phase = .starting
         errorMessage = nil
         NotificationManager.shared.configure()
-        // Live backend only — the demo is gone. Without the rust dylib
+        // Native backend only — the demo is gone. Without the rust dylib
         // there is nothing to connect to, so fail loudly with Retry.
+        buildVersionTag = BuildInfo.displayTag
         let live = RustCoreService()
         guard live.loadLibrary() else {
-            backendName = "missing"
             errorMessage = "rust core not found — rebuild: cd rust-core && cargo build --release"
             phase = .failed
             return
         }
-        backendName = "Live"
         let store: any MessageStoring
         do {
             store = try SQLiteMessageStore()
@@ -329,6 +338,7 @@ final class ChatViewModel {
     }
 
     func select(_ id: String) {
+        selectionTask?.cancel()
         selectionGeneration += 1
         let generation = selectionGeneration
         selectionInProgress = true
@@ -346,17 +356,17 @@ final class ChatViewModel {
         editingMessage = nil
         editDraft = ""
         sendErrorsByConversation[id] = nil
-        Task { [weak self] in
+        selectionTask = Task { [weak self] in
             guard let self, let controller = self.controller else { return }
             await controller.select(id)
-            guard generation == self.selectionGeneration else { return }
+            guard !Task.isCancelled, generation == self.selectionGeneration else { return }
             self.selectionInProgress = false
-            // Auto-send read receipts when opening a conversation
+            // Auto-send read receipts when opening a conversation. Keep this
+            // inside the tracked selection task so logout can await it.
             if self.sendReadReceipts {
-                Task {
-                    try? await controller.sendReadReceipts(for: id)
-                }
+                try? await controller.sendReadReceipts(for: id)
             }
+            guard !Task.isCancelled, generation == self.selectionGeneration else { return }
             self.sync()
         }
     }
@@ -741,7 +751,7 @@ func sendTyping(started: Bool) async {
                 }
                 return "unknown"
             },
-            rosterSummary: { live?.lastRosterSummary ?? "no live backend" },
+            rosterSummary: { live?.lastRosterSummary ?? "not connected" },
             requestSync: { await c?.requestSync() ?? false }
         )
     }
@@ -771,7 +781,16 @@ func sendTyping(started: Bool) async {
         guard !isLoggingOut, let c = controller else { return }
         isLoggingOut = true
         defer { isLoggingOut = false }
-        diagnosticsTask?.cancel()
+        selectionGeneration += 1
+        selectionInProgress = false
+        let oldDiagnostics = diagnosticsTask
+        let oldSelection = selectionTask
+        diagnosticsTask = nil
+        selectionTask = nil
+        oldDiagnostics?.cancel()
+        oldSelection?.cancel()
+        await oldDiagnostics?.value
+        await oldSelection?.value
         callController.reset()
         notifiedCallIDs.removeAll()
         NotificationManager.shared.cancelAll()
