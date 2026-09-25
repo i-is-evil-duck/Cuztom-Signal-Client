@@ -18,7 +18,7 @@ use ringrtc::{
     common::{CallConfig, CallEndReason, CallId, CallMediaType, DeviceId},
     core::{
         call_manager::CallManager,
-        group_call::SignalingMessageUrgency,
+        group_call::{ClientId, SignalingMessageUrgency},
         signaling::{
             self, Answer, Ice, IceCandidate, Offer, ReceivedAnswer, ReceivedBusy,
             ReceivedHangup, ReceivedIce, ReceivedOffer,
@@ -91,6 +91,11 @@ static CALL_EVENT_RX: OnceLock<Mutex<std::sync::mpsc::Receiver<String>>> = OnceL
 static CALL_MANAGER: OnceLock<Mutex<CallManager<NativePlatform>>> = OnceLock::new();
 static CALL_CONTEXT: OnceLock<NativeCallContext> = OnceLock::new();
 static CALL_AUDIO_TRACK: OnceLock<AudioTrack> = OnceLock::new();
+static CALL_VIDEO_TRACK: OnceLock<VideoTrack> = OnceLock::new();
+/// Live group call clients, so logout and relink can tear them down and a
+/// client id from a previous session cannot address a new call.
+static GROUP_CALL_CLIENTS: OnceLock<Mutex<std::collections::HashSet<ClientId>>> =
+    OnceLock::new();
 static LOCAL_DEVICE_ID: AtomicU32 = AtomicU32::new(1);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -146,6 +151,9 @@ pub fn invalidate_session() {
     SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
     clear_events();
     drop_active_call();
+    // Group call clients are account-bound: they hold SFU state and media
+    // pipelines that must not survive into a new account.
+    teardown_group_calls();
 }
 
 pub fn set_self_uuid(uuid: &str) {
@@ -531,6 +539,178 @@ impl http::Delegate for CuztomHttpDelegate {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Group call lifecycle
+// ---------------------------------------------------------------------------
+
+/// Live production SFU. Overridable so a staging build can be pointed
+/// elsewhere; it is never inferred.
+pub const DEFAULT_SFU_URL: &str = "https://sfu.voip.signal.org";
+
+/// The SFU carries the membership proof, so a plaintext hop is refused.
+fn validate_sfu_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("SFU url must be https".to_string());
+    }
+    Ok(())
+}
+
+/// Interval at which the SFU reports per-participant audio levels.
+const GROUP_AUDIO_LEVELS_INTERVAL_SECS: u64 = 1;
+/// Deep-equalization redistribution duration, matching Signal's clients.
+const GROUP_DRED_DURATION: u8 = 200;
+
+fn group_clients() -> &'static Mutex<std::collections::HashSet<ClientId>> {
+    GROUP_CALL_CLIENTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn with_manager<T>(f: impl FnOnce(&mut CallManager<NativePlatform>) -> T) -> Result<T, String> {
+    let manager = manager().ok_or_else(|| "call stack not initialized".to_string())?;
+    let mut guard = manager
+        .lock()
+        .map_err(|_| "call manager lock poisoned".to_string())?;
+    Ok(f(&mut guard))
+}
+
+/// Like [`with_manager`], for the verbs that report a failure themselves.
+///
+/// The forwarded group-call verbs (`connect`, `join`, `leave`,
+/// `delete_group_call_client`) return unit and report their outcome through
+/// `GroupUpdate` events instead, so this is only used by `create_group_call_client`.
+fn with_manager_flat<T>(
+    f: impl FnOnce(&mut CallManager<NativePlatform>) -> ringrtc::common::Result<T>,
+) -> Result<T, String> {
+    with_manager(|m| f(m)).and_then(|inner| inner.map_err(|e| e.to_string()))
+}
+
+/// Create a group call client and start its DHE connection.
+///
+/// Returns the RingRTC client id, which every later group-call command
+/// addresses. The client is tracked so a logout, relink, or reset can tear it
+/// down; a client that is not tracked here is not reachable, so nothing is
+/// left running behind the caller's back.
+pub fn start_group_call(
+    group_id: Vec<u8>,
+    sfu_url: Option<String>,
+) -> Result<ClientId, String> {
+    if group_id.is_empty() {
+        return Err("group call needs a group id".to_string());
+    }
+    let sfu_url = sfu_url
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_SFU_URL.to_string());
+    if !validate_sfu_url(&sfu_url).is_ok() {
+        // The SFU carries the membership proof, so a plaintext hop would leak
+        // it and there is no legitimate reason to allow one.
+        return Err("SFU url must be https".to_string());
+    }
+    let audio_track = CALL_AUDIO_TRACK
+        .get()
+        .cloned()
+        .ok_or_else(|| "call stack not initialized".to_string())?;
+    let video_track = CALL_VIDEO_TRACK
+        .get()
+        .cloned()
+        .ok_or_else(|| "call stack not initialized".to_string())?;
+
+    let params = ringrtc::core::call_manager::CreateGroupCallParams {
+        group_id,
+        sfu_url,
+        hkdf_extra_info: Vec::new(),
+        audio_levels_interval: Some(std::time::Duration::from_secs(
+            GROUP_AUDIO_LEVELS_INTERVAL_SECS,
+        )),
+        dred_duration: GROUP_DRED_DURATION,
+        // Server-side config is not used by any Signal client today.
+        svc_config: None,
+        peer_connection_factory: None,
+        outgoing_audio_track: audio_track,
+        outgoing_video_track: video_track,
+        incoming_video_sink: Some(Box::new(NullVideoSink)),
+    };
+
+    let client_id = with_manager_flat(|m| m.create_group_call_client(params))?;
+
+    // `connect` establishes the DHE identity. A failure here means the call can
+    // never join, so the client is deleted rather than left dangling.
+    // The forwarded verbs return unit: RingRTC reports the outcome through
+    // `GroupUpdate` events, so a failure here is observed rather than returned.
+    let connected = with_manager(|m| m.connect(client_id)).is_ok();
+    if !connected {
+        let _ = with_manager(|m| m.delete_group_call_client(client_id));
+        return Err("group call connect failed".to_string());
+    }
+
+    if let Ok(mut clients) = group_clients().lock() {
+        clients.insert(client_id);
+    }
+    Ok(client_id)
+}
+
+fn require_tracked(client_id: ClientId) -> Result<(), String> {
+    let clients = group_clients()
+        .lock()
+        .map_err(|_| "group call registry poisoned".to_string())?;
+    if clients.contains(&client_id) {
+        Ok(())
+    } else {
+        Err("unknown group call".to_string())
+    }
+}
+
+/// Ask the SFU to admit this client.
+///
+/// This is the call that raises `RequestMembershipProof` and, once a proof has
+/// been presented, performs the SFU join request.
+pub fn join_group_call(client_id: ClientId) -> Result<(), String> {
+    require_tracked(client_id)?;
+    with_manager(|m| m.join(client_id))?;
+    Ok(())
+}
+
+/// Leave the SFU but keep the client, so a call can be rejoined.
+pub fn leave_group_call(client_id: ClientId) -> Result<(), String> {
+    require_tracked(client_id)?;
+    with_manager(|m| m.leave(client_id))?;
+    Ok(())
+}
+
+/// Leave if needed, then delete the client and forget it.
+///
+/// Idempotent for an untracked id, so a teardown path can call it for every
+/// client it knows about without first checking.
+pub fn end_group_call(client_id: ClientId) -> Result<(), String> {
+    let _ = leave_group_call(client_id);
+    with_manager(|m| m.delete_group_call_client(client_id))?;
+    if let Ok(mut clients) = group_clients().lock() {
+        clients.remove(&client_id);
+    }
+    Ok(())
+}
+
+/// Tear down every group call. Called on logout, relink, and reset so no client
+/// from a previous account survives into a new one.
+pub fn teardown_group_calls() {
+    let clients: Vec<ClientId> = match group_clients().lock() {
+        Ok(mut clients) => clients.drain().collect(),
+        Err(_) => return,
+    };
+    for client_id in clients {
+        let _ = with_manager(|m| m.delete_group_call_client(client_id));
+    }
+}
+
+/// Group calls currently tracked in this process.
+pub fn active_group_calls() -> Vec<ClientId> {
+    let mut ids: Vec<ClientId> = match group_clients().lock() {
+        Ok(clients) => clients.iter().copied().collect(),
+        Err(_) => return Vec::new(),
+    };
+    ids.sort_unstable();
+    ids
+}
+
 /// Hand a group-call membership proof to RingRTC.
 pub fn set_group_membership_proof(client_id: u32, token: Vec<u8>) -> Result<(), String> {
     let manager = manager().ok_or_else(|| "call stack not initialized".to_string())?;
@@ -725,10 +905,13 @@ pub fn init_calls() -> Result<(), String> {
         false,
         ice_servers(),
         outgoing_audio_track,
-        outgoing_video_track,
+        outgoing_video_track.clone(),
         Box::new(NullVideoSink),
     );
     let _ = CALL_CONTEXT.set(call_context);
+    // Group calls need the outgoing tracks to build a new client, and the
+    // 1:1 context keeps its own copies.
+    let _ = CALL_VIDEO_TRACK.set(outgoing_video_track);
 
     let platform = NativePlatform::new(
         pcf,

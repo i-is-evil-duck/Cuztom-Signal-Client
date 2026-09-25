@@ -158,6 +158,9 @@ struct LiveEvent: Decodable {
 /// protected by the lock-backed boxes and state lock declared below.
 public final class RustCoreService: SignalService, @unchecked Sendable {
     public static let expectedNativeABI: UInt32 = 3
+    /// The production Signal SFU. Group calls use it unless a staging build
+    /// explicitly overrides it, and it is never inferred from the environment.
+    public static let defaultSFUURL = "https://sfu.voip.signal.org"
     private static let dylibEnvironmentKey = "CUZTOM_SIGNAL_CORE_PATH"
     private static let dylibHashInfoKey = "CuztomSignalCoreSHA256"
     private static let nativeStoreKeychainAccount = "native.signal.sqlcipher.passphrase.v2"
@@ -1032,6 +1035,91 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
     }
 
+    /// A live group call, addressed by its RingRTC client id.
+    public struct GroupCallHandle: Sendable, Equatable {
+        public let clientId: UInt32
+        public let groupIdHex: String
+
+        public init(clientId: UInt32, groupIdHex: String) {
+            self.clientId = clientId
+            self.groupIdHex = groupIdHex
+        }
+    }
+
+    /// Create a group call and connect it.
+    ///
+    /// This does not join: joining is a separate step, because the SFU only
+    /// admits the client after a membership proof has been presented, and that
+    /// proof is requested as a side effect of joining.
+    ///
+    /// - Parameters:
+    ///   - groupIdHex: the group's 32-byte ZK identifier in hex.
+    ///   - sfuURL: overrides the production SFU. Prefer `nil` unless testing
+    ///     against a staging deployment.
+    public func startGroupCall(
+        groupIdHex: String,
+        sfuURL: String? = nil
+    ) async throws -> GroupCallHandle {
+        let normalized = groupIdHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty,
+              normalized.allSatisfy({ $0.isHexDigit }),
+              normalized.count.isMultiple(of: 2) else {
+            throw SignalError.network("group id must be hex")
+        }
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            let result = normalized.withCString { groupId in
+                if let sfuURL {
+                    return sfuURL.withCString { url in
+                        sym.groupCallStart(groupId, url)
+                    }
+                }
+                // A null pointer selects the production SFU; an empty string
+                // would be a caller mistake and is rejected natively.
+                return sym.groupCallStart(groupId, nil)
+            }
+            guard result != UInt64.max, result != 0 else {
+                throw SignalError.network(
+                    "group call start failed: \(Self.lastError(sym))"
+                )
+            }
+            return GroupCallHandle(
+                clientId: UInt32(result - 1),
+                groupIdHex: normalized
+            )
+        }
+    }
+
+    /// Ask the SFU to admit the call, which raises the membership-proof request.
+    public func joinGroupCall(_ call: GroupCallHandle) async throws {
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            guard sym.groupCallJoin(call.clientId) == 0 else {
+                throw SignalError.network("group call join failed: \(Self.lastError(sym))")
+            }
+        }
+    }
+
+    /// Leave the SFU but keep the call so it can be rejoined.
+    public func leaveGroupCall(_ call: GroupCallHandle) async throws {
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            guard sym.groupCallLeave(call.clientId) == 0 else {
+                throw SignalError.network("group call leave failed: \(Self.lastError(sym))")
+            }
+        }
+    }
+
+    /// Leave if needed, then end the call and release the native client.
+    public func endGroupCall(_ call: GroupCallHandle) async throws {
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            guard sym.groupCallEnd(call.clientId) == 0 else {
+                throw SignalError.network("group call end failed: \(Self.lastError(sym))")
+            }
+        }
+    }
+
     /// A state change from a native group call.
     ///
     /// `requestMembershipProof` is the one that matters for actually joining:
@@ -1669,6 +1757,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let groupAuthCredentials: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let groupCallSetMembershipProof: @convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupCallSetGroupMembers: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32
+        let groupCallStart: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64
+        let groupCallJoin: @convention(c) (UInt32) -> Int32
+        let groupCallLeave: @convention(c) (UInt32) -> Int32
+        let groupCallEnd: @convention(c) (UInt32) -> Int32
         // Call signaling integration
         let sendCallSignal: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let buildCallOffer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -2300,6 +2392,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cgac = dlsym(handle, "core_cmd_group_auth_credentials"),
               let cgcsm = dlsym(handle, "core_cmd_group_call_set_membership_proof"),
               let cgcs = dlsym(handle, "core_cmd_group_call_set_group_members"),
+              let cgcs2 = dlsym(handle, "core_cmd_group_call_start"),
+              let cgcsj = dlsym(handle, "core_cmd_group_call_join"),
+              let cgcsl = dlsym(handle, "core_cmd_group_call_leave"),
+              let cgcse = dlsym(handle, "core_cmd_group_call_end"),
               let scs = dlsym(handle, "core_cmd_send_call_signal"),
               let bco = dlsym(handle, "core_cmd_build_call_offer"),
               let bca = dlsym(handle, "core_cmd_build_call_answer"),
@@ -2346,6 +2442,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             groupAuthCredentials: unsafeBitCast(cgac, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             groupCallSetMembershipProof: unsafeBitCast(cgcsm, to: (@convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupCallSetGroupMembers: unsafeBitCast(cgcs, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32).self),
+            groupCallStart: unsafeBitCast(cgcs2, to: (@convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64).self),
+            groupCallJoin: unsafeBitCast(cgcsj, to: (@convention(c) (UInt32) -> Int32).self),
+            groupCallLeave: unsafeBitCast(cgcsl, to: (@convention(c) (UInt32) -> Int32).self),
+            groupCallEnd: unsafeBitCast(cgcse, to: (@convention(c) (UInt32) -> Int32).self),
             sendCallSignal: unsafeBitCast(scs, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             buildCallOffer: unsafeBitCast(bco, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             buildCallAnswer: unsafeBitCast(bca, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),

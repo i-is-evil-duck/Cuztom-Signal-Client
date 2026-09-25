@@ -78,6 +78,25 @@ int32_t core_cmd_call_set_muted(int32_t muted);
  * released with core_free_string(), or NULL on error. */
 char *core_cmd_group_auth_credentials(void);
 
+/* Group call lifecycle. `group_id_hex` is the group's 32-byte ZK identifier in
+ * hex; `sfu_url` may be NULL to use the production SFU and is never inferred.
+ * group_call_start returns the RingRTC client id plus one, so zero means
+ * failure, and UINT64_MAX on error. Every later group-call command addresses a
+ * client by that id. */
+uint64_t core_cmd_group_call_start(const char *group_id_hex, const char *sfu_url);
+
+/* Ask the SFU to admit a group call client. Raises the
+ * `request_membership_proof` update the host answers. 0 ok, -1 error. */
+int32_t core_cmd_group_call_join(uint32_t client_id);
+
+/* Leave the SFU but keep the client so a call can be rejoined.
+ * 0 ok, -1 error. */
+int32_t core_cmd_group_call_leave(uint32_t client_id);
+
+/* Leave if needed, then delete the client and forget it.
+ * 0 ok, -1 error. */
+int32_t core_cmd_group_call_end(uint32_t client_id);
+
 /* Hand a group-call membership proof to RingRTC. RingRTC asks for this via a
  * `request_membership_proof` group update and will not send its SFU join request
  * until one arrives. Returns 0 on success, -1 on error. */

@@ -152,12 +152,14 @@ loudly at startup rather than hanging on join.
 
 ### Still to do in increment 5
 
-The membership-proof trigger and the member-identity framing are in place, so
-the proof path is now complete from RingRTC's request through to the token being
-handed back. Remaining:
+The membership-proof trigger, member framing, and the full lifecycle
+(`start_group_call`, `join`, `leave`, `end`) are in place, and group clients
+are torn down on logout, relink, and reset so no SFU or media state survives
+into a new account. The proof path is complete from RingRTC's request through
+to the token being handed back.
 
-- Commands to create a group call client, `connect`, `join`, `leave`, and
-  `delete`, backed by `CallManager::create_group_call_client`.
+Remaining:
+
 - Outbound signaling: `SignalingSender::send_call_message_to_group` still
   returns "group calls are not supported". It needs the RingRTC bytes wrapped
   in a Signal `CallMessage.opaque` and sent via presage's
@@ -166,6 +168,9 @@ handed back. Remaining:
 - Inbound signaling: `sync::call_signal_part` drops a `CallMessage` that
   carries only `opaque`, so group-call messages never reach
   `CallManager::received_call_message`.
+
+Without those two directions a call can be created and can obtain a proof, but
+no other client ever learns about it, so nothing connects.
 
 ### Open decision: how to carry the presage patch
 

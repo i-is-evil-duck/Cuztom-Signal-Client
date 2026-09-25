@@ -295,6 +295,26 @@ enum Command {
         member_ids: Vec<u8>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Create a group call client and connect it, returning its RingRTC id
+    /// (offset by one, so zero means failure).
+    GroupCallStart {
+        group_id: Vec<u8>,
+        sfu_url: Option<String>,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    GroupCallJoin {
+        client_id: u32,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    GroupCallLeave {
+        client_id: u32,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Leave if needed, then delete the client and forget it.
+    GroupCallEnd {
+        client_id: u32,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -872,6 +892,25 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::GroupCallSetMembershipProof { client_id, token, reply } => {
                             let result = call::set_group_membership_proof(client_id, token);
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallStart { group_id, sfu_url, reply } => {
+                            let result = match call::start_group_call(group_id, sfu_url) {
+                                Ok(client_id) => Ok(u64::from(client_id) + 1),
+                                Err(e) => Err(e),
+                            };
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallJoin { client_id, reply } => {
+                            let result = call::join_group_call(client_id);
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallLeave { client_id, reply } => {
+                            let result = call::leave_group_call(client_id);
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallEnd { client_id, reply } => {
+                            let result = call::end_group_call(client_id);
                             let _ = reply.send(result);
                         }
                         Command::GroupCallSetGroupMembers {
@@ -3215,6 +3254,91 @@ pub extern "C" fn core_cmd_call_hangup() -> i32 {
 #[no_mangle]
 pub extern "C" fn core_cmd_call_set_muted(muted: i32) -> i32 {
     match roundtrip(|reply| Command::CallSetMuted { muted: muted != 0, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Create a group call client and connect it.
+///
+/// `group_id` is the group's 32-byte ZK identifier in hex. `sfu_url` may be
+/// NULL to use the production SFU; it is never inferred from the environment.
+/// Returns the RingRTC client id plus one, so zero means failure; the id is the
+/// value every later group-call command addresses. Returns UINT64_MAX on error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_start(
+    group_id_hex: *const c_char,
+    sfu_url: *const c_char,
+) -> u64 {
+    let group_id_hex = match c_str_arg(group_id_hex, "group_id_hex") {
+        Ok(value) => value,
+        Err(e) => {
+            set_last_error(e);
+            return u64::MAX;
+        }
+    };
+    let group_id = match hex::decode(group_id_hex.trim()) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => {
+            set_last_error("group id was empty".to_string());
+            return u64::MAX;
+        }
+        Err(e) => {
+            set_last_error(format!("group id was not hex: {e}"));
+            return u64::MAX;
+        }
+    };
+    // A NULL url means "use the default"; an empty string is a caller mistake
+    // and is reported rather than silently replaced.
+    let sfu_url = if sfu_url.is_null() {
+        None
+    } else {
+        match c_str_arg(sfu_url, "sfu_url") {
+            Ok(value) if value.trim().is_empty() => {
+                set_last_error("sfu url was empty".to_string());
+                return u64::MAX;
+            }
+            Ok(value) => Some(value),
+            Err(e) => {
+                set_last_error(e);
+                return u64::MAX;
+            }
+        }
+    };
+
+    match roundtrip(|reply| Command::GroupCallStart { group_id, sfu_url, reply }) {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            u64::MAX
+        }
+    }
+}
+
+/// Ask the SFU to admit a group call client. This raises the
+/// `request_membership_proof` update the host answers. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_join(client_id: u32) -> i32 {
+    match roundtrip(|reply| Command::GroupCallJoin { client_id, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Leave the SFU but keep the client so a call can be rejoined.
+/// 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_leave(client_id: u32) -> i32 {
+    match roundtrip(|reply| Command::GroupCallLeave { client_id, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Leave if needed, then delete the client and forget it. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_end(client_id: u32) -> i32 {
+    match roundtrip(|reply| Command::GroupCallEnd { client_id, reply }) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
     }
