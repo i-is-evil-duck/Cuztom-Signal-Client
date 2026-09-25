@@ -124,7 +124,7 @@ then ad-hoc sign the bundle.
 
 | Area | Status |
 |---|---|
-| Swift core tests | **54 passed** with full Xcode |
+| Swift core tests | **55 passed** with full Xcode |
 | Rust library tests | **11 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |

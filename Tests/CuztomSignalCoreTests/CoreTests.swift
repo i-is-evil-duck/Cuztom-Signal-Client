@@ -183,3 +183,24 @@ import Testing
         // Expected: SQLCipher refuses the file rather than falling back.
     }
 }
+
+@Test func sqliteStoreDestroyRemovesEncryptedDatabase() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sqlite-destroy-test-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let dbURL = directory.appendingPathComponent("messages.sqlite")
+    let store = try SQLiteMessageStore(path: directory, passphrase: "destroy-key")
+    await store.upsertConversation(Conversation(
+        id: "c1",
+        title: "Peer",
+        peer: SignalAddress(phone: "+1"),
+        lastActiveAt: Date()
+    ))
+    try await store.destroy()
+    #expect(!FileManager.default.fileExists(atPath: dbURL.path))
+
+    let recreated = try SQLiteMessageStore(path: directory, passphrase: "destroy-key")
+    let recreatedConversations = await recreated.allConversations()
+    #expect(recreatedConversations.isEmpty)
+}

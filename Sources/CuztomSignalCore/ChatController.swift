@@ -710,8 +710,14 @@ public final class ChatController: @unchecked Sendable {
         await cancelOwnedTasks()
         // The Rust Signal database and the Swift presentation database are
         // separate stores. Clear both so a relink cannot resurrect the prior
-        // account's conversations, unread counts, or message UUIDs.
-        try await store.clearAllDataChecked()
+        // account's conversations, unread counts, or message UUIDs. The
+        // encrypted presentation store uses its terminal path so its file and
+        // database-scoped Keychain key can be removed after the queue closes.
+        if let sqliteStore = store as? SQLiteMessageStore {
+            try await sqliteStore.destroy()
+        } else {
+            try await store.clearAllDataChecked()
+        }
         selfAci = nil
         lastSentThread = nil
         await contactResolver.clear()

@@ -14,6 +14,8 @@ import GRDB
 /// Indexes on messages(conversationId, sentAt) for paging.
 public actor SQLiteMessageStore: MessageStoring {
     private let dbQueue: DatabaseQueue
+    private let path: URL
+    private let keychainAccount: String?
 
     /// Create the presentation store. Production callers should omit
     /// `passphrase`; the value is loaded/created in the device-only Keychain.
@@ -38,6 +40,10 @@ public actor SQLiteMessageStore: MessageStoring {
             at: dbPath,
             explicitPassphrase: passphrase
         )
+        self.path = dbPath
+        self.keychainAccount = passphrase == nil
+            ? PresentationDatabaseSecurity.keychainAccount(for: dbPath)
+            : nil
         self.dbQueue = try DatabaseQueue(
             path: dbPath.path,
             configuration: PresentationDatabaseSecurity.configuration(passphrase: canonicalPassphrase)
@@ -56,6 +62,11 @@ public actor SQLiteMessageStore: MessageStoring {
             [.protectionKey: FileProtectionType.complete],
             ofItemAtPath: url.path
         )
+    }
+
+    private func removeIfPresent(_ url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
     }
 
     private static func migrate(_ db: Database) throws {
@@ -595,9 +606,22 @@ public actor SQLiteMessageStore: MessageStoring {
             }
         }
         // Keep the encrypted queue alive for callers that inspect the store
-        // after a wipe. Key/file deletion is handled by the app-level wipe
-        // once this actor is no longer referenced; deleting the key while a
-        // SQLCipher connection is still live can crash the SQLCipher XCFramework.
+        // after a routine wipe. The authoritative logout path uses destroy()
+        // below when it can safely close the connection first.
+    }
+
+    /// Terminal presentation-store wipe used by authoritative logout. The
+    /// actor is not reusable after this method succeeds.
+    public func destroy() async throws {
+        try await clearAllDataChecked()
+        try dbQueue.close()
+        try removeIfPresent(path)
+        try removeIfPresent(URL(fileURLWithPath: path.path + "-wal"))
+        try removeIfPresent(URL(fileURLWithPath: path.path + "-shm"))
+        try removeIfPresent(URL(fileURLWithPath: path.path + "-journal"))
+        if let keychainAccount {
+            try PresentationDatabaseSecurity.deleteKey(account: keychainAccount)
+        }
     }
 }
 

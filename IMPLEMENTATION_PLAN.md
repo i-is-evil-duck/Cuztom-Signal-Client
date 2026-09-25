@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 54/54 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 55/55 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 11/11 passed |
@@ -195,9 +195,10 @@ verified full native key wipe.
 Keychain-backed passphrases. Recognized legacy plaintext stores are migrated
 through validated, atomic SQLCipher exports; unknown/encrypted files and wrong
 keys fail closed. The presentation store uses the managed SQLCipher-enabled
-GRDB fork and Swift 6.1 tooling. Encrypted attachment bodies, full native
-key-material wipe verification, and identity challenge approval remain
-pending.
+GRDB fork and Swift 6.1 tooling, and authoritative logout closes/removes its
+file and database-scoped key after clearing data. Encrypted attachment bodies,
+full native key-material wipe verification, and identity challenge approval
+remain pending.
 
 #### P1-2: Unknown/changed identities are trusted automatically
 
@@ -319,6 +320,8 @@ broader cache work.
 - [x] Move the Swift presentation store to the SQLCipher-enabled GRDB fork;
       add separate Keychain key management, atomic plaintext migration, and
       wrong-key regression coverage.
+- [x] Add a terminal presentation-store destroy path that closes the queue
+      before removing the encrypted file and database-scoped Keychain key.
 - [ ] Block first-seen identities and add a safety-number challenge/approval
       workflow; the pinned Presage store still requires a protocol-layer patch.
 
