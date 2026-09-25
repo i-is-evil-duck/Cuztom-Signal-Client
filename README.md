@@ -10,7 +10,7 @@ virtual audio device.
 > an App Store product; distribution should use a signed/notarized build with
 > appropriate licensing disclosures.
 
-## Current status — 2026-09-24
+## Current status — 2026-09-25
 
 ### Working
 
@@ -21,9 +21,9 @@ virtual audio device.
   group messages.
 - Group conversation routing is canonicalized through
   `contact:<service-id>` / `group:<master-key>` thread IDs.
-- SQLite message/conversation storage with logical message deduplication,
-  startup migration cleanup, unread-count protection, and persistent UUID/path
-  mappings.
+- SQLCipher-encrypted SQLite message/conversation storage with logical message
+  deduplication, startup migration cleanup, unread-count protection, and
+  persistent UUID/path mappings.
 - Friendly contact/group names, group-member profile-key fallback resolution,
   initials, Note to Self/You labeling, and sender-name hints from decrypted
   envelopes.
@@ -57,9 +57,8 @@ virtual audio device.
   roles, and leave-group flows.
 - Full video calling, group video, multi-call handling, CallKit integration,
   and lock-screen call controls.
-- Disappearing-message timers, encrypted SQLite-at-rest, cross-thread message
-  search, backup/restore, notarized DMG/Sparkle distribution, and crash
-  reporting.
+- Disappearing-message timers, cross-thread message search, backup/restore,
+  notarized DMG/Sparkle distribution, and crash reporting.
 - Signal does not sync pre-link history to a newly linked device; history
   accumulates from link time forward.
 
@@ -73,8 +72,8 @@ SwiftUI Views (XcodeApp/Sources)
         -> RustCoreService (dlopen/dlsym)
           -> presage Manager + libsignal + Signal websocket
           -> RingRTC native 1:1 call engine
-      -> MessageStore actor (SQLite/GRDB in production)
-      -> SecretStore (Keychain in production)
+      -> MessageStore actor (SQLCipher/GRDB in production)
+      -> SecretStore (separate native/presentation Keychain keys)
 ```
 
 Important implementation areas:
@@ -84,8 +83,10 @@ Important implementation areas:
 - `rust-core/src/sync.rs` — message normalization, stable timestamps, control
   envelope filtering, attachment metadata, profile/group-member resolution,
   and send helpers.
-- `Sources/CuztomSignalCore/SQLiteMessageStore.swift` — durable message store
-  and startup migration/deduplication.
+- `Sources/CuztomSignalCore/PresentationDatabaseSecurity.swift` — SQLCipher
+  configuration, Keychain key handling, and atomic plaintext migration.
+- `Sources/CuztomSignalCore/SQLiteMessageStore.swift` — durable encrypted
+  message store and startup migration/deduplication.
 - `XcodeApp/Sources/Views.swift` — message list, sender-run chips, media
   rendering, and scrolling.
 - `XcodeApp/Sources/NotificationManager.swift` — local macOS notifications.
@@ -94,7 +95,9 @@ Important implementation areas:
 ## Build and test
 
 Full Xcode is required for the SwiftUI executable and Swift Testing macros.
-The core target can be built with the command-line tools.
+The package uses the SQLCipher-enabled GRDB fork and requires Swift 6.1 /
+Xcode 16.3 or newer on macOS 14+. The core target can be built with the
+command-line tools.
 
 ```bash
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
@@ -112,21 +115,24 @@ PATH="$PWD/scripts:$PATH" cargo build --release
 ```
 
 The checked-in source does not include the local app bundle or user data.
-For a local runnable bundle, copy the built Swift executable and release dylib
-into `CuztomSignal.app/Contents/MacOS/`, then ad-hoc sign the bundle.
+The SQLCipher XCFramework is resolved as a pinned SwiftPM binary dependency and
+must be embedded/signed with the app. For a local runnable bundle, copy the
+built Swift executable and release dylib into `CuztomSignal.app/Contents/MacOS/`,
+then ad-hoc sign the bundle.
 
 ## Verification status
 
 | Area | Status |
 |---|---|
-| Swift core tests | **38 passed** with full Xcode |
-| Rust library tests | **6 passed** |
+| Swift core tests | **54 passed** with full Xcode |
+| Rust library tests | **11 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |
 | QR link/resume | Manually verified |
 | Contacts/groups/name resolution | Manually verified after fresh reset |
 | 1:1/group text routing | Manually verified |
-| Duplicate/control-envelope cleanup | Verified against the local SQLite store |
+| Duplicate/control-envelope cleanup | Verified against the local encrypted SQLite store |
+| Presentation SQLCipher migration | Plaintext export, encrypted reopen, and wrong-key rejection tested |
 | 1:1 native voice call | Manually verified with two-way audio |
 | Group call | Not enabled; blocked on SFU/membership-proof work |
 | 500-message paging | Still needs a dedicated manual test |

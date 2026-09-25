@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 import PackageDescription
 
 let package = Package(
@@ -9,7 +9,7 @@ let package = Package(
         .executable(name: "CuztomSignal", targets: ["CuztomSignalApp"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/groue/GRDB.swift", from: "6.29.0"),
+        .package(url: "https://github.com/sqlcipher/GRDB.swift.git", exact: "7.11.1"),
     ],
     targets: [
         .target(

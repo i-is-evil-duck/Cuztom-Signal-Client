@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 import Testing
 @testable import CuztomSignalCore
 
@@ -120,4 +121,65 @@ import Testing
     let reloadedMsgs = await store2.messages(in: "c1")
     #expect(reloadedMsgs.count == 1)
     #expect(reloadedMsgs.first?.body == "hi")
+}
+
+@Test func sqliteStoreMigratesPlaintextAndRejectsWrongKey() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sqlite-encryption-test-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let dbURL = directory.appendingPathComponent("messages.sqlite")
+
+    let plaintext = try DatabaseQueue(path: dbURL.path)
+    try await plaintext.write { db in
+        try db.create(table: "conversations") { table in
+            table.column("id", .text).primaryKey()
+            table.column("title", .text).notNull()
+            table.column("peer_json", .text).notNull()
+            table.column("lastMessagePreview", .text)
+            table.column("lastActiveAt", .double).notNull()
+            table.column("unreadCount", .integer).notNull().defaults(to: 0)
+        }
+        try db.create(table: "messages") { table in
+            table.column("id", .text).primaryKey()
+            table.column("conversationId", .text).notNull()
+            table.column("author_json", .text).notNull()
+            table.column("body", .text).notNull()
+            table.column("direction", .text).notNull()
+            table.column("status", .text).notNull()
+            table.column("sentAt", .double).notNull()
+            table.column("attachments_json", .text).notNull()
+            table.column("reply_json", .text)
+            table.column("storeTs", .integer)
+            table.column("reactions_json", .text).notNull()
+            table.column("readBy_json", .text).notNull()
+            table.column("deliveredTo_json", .text).notNull()
+        }
+        try db.execute(sql: "INSERT INTO conversations VALUES ('c1', 'Peer', '{}', NULL, 1, 0)")
+    }
+    try plaintext.close()
+
+    _ = try SQLiteMessageStore(path: directory, passphrase: "correct-key")
+    let header = try Data(contentsOf: dbURL).prefix(16)
+    #expect(Data(header) != Data([0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00]))
+
+    let encryptedReader = try DatabaseQueue(
+        path: dbURL.path,
+        configuration: PresentationDatabaseSecurity.configuration(passphrase: "correct-key")
+    )
+    let cipherVersion = try await encryptedReader.read { db in
+        try String.fetchOne(db, sql: "PRAGMA cipher_version")
+    }
+    #expect(cipherVersion?.isEmpty == false)
+    try encryptedReader.close()
+
+    let reopened = try SQLiteMessageStore(path: directory, passphrase: "correct-key")
+    let reopenedConversations = await reopened.allConversations()
+    #expect(reopenedConversations.count == 1)
+    do {
+        _ = try SQLiteMessageStore(path: directory, passphrase: "wrong-key")
+        Issue.record("expected wrong presentation passphrase to fail")
+    } catch {
+        // Expected: SQLCipher refuses the file rather than falling back.
+    }
 }

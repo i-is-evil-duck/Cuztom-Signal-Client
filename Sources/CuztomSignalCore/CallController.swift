@@ -135,11 +135,18 @@ public final class CallController: ObservableObject {
     /// keep the call visible briefly and let the native terminal state win if
     /// the hangup was real.
     private var pendingRemoteEndReasons: [UInt64: CallEndReason] = [:]
+    /// Prevents two rapid UI taps from both entering the asynchronous
+    /// microphone-permission/start path.
+    private var startCallInFlight = false
+    /// Invalidates callbacks and in-flight starts across configure/reset.
+    private var callLifecycleGeneration = 0
 
     private init() {}
 
     public func configure(with service: any SignalService, transport: any CallSignalTransport) {
         _ = transport // retained in the signature for existing integrations
+        callLifecycleGeneration += 1
+        startCallInFlight = false
         signalTask?.cancel()
         signalTask = nil
         rustCore?.onCallSignal = nil
@@ -149,14 +156,17 @@ public final class CallController: ObservableObject {
             return
         }
         rustCore = rust
+        let callbackGeneration = callLifecycleGeneration
         rust.onCallSignal = { [weak self] signal in
             Task { @MainActor [weak self] in
-                self?.receive(signal)
+                guard let self, self.callLifecycleGeneration == callbackGeneration else { return }
+                self.receive(signal)
             }
         }
         rust.onCallState = { [weak self] event in
             Task { @MainActor [weak self] in
-                self?.receive(event)
+                guard let self, self.callLifecycleGeneration == callbackGeneration else { return }
+                self.receive(event)
             }
         }
     }
@@ -167,9 +177,16 @@ public final class CallController: ObservableObject {
         mediaType: CallMediaType,
         peer: SignalAddress
     ) async throws -> ActiveCall {
-        guard activeCall == nil else { throw CallError.alreadyInCall }
+        guard !startCallInFlight, activeCall == nil else { throw CallError.alreadyInCall }
+        startCallInFlight = true
+        let startGeneration = callLifecycleGeneration
+        defer { startCallInFlight = false }
         try await ensureMicrophonePermission()
+        guard startGeneration == callLifecycleGeneration else {
+            throw CallError.signalingFailed("call start cancelled")
+        }
         guard let rust = rustCore else { throw CallError.signalingFailed("call core unavailable") }
+        guard activeCall == nil else { throw CallError.alreadyInCall }
         guard !peer.isGroup else { throw CallError.signalingFailed("group calls are not supported") }
 
         let record = CallRecord(
@@ -329,6 +346,8 @@ public final class CallController: ObservableObject {
 
     /// Clear UI/call identity state when the Signal session is logged out.
     public func reset() {
+        callLifecycleGeneration += 1
+        startCallInFlight = false
         if let rust = rustCore {
             Task { try? await rust.setCallMuted(false) }
         }

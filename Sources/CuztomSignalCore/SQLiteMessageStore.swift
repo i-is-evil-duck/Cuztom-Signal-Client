@@ -1,7 +1,8 @@
 import Foundation
 import GRDB
 
-/// SQLite-backed MessageStore using GRDB. Implements `MessageStoring`
+/// SQLCipher-encrypted SQLite-backed MessageStore using GRDB. Implements
+/// `MessageStoring`
 /// so it can replace `InMemoryMessageStore` without touching the controller.
 ///
 /// Schema:
@@ -13,9 +14,12 @@ import GRDB
 /// Indexes on messages(conversationId, sentAt) for paging.
 public actor SQLiteMessageStore: MessageStoring {
     private let dbQueue: DatabaseQueue
-    private let path: URL
 
-    public init(path: URL? = nil) throws {
+    /// Create the presentation store. Production callers should omit
+    /// `passphrase`; the value is loaded/created in the device-only Keychain.
+    /// An explicit passphrase is intended for isolated tests and migration
+    /// tooling.
+    public init(path: URL? = nil, passphrase: String? = nil) throws {
         let base: URL
         if let path = path {
             base = path
@@ -30,8 +34,14 @@ public actor SQLiteMessageStore: MessageStoring {
             ofItemAtPath: base.path
         )
         let dbPath = base.appendingPathComponent("messages.sqlite")
-        self.path = dbPath
-        self.dbQueue = try DatabaseQueue(path: dbPath.path)
+        let canonicalPassphrase = try PresentationDatabaseSecurity.prepareDatabase(
+            at: dbPath,
+            explicitPassphrase: passphrase
+        )
+        self.dbQueue = try DatabaseQueue(
+            path: dbPath.path,
+            configuration: PresentationDatabaseSecurity.configuration(passphrase: canonicalPassphrase)
+        )
         try dbQueue.write { db in
             try Self.migrate(db)
         }
@@ -584,6 +594,10 @@ public actor SQLiteMessageStore: MessageStoring {
                 throw SignalError.storage("presentation store wipe verification failed")
             }
         }
+        // Keep the encrypted queue alive for callers that inspect the store
+        // after a wipe. Key/file deletion is handled by the app-level wipe
+        // once this actor is no longer referenced; deleting the key while a
+        // SQLCipher connection is still live can crash the SQLCipher XCFramework.
     }
 }
 

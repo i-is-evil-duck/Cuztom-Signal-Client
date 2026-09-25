@@ -47,6 +47,10 @@ struct AppleEmojiCatcher: NSViewRepresentable {
             self.onPick = onPick
         }
 
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
         @objc func changed(_ note: Notification) {
             guard let field = note.object as? NSTextField else { return }
             let picked = field.stringValue

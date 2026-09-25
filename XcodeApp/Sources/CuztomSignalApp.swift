@@ -239,8 +239,13 @@ final class ChatViewModel {
             store = try SQLiteMessageStore()
             Log.info("SQLiteMessageStore initialized")
         } catch {
-            Log.error("SQLiteMessageStore init failed, falling back to in-memory: \(error)")
-            store = InMemoryMessageStore()
+            // A missing/wrong presentation key is a security/recovery error;
+            // silently falling back to memory would hide data loss and make
+            // logout/relink behavior diverge from production persistence.
+            Log.error("SQLiteMessageStore init failed: \(error)")
+            errorMessage = "Presentation database unavailable: \(error.localizedDescription)"
+            phase = .failed
+            return
         }
         let controller = ChatController(service: live, store: store, pluginHost: plugins)
         self.controller = controller
@@ -255,8 +260,14 @@ final class ChatViewModel {
         // call can arrive immediately after the linked session resumes.
         callController.onIncomingCallChanged = { [weak self] call in
             guard let self else { return }
+            let previousIncoming = self.incomingCall
             let wasActive = self.activeCall != nil
             self.incomingCall = wasActive ? nil : call
+            if call == nil, let previousIncoming {
+                NotificationManager.shared.cancelIncomingCall(
+                    identifier: previousIncoming.callRecord.id.uuidString
+                )
+            }
             if let call, !wasActive, self.activeCall == nil,
                self.notifiedCallIDs.insert(call.callRecord.id).inserted {
                 let peer = call.callRecord.remotePeer

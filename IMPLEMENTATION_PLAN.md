@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 53/53 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 54/54 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 11/11 passed |
@@ -191,12 +191,12 @@ identity/master/account key material from the underlying store.
 Keychain with `ThisDeviceOnly` accessibility, protect cache files, and add a
 verified full native key wipe.
 
-**Status:** The native store now opens through SQLCipher using a 32-byte
-Keychain-backed passphrase, and recognized legacy plaintext stores are migrated
-through a validated, atomic SQLCipher export. Native identity changes use
-`OnNewIdentity::Reject`; unknown-identity TOFU behavior and a safety-number
-approval workflow remain pending upstream work. Swift presentation SQLite,
-full key-material wipe verification, and encrypted attachment bodies remain
+**Status:** Both native and presentation stores now use SQLCipher with separate
+Keychain-backed passphrases. Recognized legacy plaintext stores are migrated
+through validated, atomic SQLCipher exports; unknown/encrypted files and wrong
+keys fail closed. The presentation store uses the managed SQLCipher-enabled
+GRDB fork and Swift 6.1 tooling. Encrypted attachment bodies, full native
+key-material wipe verification, and identity challenge approval remain
 pending.
 
 #### P1-2: Unknown/changed identities are trusted automatically
@@ -316,6 +316,9 @@ broader cache work.
       device-only Keychain accessibility for secrets.
 - [x] Add ABI-v2 `core_cmd_init_encrypted`, strict Keychain key loading, and
       validated SQLCipher migration for recognized legacy native stores.
+- [x] Move the Swift presentation store to the SQLCipher-enabled GRDB fork;
+      add separate Keychain key management, atomic plaintext migration, and
+      wrong-key regression coverage.
 - [ ] Block first-seen identities and add a safety-number challenge/approval
       workflow; the pinned Presage store still requires a protocol-layer patch.
 
@@ -338,13 +341,14 @@ broader cache work.
 - Call mute can update the UI even if the native call fails.
 - Speaker and video toggles are currently cosmetic.
 - Call answer state can be overwritten by the view model.
-- Two rapid Call taps can start duplicate native calls while microphone
-  permission is pending.
-- Remote call termination can leave a delivered call notification.
+- [x] Guard rapid outgoing-call taps while microphone permission/native start
+      is pending, and invalidate stale call callbacks across reset/configure.
+- [x] Cancel delivered incoming-call notifications when the remote call ends
+      or the incoming overlay is dismissed.
 - Queued RingRTC signals have no account generation and can cross a
   logout/relink boundary.
-- The Character Viewer integration uses a private AppKit selector and leaks
-  its observer.
+- [x] Remove the Character Viewer observer when its coordinator deallocates;
+      the private selector remains an explicit compatibility limitation.
 - QR expiration is not displayed or enforced.
 - Negative paging limits can trap.
 - SQLite schema migration is not versioned.
@@ -367,8 +371,8 @@ changing behavior.
 - [x] Commit `Package.resolved`.
 - [x] Commit `rust-core/Cargo.lock`.
 - [x] Pin `presage` and `ringrtc` Git revisions/tags.
-- [x] Add `rust-toolchain.toml` and document the supported Xcode/macOS/Rust
-      versions.
+- [x] Add `rust-toolchain.toml` and document the supported Swift 6.1 /
+      Xcode 16.3+ / macOS 14+ / Rust versions.
 - [x] Add a macOS CI workflow for full-Xcode Swift tests/builds and native
       Rust tests/checks/builds.
 - [ ] Add strict `cargo fmt` and Clippy gates once the current warning/toolchain
@@ -472,8 +476,8 @@ or task from account A can update account B.
       Swift store hydration.
 - [x] Preserve PNI service IDs in quote paths.
 - [ ] Preserve PNI service IDs in contact, reaction, receipt, and edit paths.
-- [ ] Include thread and stable sender identity in receipt events/models.
-- [ ] Persist manually downloaded attachment paths through the account-scoped
+- [x] Include thread and stable sender identity in receipt events/models.
+- [x] Persist manually downloaded attachment paths through the account-scoped
       path cache.
 - [x] Attach GroupsV2 context/revision to all group control messages.
 - [x] Validate group IDs before native calls.
@@ -496,11 +500,11 @@ without crashing the worker.
 
 **Goal:** Make local data and native loading safe for real users.
 
-- [ ] Add encrypted SQLite support and Keychain-backed passphrase storage.
-- [ ] Migrate existing plaintext databases with a tested migration path.
+- [x] Add encrypted SQLite support and Keychain-backed passphrase storage.
+- [x] Migrate existing plaintext databases with a tested migration path.
 - [ ] Add identity-change verification/safety-number UI.
-- [ ] Bundle and sign the native dylib; remove user-writable search paths.
-- [ ] Verify native code signature/hash and ABI version before `dlopen()`.
+- [x] Bundle and sign the native dylib; remove user-writable search paths.
+- [x] Verify native code signature/hash and ABI version before `dlopen()`.
 - [x] Add notification preview redaction with an explicit opt-in setting.
 - [x] Redact identifiers/paths, cap diagnostic logs, and clear them after a
       successful account wipe.
