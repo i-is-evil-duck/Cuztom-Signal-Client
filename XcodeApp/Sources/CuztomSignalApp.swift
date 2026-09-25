@@ -101,15 +101,67 @@ final class ChatViewModel {
     var diagnosticsText = ""
     var historyExhausted = false
     var preview: PreviewItem?
-    var replyingTo: ChatMessage?
     var receiptTarget: ChatMessage?
     var emojiTarget: ChatMessage?
     var showCallsSoon = false
-    var sendingAttachment = false
-    /// Files staged via paperclip / drop / paste, sent on Send.
-    var pendingFiles: [URL] = []
-    /// Last failed-action message (send/attachment/react/delete).
-    var sendError: String?
+
+    /// Composer state is keyed by conversation so switching chats never sends
+    /// a draft, reply, or staged file to the newly selected peer.
+    var draft: String {
+        get {
+            guard let selectedId else { return "" }
+            return draftsByConversation[selectedId] ?? ""
+        }
+        set {
+            guard let selectedId else { return }
+            draftsByConversation[selectedId] = newValue
+        }
+    }
+
+    var replyingTo: ChatMessage? {
+        get {
+            guard let selectedId else { return nil }
+            return repliesByConversation[selectedId]
+        }
+        set {
+            guard let selectedId else { return }
+            repliesByConversation[selectedId] = newValue
+        }
+    }
+
+    var pendingFiles: [URL] {
+        get {
+            guard let selectedId else { return [] }
+            return pendingFilesByConversation[selectedId] ?? []
+        }
+        set {
+            guard let selectedId else { return }
+            pendingFilesByConversation[selectedId] = newValue
+        }
+    }
+
+    var sendingAttachment: Bool {
+        get {
+            guard let selectedId else { return false }
+            return sendingAttachmentByConversation[selectedId] ?? false
+        }
+        set {
+            guard let selectedId else { return }
+            sendingAttachmentByConversation[selectedId] = newValue
+        }
+    }
+
+    var sendError: String? {
+        get {
+            guard let selectedId else { return nil }
+            return sendErrorsByConversation[selectedId]
+        }
+        set {
+            guard let selectedId else { return }
+            sendErrorsByConversation[selectedId] = newValue
+        }
+    }
+    var isLoggingOut = false
 
     // Read receipts settings
     var sendReadReceipts = true
@@ -120,10 +172,15 @@ final class ChatViewModel {
     var activeCall: ActiveCall?
 
     // Typing indicator state
-    var typingUsers: [String: (String, Bool)] = [:] // thread -> (sender, isTyping)
+    var typingUsers: [String: [String: (String, Bool)]] = [:] // thread -> sender ID -> (name, isTyping)
 
     // Cached own ACI for name resolution
     private var cachedSelfAci: String?
+    private var draftsByConversation: [String: String] = [:]
+    private var repliesByConversation: [String: ChatMessage] = [:]
+    private var pendingFilesByConversation: [String: [URL]] = [:]
+    private var sendingAttachmentByConversation: [String: Bool] = [:]
+    private var sendErrorsByConversation: [String: String] = [:]
     // Guards against an older async selection completing after a newer click.
     private var selectionGeneration = 0
     private var selectionInProgress = false
@@ -131,6 +188,7 @@ final class ChatViewModel {
     // being restored. Only one service/controller may be started at a time.
     private var starting = false
     private var notifiedCallIDs: Set<UUID> = []
+    private var diagnosticsTask: Task<Void, Never>?
 
     var notificationsEnabled: Bool = NotificationManager.shared.enabled {
         didSet {
@@ -171,7 +229,7 @@ final class ChatViewModel {
         let controller = ChatController(service: live, store: store, pluginHost: plugins)
         self.controller = controller
         self.liveService = live
-        controller.onRosterChanged = { [weak self] in
+        controller.onStateChange = { [weak self] in
             self?.sync()
         }
         controller.onIncomingMessage = { [weak self] message in
@@ -206,12 +264,19 @@ final class ChatViewModel {
         }
         callController.configure(with: live, transport: live)
         // Wire typing indicator callback to update ViewModel state
-        controller.onTypingUpdate = { [weak self] thread, sender, started in
+        controller.onTypingUpdateWithID = { [weak self] thread, senderID, senderName, started in
             Task { @MainActor in
+                guard let self else { return }
+                var users = self.typingUsers[thread] ?? [:]
                 if started {
-                    self?.typingUsers[thread] = (sender, true)
+                    users[senderID] = (senderName, true)
                 } else {
-                    self?.typingUsers.removeValue(forKey: thread)
+                    users.removeValue(forKey: senderID)
+                }
+                if users.isEmpty {
+                    self.typingUsers.removeValue(forKey: thread)
+                } else {
+                    self.typingUsers[thread] = users
                 }
             }
         }
@@ -245,6 +310,15 @@ final class ChatViewModel {
         selectedId = id
         messages = []
         historyExhausted = false
+        // These are intentionally transient, unlike the composer cache. A
+        // sheet/popover from the previous conversation must not cover the new
+        // one or retain an action target after the selection changes.
+        preview = nil
+        receiptTarget = nil
+        emojiTarget = nil
+        editingMessage = nil
+        editDraft = ""
+        sendErrorsByConversation[id] = nil
         Task { [weak self] in
             guard let self, let controller = self.controller else { return }
             await controller.select(id)
@@ -264,50 +338,102 @@ final class ChatViewModel {
         guard let controller else { return }
         let targetID = requestedID ?? selectedId
         guard let targetID else { return }
-        sendError = nil
+
+        // Snapshot all composer state by target. An upload may outlive the
+        // selection change; completion must update the old conversation's
+        // cache, never the newly visible one.
+        sendErrorsByConversation[targetID] = nil
         if body.hasPrefix("/") {
-            await controller.sendOrCommand(body, plugins: plugins, ctx: pluginCtx())
+            await controller.sendOrCommand(
+                body,
+                plugins: plugins,
+                ctx: pluginCtx(selectedThread: targetID),
+                to: targetID
+            )
+            sendErrorsByConversation[targetID] = controller.lastError
             sync()
             return
         }
-        if !pendingFiles.isEmpty {
-            sendingAttachment = true
-            let files = pendingFiles
-            pendingFiles = []
-            replyingTo = nil
-            var first = true
-            for url in files {
-                let caption = first ? body : ""
-                first = false
-                await controller.sendAttachment(fileURL: url, caption: caption, to: targetID)
+
+        let files = pendingFilesByConversation[targetID] ?? []
+        let quote = repliesByConversation[targetID]
+        if !files.isEmpty {
+            sendingAttachmentByConversation[targetID] = true
+            var remaining: [URL] = []
+            var firstFile = true
+            var replyWasSent = false
+
+            // The native attachment command does not carry a quote yet. If a
+            // text reply is present, send it first rather than silently
+            // dropping the quote; subsequent files remain ordinary uploads.
+            if let quote, !body.isEmpty {
+                await controller.sendReply(body: body, to: targetID, quote: quote)
+                if controller.lastError == nil {
+                    replyWasSent = true
+                    repliesByConversation[targetID] = nil
+                }
             }
-            sendingAttachment = false
-            sendError = controller.lastError
+
+            if replyWasSent || quote == nil {
+                for url in files {
+                    let caption = firstFile && !replyWasSent ? body : ""
+                    firstFile = false
+                    if await controller.sendAttachment(fileURL: url, caption: caption, to: targetID) {
+                        try? FileManager.default.removeItem(at: url)
+                    } else {
+                        remaining.append(url)
+                    }
+                }
+            } else {
+                remaining = files
+                sendErrorsByConversation[targetID] = "A reply with only attachments is not supported yet"
+            }
+
+            pendingFilesByConversation[targetID] = remaining
+            sendingAttachmentByConversation[targetID] = false
+            if controller.lastError != nil {
+                sendErrorsByConversation[targetID] = controller.lastError
+            }
+            if remaining.isEmpty {
+                repliesByConversation[targetID] = nil
+                try? FileManager.default.removeItem(at: pendingDir(for: targetID))
+            }
             sync()
-            try? FileManager.default.removeItem(at: pendingDir())
             return
         }
-        if let quote = replyingTo {
-            replyingTo = nil
+
+        if let quote {
             await controller.sendReply(body: body, to: targetID, quote: quote)
-            sendError = controller.lastError
+            sendErrorsByConversation[targetID] = controller.lastError
+            if controller.lastError == nil {
+                repliesByConversation[targetID] = nil
+            }
             sync()
             return
         }
+
         await controller.send(body, to: targetID)
-        sendError = controller.lastError
+        sendErrorsByConversation[targetID] = controller.lastError
         sync()
     }
 
     func react(message: ChatMessage, emoji: String) async {
-        await controller?.react(messageId: message.id, emoji: emoji)
-        sendError = controller?.lastError
+        guard let controller else { return }
+        sendErrorsByConversation[message.conversationId] = nil
+        let succeeded = await controller.react(messageId: message.id, emoji: emoji)
+        if !succeeded {
+            sendErrorsByConversation[message.conversationId] = controller.lastError ?? "Reaction failed"
+        }
         sync()
     }
 
     func deleteMessage(_ message: ChatMessage, forEveryone: Bool) async {
-        await controller?.deleteMessage(id: message.id, forEveryone: forEveryone)
-        sendError = controller?.lastError
+        guard let controller else { return }
+        sendErrorsByConversation[message.conversationId] = nil
+        let succeeded = await controller.deleteMessage(id: message.id, forEveryone: forEveryone)
+        if !succeeded {
+            sendErrorsByConversation[message.conversationId] = controller.lastError ?? "Delete failed"
+        }
         sync()
     }
 
@@ -317,7 +443,7 @@ final class ChatViewModel {
 
     func editMessage(_ message: ChatMessage) async {
         guard message.direction == .outgoing,
-              let id = selectedId else { return }
+              selectedId != nil else { return }
         // Present edit sheet with current body
         editingMessage = message
         editDraft = message.body
@@ -327,12 +453,16 @@ final class ChatViewModel {
     func confirmEdit() async {
         guard let msg = editingMessage,
               let id = selectedId else { return }
-        do {
-            try await controller?.sendMessageEdit(thread: id, targetTs: msg.storeTs ?? 0, newBody: editDraft)
+        let sentTs = await controller?.sendMessageEdit(
+            thread: id,
+            targetTs: msg.storeTs ?? 0,
+            newBody: editDraft
+        ) ?? -1
+        if sentTs < 0 {
+            sendError = controller?.lastError ?? "Edit failed"
+        } else {
             editingMessage = nil
             editDraft = ""
-        } catch {
-            sendError = "Edit failed: \(error.localizedDescription)"
         }
         sync()
     }
@@ -344,11 +474,23 @@ final class ChatViewModel {
     }
 
     /// Apply a live typing indicator
-    func applyTyping(thread: String, senderName: String, started: Bool) {
+    func applyTyping(
+        thread: String,
+        senderName: String,
+        started: Bool,
+        senderID: String? = nil
+    ) {
+        let key = senderID ?? senderName
+        var users = typingUsers[thread] ?? [:]
         if started {
-            typingUsers[thread] = (senderName, true)
+            users[key] = (senderName, true)
         } else {
+            users.removeValue(forKey: key)
+        }
+        if users.isEmpty {
             typingUsers.removeValue(forKey: thread)
+        } else {
+            typingUsers[thread] = users
         }
     }
 
@@ -428,18 +570,20 @@ func sendTyping(started: Bool) async {
         }
     }
 
-    func sendAttachment(url: URL, caption: String) async {
-        sendingAttachment = true
-        sendError = nil
-        await controller?.sendAttachment(fileURL: url, caption: caption)
-        sendError = controller?.lastError
-        sendingAttachment = false
+    func sendAttachment(url: URL, caption: String, to requestedID: String? = nil) async {
+        guard let controller, let targetID = requestedID ?? selectedId else { return }
+        sendingAttachmentByConversation[targetID] = true
+        sendErrorsByConversation[targetID] = nil
+        _ = await controller.sendAttachment(fileURL: url, caption: caption, to: targetID)
+        sendErrorsByConversation[targetID] = controller.lastError
+        sendingAttachmentByConversation[targetID] = false
         sync()
     }
 
-    /// Stage dropped/pasted files (copied into Caches/pending).
+    /// Stage dropped/pasted files (copied into a conversation-scoped cache).
     func stageFiles(_ urls: [URL]) {
-        let dir = pendingDir()
+        guard let conversationID = selectedId else { return }
+        let dir = pendingDir(for: conversationID)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var staged = 0
         for url in urls {
@@ -447,47 +591,91 @@ func sendTyping(started: Bool) async {
             // this the copy fails silently with a permission error.
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            let dest = dir.appendingPathComponent(url.lastPathComponent)
-            try? FileManager.default.removeItem(at: dest)
-            if (try? FileManager.default.copyItem(at: url, to: dest)) != nil {
-                if !pendingFiles.contains(dest) { pendingFiles.append(dest) }
-                staged += 1
+
+            // Avoid copying a file onto itself when a paste/drop points into
+            // our own cache. The suffix also prevents same-basename files in
+            // one chat from replacing each other.
+            let sourceName = url.lastPathComponent.isEmpty ? "attachment" : url.lastPathComponent
+            let dest: URL
+            if url.standardizedFileURL == dir.appendingPathComponent(sourceName).standardizedFileURL {
+                dest = url
             } else {
-                Log.error("stage failed: \(url.lastPathComponent)")
+                let sourceURL = URL(fileURLWithPath: sourceName)
+                let stem = sourceURL.deletingPathExtension().lastPathComponent
+                let ext = sourceURL.pathExtension
+                let suffix = UUID().uuidString.prefix(8)
+                let filename = ext.isEmpty ? "\(stem)-\(suffix)" : "\(stem)-\(suffix).\(ext)"
+                dest = dir.appendingPathComponent(filename)
+                try? FileManager.default.removeItem(at: dest)
+                guard (try? FileManager.default.copyItem(at: url, to: dest)) != nil else {
+                    Log.error("stage failed: \(url.lastPathComponent)")
+                    continue
+                }
             }
+
+            var files = pendingFilesByConversation[conversationID] ?? []
+            if !files.contains(dest) {
+                files.append(dest)
+                pendingFilesByConversation[conversationID] = files
+            }
+            staged += 1
         }
-        Log.info("staged \(staged)/\(urls.count) files")
+        Log.info("staged \(staged)/\(urls.count) files for \(conversationID)")
     }
 
     /// Paste images/files from the clipboard into the pending tray.
     func pasteBoard() {
+        guard let conversationID = selectedId else { return }
         let pb = NSPasteboard.general
         var urls: [URL] = []
         if let objects = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
             urls.append(contentsOf: objects.filter { $0.isFileURL })
         }
         if urls.isEmpty, let tiff = pb.data(forType: .tiff), let img = NSImage(data: tiff) {
-            let dest = pendingDir().appendingPathComponent("paste-\(Int(Date().timeIntervalSince1970)).png")
-            try? FileManager.default.createDirectory(at: pendingDir(), withIntermediateDirectories: true)
+            let dir = pendingDir(for: conversationID)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dest = dir.appendingPathComponent("paste-\(UUID().uuidString.prefix(8)).png")
             if let rep = img.tiffRepresentation,
                let png = NSBitmapImageRep(data: rep)?.representation(using: .png, properties: [:]) {
                 try? png.write(to: dest)
-                urls.append(dest)
+                var files = pendingFilesByConversation[conversationID] ?? []
+                files.append(dest)
+                pendingFilesByConversation[conversationID] = files
             }
         }
         if !urls.isEmpty { stageFiles(urls) }
     }
 
+    func removePendingFile(_ url: URL) {
+        guard let conversationID = selectedId else { return }
+        pendingFilesByConversation[conversationID]?.removeAll { $0 == url }
+        try? FileManager.default.removeItem(at: url)
+    }
+
     private func pendingDir() -> URL {
         let base = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)) ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("CuztomSignal/pending")
+        return base.appendingPathComponent("CuztomSignal/pending", isDirectory: true)
+    }
+
+    private func pendingDir(for conversationID: String) -> URL {
+        let encoded = conversationID.addingPercentEncoding(withAllowedCharacters: .alphanumerics)
+            ?? UUID().uuidString
+        return pendingDir().appendingPathComponent(encoded, isDirectory: true)
     }
 
     func loadMore() async {
         guard let controller else { return }
-        historyExhausted = false
-        let grew = await controller.loadMore()
-        if !grew { historyExhausted = true }
+        switch await controller.loadMoreResult() {
+        case .loaded:
+            historyExhausted = false
+        case .exhausted:
+            historyExhausted = true
+        case .failed(let message):
+            historyExhausted = false
+            sendError = message
+        case .cancelled:
+            break
+        }
         sync()
     }
 
@@ -498,13 +686,18 @@ func sendTyping(started: Bool) async {
 
     private let plugins = PluginHost(plugins: [InfoPlugin()])
 
-    private func pluginCtx() -> PluginContext {
+    private func pluginCtx(selectedThread: String? = nil) -> PluginContext {
         // `controller`/`liveService` are Sendable; safe to capture.
         let c = controller
         let live = liveService
+        let capturedThread = selectedThread
         return PluginContext(
             conversations: { await c?.conversations ?? [] },
-            selectedThread: { await c?.selectedId },
+            selectedThread: {
+                if let capturedThread { return capturedThread }
+                guard let c else { return nil }
+                return await c.selectedId
+            },
             recentMessages: { id, n in await c?.messages(in: id, limit: n) ?? [] },
             diagnostics: { await c?.diagnostics() ?? "not started" },
             account: {
@@ -540,28 +733,45 @@ func sendTyping(started: Bool) async {
     }
 
     func logout() async {
-        guard let c = controller else { return }
+        guard !isLoggingOut, let c = controller else { return }
+        isLoggingOut = true
+        defer { isLoggingOut = false }
+        diagnosticsTask?.cancel()
         callController.reset()
         notifiedCallIDs.removeAll()
         NotificationManager.shared.cancelAll()
-        // Clear all data from Rust core (DB, caches, keychain). This performs
-        // the service logout itself; do not issue a second logout afterward.
-        if let live = liveService {
-            do {
-                try await live.clearAllData()
-            } catch {
-                Log.error("service data wipe failed: \(error)")
-            }
+
+        // The controller owns one authoritative, throwing wipe. It does not
+        // start a replacement account if the native or presentation wipe fails.
+        do {
+            try await c.logoutAndWipe()
+        } catch {
+            let message = "Logout failed: \(error.localizedDescription)"
+            Log.error("logout/data wipe failed: \(error)")
+            errorMessage = message
+            sendError = message
+            phase = .failed
+            return
         }
-        // Clear the Swift-side store/controller after the service wipe.
-        await c.resetAfterServiceLogout()
+
+        // The controller has already cleared the Swift-side store.
         liveService = nil
         cachedSelfAci = nil
+        draftsByConversation.removeAll()
+        repliesByConversation.removeAll()
+        pendingFilesByConversation.removeAll()
+        sendingAttachmentByConversation.removeAll()
+        sendErrorsByConversation.removeAll()
+        editingMessage = nil
+        editDraft = ""
+        preview = nil
+        typingUsers.removeAll()
         selectionGeneration += 1
         selectionInProgress = false
         selectedId = nil
+        try? FileManager.default.removeItem(at: pendingDir())
         sync()
-        // Back to a fresh QR.
+        // Back to a fresh QR only after the native wipe succeeded.
         phase = .starting
         await start()
     }
@@ -673,15 +883,19 @@ func sendTyping(started: Bool) async {
         isLinked = controller.isLinked
         syncNote = controller.lastSyncNote ?? "none"
         errorMessage = phase == .failed ? errorMessage : controller.lastError
-        Task {
-            connectionText = String(describing: controller.connection)
-            diagnosticsText = await controller.diagnostics()
-            if let live = liveService,
+        diagnosticsTask?.cancel()
+        diagnosticsTask = Task { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            self.connectionText = String(describing: controller.connection)
+            self.diagnosticsText = await controller.diagnostics()
+            guard !Task.isCancelled else { return }
+            if let live = self.liveService,
                let me = try? await live.whoami() {
-                let friendlyName = (try? await live.profileName(uuid: me.aci))
+                let friendlyName = (await live.profileName(uuid: me.aci))
                     .flatMap { $0.isEmpty ? nil : $0 } ?? "You"
-                accountLine = "\(me.number) · \(friendlyName)"
-                cachedSelfAci = me.aci
+                guard !Task.isCancelled else { return }
+                self.accountLine = "\(me.number) · \(friendlyName)"
+                self.cachedSelfAci = me.aci
             }
         }
     }

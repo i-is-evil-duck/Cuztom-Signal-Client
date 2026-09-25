@@ -72,8 +72,47 @@ fn content_store_timestamp(content: &Content) -> u64 {
     content.metadata.client_timestamp.timestamp_millis().max(0) as u64
 }
 
-fn has_chat_content(body: &str, attachments: &[AttachmentPointer]) -> bool {
-    !body.is_empty() || !attachments.is_empty()
+fn has_chat_content(body: &str, attachments: &[AttachmentPointer], has_quote: bool) -> bool {
+    !body.is_empty() || !attachments.is_empty() || has_quote
+}
+
+fn group_key_from_content(content: &Content) -> Option<&[u8]> {
+    match &content.body {
+        ContentBody::DataMessage(message) => message
+            .group_v2
+            .as_ref()
+            .and_then(|group| group.master_key.as_deref()),
+        ContentBody::EditMessage(edit) => edit.data_message.as_ref()?.group_v2.as_ref()?.master_key.as_deref(),
+        ContentBody::SynchronizeMessage(sync) => {
+            let sent = match &sync.content {
+                Some(SyncContent::Sent(sent)) => sent,
+                _ => return None,
+            };
+            sent.message
+                .as_ref()
+                .and_then(|message| message.group_v2.as_ref())
+                .and_then(|group| group.master_key.as_deref())
+                .or_else(|| {
+                    sent.edit_message
+                        .as_ref()
+                        .and_then(|edit| edit.data_message.as_ref())
+                        .and_then(|message| message.group_v2.as_ref())
+                        .and_then(|group| group.master_key.as_deref())
+                })
+        }
+        _ => None,
+    }
+}
+
+/// `presage::store::Thread::try_from` panics on a malformed group key in
+/// one group-edit branch. Validate group context before delegating so hostile
+/// wire data becomes a dropped/error event, never a worker panic.
+fn safe_thread_of_content(content: &Content) -> Option<Thread> {
+    if let Some(key) = group_key_from_content(content) {
+        let key: [u8; 32] = key.try_into().ok()?;
+        return Some(Thread::Group(key));
+    }
+    Thread::try_from(content).ok()
 }
 
 /// Convert one decrypted `Content` into a wire message plus its raw
@@ -93,7 +132,7 @@ pub fn content_parts(
             let body = m.body.clone().unwrap_or_default();
             let outgoing = sender == self_aci;
             // Canonical thread derivation (group via master key, else 1:1).
-            let thread = Thread::try_from(content).ok()?;
+            let thread = safe_thread_of_content(content)?;
             let thread_id = match &thread {
                 Thread::Contact(sid) => {
                     // Outgoing envelope from this device: thread by recipient.
@@ -106,29 +145,48 @@ pub fn content_parts(
                 Thread::Group(key) => format!("group:{}", hex::encode(key)),
             };
             let pointers = m.attachments.clone();
-            if !has_chat_content(&body, &pointers) {
+            if !has_chat_content(&body, &pointers, m.quote.is_some()) {
                 return None;
             }
-            Some((message_json(&thread_id, &sender, names, &body, ts, outgoing, &pointers, store_ts), pointers))
+            Some((message_json(
+                &thread_id,
+                &sender,
+                names,
+                &body,
+                ts,
+                outgoing,
+                &pointers,
+                store_ts,
+                m.quote.as_ref(),
+            ), pointers))
         }
         ContentBody::SynchronizeMessage(s) => {
-            let (body, pointers) = match &s.content {
+            let (body, pointers, quote) = match &s.content {
                 Some(SyncContent::Sent(sent)) => (
                     sent.message.as_ref().and_then(|m| m.body.clone()).unwrap_or_default(),
                     sent.message.as_ref().map(|m| m.attachments.clone()).unwrap_or_default(),
+                    sent.message.as_ref().and_then(|m| m.quote.as_ref()),
                 ),
                 _ => return None,
             };
-            if !has_chat_content(&body, &pointers) {
+            if !has_chat_content(&body, &pointers, quote.is_some()) {
                 return None;
             }
-            // Canonical thread derivation (sync-sent, group, 1:1).
-            let thread = Thread::try_from(content).ok()?;
-            let thread_id = match &thread {
-                Thread::Contact(sid) => format!("contact:{}", service_uuid(sid)),
-                Thread::Group(key) => format!("group:{}", hex::encode(key)),
-            };
-            Some((message_json(&thread_id, self_aci, names, &body, ts, true, &pointers, store_ts), pointers))
+            // Canonical thread derivation (sync-sent, group, 1:1). A
+            // synchronized message authored by this account uses its
+            // destination, just like an ordinary outgoing DataMessage.
+            let thread_id = thread_of_content_for(content, self_aci)?;
+            Some((message_json(
+                &thread_id,
+                self_aci,
+                names,
+                &body,
+                ts,
+                true,
+                &pointers,
+                store_ts,
+                quote,
+            ), pointers))
         }
         _ => None,
     }
@@ -143,6 +201,90 @@ pub fn content_event(
     content_parts(content, self_aci, names).map(|(v, _)| v)
 }
 
+fn content_protocol_timestamp(content: &Content) -> u64 {
+    match &content.body {
+        ContentBody::DataMessage(message) => message.timestamp.unwrap_or(0),
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(SyncContent::Sent(sent)) => sent
+                .message
+                .as_ref()
+                .and_then(|message| message.timestamp)
+                .unwrap_or(sent.timestamp.unwrap_or(0)),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn reaction_details(content: &Content) -> Option<(u64, String, String, bool)> {
+    let message = match &content.body {
+        ContentBody::DataMessage(message) => message,
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(SyncContent::Sent(sent)) => sent.message.as_ref()?,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let reaction = message.reaction.as_ref()?;
+    let target = reaction.target_sent_timestamp?;
+    let emoji = reaction.emoji.clone().unwrap_or_default();
+    if emoji.is_empty() {
+        return None;
+    }
+    Some((
+        target,
+        service_uuid(&content.metadata.sender),
+        emoji,
+        reaction.remove.unwrap_or(false),
+    ))
+}
+
+/// Aggregate the reaction envelopes stored for one thread. The presentation
+/// model intentionally stores emoji values, so removals are applied per
+/// sender/emoji while the result remains a compact display list.
+fn reaction_summaries(contents: &[Content]) -> HashMap<u64, Vec<String>> {
+    let mut ordered = contents.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|content| content_store_timestamp(content));
+    let mut active: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+    for content in ordered {
+        let Some((target, sender, emoji, remove)) = reaction_details(content) else {
+            continue;
+        };
+        let entries = active.entry(target).or_default();
+        if remove {
+            entries.retain(|(existing_sender, existing_emoji)| {
+                existing_sender != &sender || existing_emoji != &emoji
+            });
+        } else if !entries
+            .iter()
+            .any(|(existing_sender, existing_emoji)| existing_sender == &sender && existing_emoji == &emoji)
+        {
+            entries.push((sender, emoji));
+        }
+    }
+    active
+        .into_iter()
+        .map(|(target, entries)| (target, entries.into_iter().map(|(_, emoji)| emoji).collect()))
+        .collect()
+}
+
+fn add_reaction_summary(
+    event: &mut serde_json::Value,
+    content: &Content,
+    summaries: &HashMap<u64, Vec<String>>,
+) {
+    for target in [content_store_timestamp(content), content_protocol_timestamp(content)] {
+        if target != 0 {
+            if let Some(emojis) = summaries.get(&target) {
+                if !emojis.is_empty() {
+                    event["reactions"] = serde_json::json!(emojis);
+                }
+                return;
+            }
+        }
+    }
+}
+
 fn message_json(
     thread: &str,
     sender: &str,
@@ -152,12 +294,13 @@ fn message_json(
     outgoing: bool,
     pointers: &[AttachmentPointer],
     store_ts: u64,
+    quote: Option<&Quote>,
 ) -> serde_json::Value {
     // The client/store timestamp is stable across roster pagination, live
     // delivery, and linked-device sync. Server timestamps can differ between
     // those paths and must not create a second UUID for the same message.
     let identity_ts = if store_ts != 0 { store_ts } else { ts };
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "key": format!("{thread}/{identity_ts}/{sender}"),
         "thread": thread,
         "sender": sender,
@@ -170,7 +313,15 @@ fn message_json(
         "sts": store_ts,
         "outgoing": outgoing,
         "attachments": pointers.iter().map(attachment_meta).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(reply) = quote {
+        value["reply_to"] = serde_json::json!({
+            "target_sts": reply.id,
+            "author": reply.author_aci,
+            "body": reply.text,
+        });
+    }
+    value
 }
 
 /// Metadata-only attachment descriptor (`path` filled after download).
@@ -340,20 +491,32 @@ pub async fn thread_page(
     // The store casts bounds to i64: clamp u64::MAX ("latest") or it wraps
     // to -1 and matches nothing. Real timestamps always fit in i64.
     let before = before_sts.min(i64::MAX as u64);
+    if limit == 0 {
+        return serde_json::to_string(&serde_json::json!({ "messages": [] }))
+            .map_err(|e| format!("encode thread: {e}"));
+    }
     let mut msgs: Vec<Content> = store
         .messages(&thread, ..before)
         .await
         .map_err(|e| format!("messages: {e}"))?
         .filter_map(|m| m.ok())
         .collect();
-    msgs.sort_by_key(|m| m.metadata.server_timestamp);
-    let page: Vec<serde_json::Value> = msgs
-        .iter()
-        .rev()
-        .take(limit)
-        .rev()
-        .filter_map(|m| content_event(m, &self_aci, &names))
-        .collect();
+    // Paging is based on the store clock. Filter control envelopes before
+    // applying the limit so a page of receipts/typing cannot hide older chat.
+    msgs.sort_by_key(|m| content_store_timestamp(m));
+    let reaction_summaries = reaction_summaries(&msgs);
+    let mut page: Vec<serde_json::Value> = Vec::with_capacity(limit);
+    for message in msgs.iter().rev() {
+        if let Some(mut event) = content_event(message, &self_aci, &names) {
+            if event.get("thread").and_then(|value| value.as_str()) != Some(thread_id) {
+                continue;
+            }
+            add_reaction_summary(&mut event, message, &reaction_summaries);
+            page.push(event);
+            if page.len() == limit { break; }
+        }
+    }
+    page.reverse();
     serde_json::to_string(&serde_json::json!({ "messages": page }))
         .map_err(|e| format!("encode thread: {e}"))
 }
@@ -505,16 +668,24 @@ pub async fn build_roster(store: &SqliteStore) -> Result<String, String> {
             .map_err(|e| format!("messages: {e}"))?
             .filter_map(|m| m.ok())
             .collect();
-        thread_msgs.sort_by_key(|m| m.metadata.server_timestamp);
-        for m in thread_msgs.iter().rev().take(SEED_WINDOW).rev() {
-            if let Some(ev) = content_event(m, &self_aci, &names) {
+        thread_msgs.sort_by_key(content_store_timestamp);
+        let reaction_summaries = reaction_summaries(&thread_msgs);
+        let seed: Vec<serde_json::Value> = thread_msgs
+            .iter()
+            .rev()
+            .filter_map(|m| {
+                let mut event = content_event(m, &self_aci, &names)?;
                 // content_event derives the thread from the envelope; it must
                 // agree with the queried thread or the row is misfiled.
-                if ev.get("thread").and_then(|t| t.as_str()) == Some(thread_id.as_str()) {
-                    messages.push(ev);
+                if event.get("thread").and_then(|t| t.as_str()) != Some(thread_id.as_str()) {
+                    return None;
                 }
-            }
-        }
+                add_reaction_summary(&mut event, m, &reaction_summaries);
+                Some(event)
+            })
+            .take(SEED_WINDOW)
+            .collect();
+        messages.extend(seed.into_iter().rev());
     }
 
     let roster = serde_json::json!({
@@ -550,13 +721,23 @@ pub async fn whoami(store: &SqliteStore) -> Result<String, String> {
 pub fn received_event(r: &Received, self_aci: &str, names: &HashMap<String, String>) -> Option<String> {
     let v = match r {
         Received::Content(c) => {
-            if reaction_part(c, names).is_some()
-                || receipt_part(c, names).is_some()
-                || call_signal_part(c, names).is_some()
-            {
-                // Reaction/receipt/call-only envelopes are emitted as their own
-                // events by the loop; they must not become message rows.
-                return None;
+            if let Some(event) = receipt_part(c, names) {
+                return Some(event.to_string());
+            }
+            if let Some(event) = call_signal_part(c, names) {
+                return Some(event.to_string());
+            }
+            if let Some(event) = reaction_part(c, names, self_aci) {
+                return Some(event.to_string());
+            }
+            if let Some(event) = edit_part(c, names, self_aci) {
+                return Some(event.to_string());
+            }
+            if let Some(event) = delete_part(c, names, self_aci) {
+                return Some(event.to_string());
+            }
+            if let Some(event) = typing_part(c, names) {
+                return Some(event.to_string());
             }
             let (m, _) = content_parts(c, self_aci, names)?;
             serde_json::json!({"type": "message", "message": m})
@@ -573,13 +754,17 @@ pub fn received_event(r: &Received, self_aci: &str, names: &HashMap<String, Stri
 /// Reaction envelope → {"type":"reaction","thread","target_sts","emoji",
 /// "remove","sender","sender_name"}. `target_sts` is the store-clock ts of
 /// the targeted message.
-pub fn reaction_part(content: &Content, names: &HashMap<String, String>) -> Option<serde_json::Value> {
+pub fn reaction_part(
+    content: &Content,
+    names: &HashMap<String, String>,
+    self_aci: &str,
+) -> Option<serde_json::Value> {
     let (reaction, thread_id) = match &content.body {
-        ContentBody::DataMessage(m) => (m.reaction.as_ref()?, thread_of_content(content)?),
+        ContentBody::DataMessage(m) => (m.reaction.as_ref()?, thread_of_content_for(content, self_aci)?),
         ContentBody::SynchronizeMessage(s) => match &s.content {
             Some(SyncContent::Sent(sent)) => {
                 let dm = sent.message.as_ref()?;
-                (dm.reaction.as_ref()?, thread_of_content(content)?)
+                (dm.reaction.as_ref()?, thread_of_content_for(content, self_aci)?)
             }
             _ => return None,
         },
@@ -594,6 +779,154 @@ pub fn reaction_part(content: &Content, names: &HashMap<String, String>) -> Opti
         "remove": reaction.remove.unwrap_or(false),
         "sender": sender,
         "sender_name": display_name(names, &sender),
+    }))
+}
+
+/// Edit envelope → a normalized event for the Swift presentation store.
+pub fn edit_part(
+    content: &Content,
+    names: &HashMap<String, String>,
+    self_aci: &str,
+) -> Option<serde_json::Value> {
+    let edit = match &content.body {
+        ContentBody::EditMessage(edit) => edit,
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(SyncContent::Sent(sent)) => sent.edit_message.as_ref()?,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let target = edit.target_sent_timestamp?;
+    let data = edit.data_message.as_ref()?;
+    let sender = service_uuid(&content.metadata.sender);
+    let thread = thread_of_content_for(content, self_aci)?;
+    Some(serde_json::json!({
+        "type": "edit",
+        "thread": thread,
+        "target_sts": target,
+        "body": data.body.clone().unwrap_or_default(),
+        "sender": sender,
+        "sender_name": display_name(names, &sender),
+        "ts": content.metadata.server_timestamp.timestamp_millis().max(0) as u64,
+    }))
+}
+
+/// Delete-for-everyone envelope → a normalized event for the Swift store.
+pub fn delete_part(
+    content: &Content,
+    names: &HashMap<String, String>,
+    self_aci: &str,
+) -> Option<serde_json::Value> {
+    let target = match &content.body {
+        ContentBody::DataMessage(message) => message.delete.as_ref()?.target_sent_timestamp?,
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(SyncContent::Sent(sent)) => {
+                sent.message.as_ref()?.delete.as_ref()?.target_sent_timestamp?
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let sender = service_uuid(&content.metadata.sender);
+    let thread = thread_of_content_for(content, self_aci)?;
+    Some(serde_json::json!({
+        "type": "delete",
+        "thread": thread,
+        "target_sts": target,
+        "sender": sender,
+        "sender_name": display_name(names, &sender),
+        "ts": content.metadata.server_timestamp.timestamp_millis().max(0) as u64,
+    }))
+}
+
+/// Reconcile an edit into the native store so a later roster refresh cannot
+/// restore the pre-edit body. The Swift presentation store is updated by the
+/// emitted event; this keeps the native source of truth consistent as well.
+pub async fn reconcile_edit(
+    store: &SqliteStore,
+    thread_id: &str,
+    target_sts: u64,
+    body: &str,
+    author_id: &str,
+) -> Result<(), String> {
+    let thread = parse_thread(thread_id)?;
+    let mut content = store
+        .message(&thread, target_sts)
+        .await
+        .map_err(|e| format!("edit target: {e}"))?
+        .ok_or_else(|| "edit target not found".to_string())?;
+    if !author_id.is_empty()
+        && author_id != "?"
+        && service_uuid(&content.metadata.sender) != author_id
+    {
+        return Err("edit author does not match target".to_string());
+    }
+    match &mut content.body {
+        ContentBody::DataMessage(message) => message.body = Some(body.to_string()),
+        ContentBody::SynchronizeMessage(sync) => {
+            if let Some(SyncContent::Sent(sent)) = &mut sync.content {
+                if let Some(message) = sent.message.as_mut() {
+                    message.body = Some(body.to_string());
+                }
+            }
+        }
+        _ => return Err("edit target is not a chat message".to_string()),
+    }
+    store
+        .save_message(&thread, content)
+        .await
+        .map_err(|e| format!("save edited message: {e}"))
+}
+
+/// Remove a delete target from the native store after validating that it
+/// exists. This prevents a stale target from being reintroduced by a later
+/// history query.
+pub async fn reconcile_delete(
+    store: &mut SqliteStore,
+    thread_id: &str,
+    target_sts: u64,
+    author_id: &str,
+) -> Result<(), String> {
+    let thread = parse_thread(thread_id)?;
+    if !author_id.is_empty() && author_id != "?" {
+        if let Some(content) = store
+            .message(&thread, target_sts)
+            .await
+            .map_err(|e| format!("delete target: {e}"))?
+        {
+            if service_uuid(&content.metadata.sender) != author_id {
+                return Err("delete author does not match target".to_string());
+            }
+        }
+    }
+    store
+        .delete_message(&thread, target_sts)
+        .await
+        .map_err(|e| format!("delete target: {e}"))?;
+    Ok(())
+}
+
+/// Typing envelope → a normalized event for the Swift UI.
+pub fn typing_part(
+    content: &Content,
+    names: &HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    let ContentBody::TypingMessage(typing) = &content.body else { return None };
+    let sender = service_uuid(&content.metadata.sender);
+    let thread = if let Some(group_id) = &typing.group_id {
+        if group_id.len() != 32 { return None; }
+        format!("group:{}", hex::encode(group_id))
+    } else {
+        thread_of_content(content)?
+    };
+    Some(serde_json::json!({
+        "type": "typing",
+        "thread": thread,
+        "typing_sender": sender,
+        "sender": sender,
+        "sender_name": display_name(names, &sender),
+        "started": typing.action.unwrap_or(1) == 0,
+        "ts": content.metadata.server_timestamp.timestamp_millis().max(0) as u64,
     }))
 }
 
@@ -730,6 +1063,9 @@ pub fn receipt_part(content: &Content, names: &HashMap<String, String>) -> Optio
     let sender = service_uuid(&content.metadata.sender);
     Some(serde_json::json!({
         "type": "receipt",
+        // Receipt envelopes do not carry a reliable thread discriminator;
+        // leave it null rather than misrouting a group receipt as a contact.
+        "thread": serde_json::Value::Null,
         "sender": sender,
         "sender_name": display_name(names, &sender),
         "kind": kind,
@@ -737,12 +1073,30 @@ pub fn receipt_part(content: &Content, names: &HashMap<String, String>) -> Optio
     }))
 }
 
-fn thread_of_content(content: &Content) -> Option<String> {
-    let thread = Thread::try_from(content).ok()?;
+fn thread_of_content_for(content: &Content, self_aci: &str) -> Option<String> {
+    let thread = safe_thread_of_content(content)?;
     Some(match &thread {
-        Thread::Contact(sid) => format!("contact:{}", service_uuid(sid)),
+        Thread::Contact(sid) => {
+            let sender = service_uuid(&content.metadata.sender);
+            // Envelopes emitted by another linked device carry this account as
+            // sender, while the destination is the actual conversation. Using
+            // the destination prevents self-authored reactions/edits/typing
+            // from being misfiled under contact:<self>.
+            if !self_aci.is_empty()
+                && sender == self_aci
+                && content.metadata.destination != content.metadata.sender
+            {
+                format!("contact:{}", service_uuid(&content.metadata.destination))
+            } else {
+                format!("contact:{}", service_uuid(sid))
+            }
+        }
         Thread::Group(key) => format!("group:{}", hex::encode(key)),
     })
+}
+
+fn thread_of_content(content: &Content) -> Option<String> {
+    thread_of_content_for(content, "")
 }
 
 use presage::libsignal_service::content::DataMessage;
@@ -794,20 +1148,28 @@ pub(crate) async fn send_content(
             .group(key)
             .await
             .map_err(|e| format!("group metadata: {e}"))?
-            .map(|group| group.revision)
-            .unwrap_or(0);
+            .ok_or_else(|| "group metadata not found".to_string())?
+            .revision;
 
         // Presage's group sender broadcasts to each member, but it does not
         // add GroupsV2 context to the DataMessage itself. Without this field
         // Signal clients legitimately classify the message as a 1:1 message
         // from the sender (often the first/only visible member). Set the
-        // canonical master-key context before handing it to the sender.
-        if let ContentBody::DataMessage(message) = &mut content_body {
-            message.group_v2 = Some(GroupContextV2 {
-                master_key: Some(bytes.clone()),
-                revision: Some(revision),
-                group_change: None,
-            });
+        // canonical master-key context on every group-capable payload before
+        // handing it to the sender.
+        let group_context = GroupContextV2 {
+            master_key: Some(bytes.clone()),
+            revision: Some(revision),
+            group_change: None,
+        };
+        match &mut content_body {
+            ContentBody::DataMessage(message) => message.group_v2 = Some(group_context),
+            ContentBody::EditMessage(edit) => {
+                if let Some(data_message) = edit.data_message.as_mut() {
+                    data_message.group_v2 = Some(group_context);
+                }
+            }
+            _ => {}
         }
 
         eprintln!(
@@ -845,16 +1207,17 @@ pub async fn do_send(manager: &mut StoredManager, thread: &str, body: &str) -> R
 }
 
 /// Reply prefabs: quote block pointing at a previous message.
-pub fn make_quote(ts: u64, author_aci: &str, body: &str) -> Quote {
-    // PNI senders can't be quoted by ACI (unknown mapping) — pass through;
-    // the server accepts ACI authors, PNI-authored quotes may not render.
-    let author = author_aci.strip_prefix("PNI:").unwrap_or(author_aci);
-    Quote {
+pub fn make_quote(ts: u64, author_aci: &str, body: &str) -> Result<Quote, String> {
+    // Signal's quote field carries the service-id string. Validate the
+    // service-id shape but preserve a PNI prefix instead of silently routing
+    // a reply to the wrong ACI.
+    parse_service_id(author_aci)?;
+    Ok(Quote {
         id: Some(ts),
-        author_aci: Some(author.to_string()),
+        author_aci: Some(author_aci.to_string()),
         text: Some(body.chars().take(200).collect()),
         ..Default::default()
-    }
+    })
 }
 
 /// Guess a content-type from a file extension (upload metadata).
@@ -925,8 +1288,8 @@ pub async fn send_receipt(
     kind: &str,
 ) -> Result<(), String> {
     use presage::libsignal_service::proto::ReceiptMessage;
-    use presage::libsignal_service::protocol::{Aci, ServiceId};
     use presage::libsignal_service::content::ContentBody;
+    use presage::store::Thread;
 
     let receipt_type = match kind {
         "read" => 1i32,
@@ -945,26 +1308,19 @@ pub async fn send_receipt(
         .map_err(|e| format!("time error: {e}"))?
         .as_millis() as u64;
 
-    // Parse thread to determine how to send
-    if let Some(uuid) = thread.strip_prefix("contact:") {
-        // 1:1 contact - send directly to the ACI
-        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
-        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
-        let recipient = ServiceId::Aci(Aci::from(parsed));
-        manager
-            .send_message(recipient, content_body, timestamp)
-            .await
-            .map_err(|e| format!("send receipt: {e}"))?;
-    } else if let Some(hexkey) = thread.strip_prefix("group:") {
-        // Group - send to the group using send_message_to_group with master key
-        let group_key_bytes = hex::decode(hexkey).map_err(|_| "bad group id".to_string())?;
-        manager
-            .send_message_to_group(&group_key_bytes, content_body, timestamp)
-            .await
-            .map_err(|e| format!("send group receipt: {e}"))?;
-    } else {
-        return Err("bad thread id".to_string());
-    }
+    // Receipts are direct 1:1 acknowledgements. A group receipt must be sent
+    // separately to each message author; broadcasting it to the group is not
+    // equivalent and can disclose/read-state to the wrong recipients.
+    let recipient = match parse_thread(thread)? {
+        Thread::Contact(service_id) => service_id,
+        Thread::Group(_) => {
+            return Err("group receipts require per-author delivery".to_string());
+        }
+    };
+    manager
+        .send_message(recipient, content_body, timestamp)
+        .await
+        .map_err(|e| format!("send receipt: {e}"))?;
 
     Ok(())
 }
@@ -1014,22 +1370,8 @@ pub async fn send_message_edit(
     target_ts: u64,
     new_body: &str,
 ) -> Result<u64, String> {
-    use presage::libsignal_service::proto::EditMessage;
     use presage::libsignal_service::content::ContentBody;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("time error: {e}"))?
-        .as_millis() as u64;
-
-    // Parse thread to get recipient ServiceId
-    let recipient = if let Some(uuid) = thread.strip_prefix("contact:") {
-        parse_service_id(uuid)?
-    } else if let Some(_hexkey) = thread.strip_prefix("group:") {
-        return Err("group message edits not yet supported".to_string());
-    } else {
-        return Err("bad thread id".to_string());
-    };
-
+    let timestamp = now_millis();
     let edit_msg = presage::proto::EditMessage {
         target_sent_timestamp: Some(target_ts),
         data_message: Some(presage::proto::DataMessage {
@@ -1038,15 +1380,8 @@ pub async fn send_message_edit(
         }),
         ..Default::default()
     };
-
     let content_body: ContentBody = ContentBody::EditMessage(edit_msg);
-
-    manager
-        .send_message(recipient, content_body, timestamp)
-        .await
-        .map_err(|e| format!("send edit: {e}"))?;
-
-    Ok(timestamp)
+    send_content(manager, thread, content_body, timestamp).await
 }
 
 /// Send a typing indicator to the remote peer via Signal's websocket.
@@ -1058,32 +1393,19 @@ pub async fn send_typing(
     use presage::libsignal_service::content::ContentBody;
     use presage::libsignal_service::proto::TypingMessage;
 
-    let recipient = if let Some(uuid) = thread.strip_prefix("contact:") {
-        parse_service_id(uuid)?
-    } else if let Some(_hexkey) = thread.strip_prefix("group:") {
-        // For groups, typing indicators work similarly
-        return Err("group typing not yet supported".to_string());
-    } else {
-        return Err("bad thread id".to_string());
+    let group_id = match parse_thread(thread)? {
+        Thread::Group(key) => Some(key.to_vec()),
+        Thread::Contact(_) => None,
     };
-
     let typing_msg = TypingMessage {
-        action: if started { Some(0) } else { Some(1) }, // 0 = started, 1 = stopped
-        ..Default::default()
+        action: if started { Some(0) } else { Some(1) },
+        group_id,
+        timestamp: Some(now_millis()),
     };
-
     let content_body: ContentBody = ContentBody::TypingMessage(typing_msg);
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("time error: {e}"))?
-        .as_millis() as u64;
-
-    manager
-        .send_message(recipient, content_body, timestamp)
+    send_content(manager, thread, content_body, now_millis())
         .await
-        .map_err(|e| format!("send typing: {e}"))?;
-
-    Ok(())
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -1092,13 +1414,14 @@ mod tests {
 
     #[test]
     fn empty_control_envelopes_are_not_chat_content() {
-        assert!(!has_chat_content("", &[]));
+        assert!(!has_chat_content("", &[], false));
+        assert!(has_chat_content("", &[], true));
         let pointer = AttachmentPointer {
             content_type: Some("image/gif".to_string()),
             ..Default::default()
         };
-        assert!(has_chat_content("", &[pointer]));
-        assert!(has_chat_content("hello", &[]));
+        assert!(has_chat_content("", &[pointer], false));
+        assert!(has_chat_content("hello", &[], false));
     }
 
     #[test]
@@ -1112,6 +1435,23 @@ mod tests {
         assert_eq!(mime, "image/gif");
         assert_eq!(effective_attachment_name(&pointer, &mime), "attachment.gif");
         assert!(is_media_attachment(&pointer));
+    }
+
+    #[test]
+    fn thread_ids_preserve_service_id_type_and_validate_group_keys() {
+        let pni = parse_thread("contact:PNI:11111111-1111-1111-1111-111111111111");
+        assert!(matches!(pni, Ok(Thread::Contact(ServiceId::Pni(_)))));
+        assert!(parse_thread(&format!("group:{}", "ab".repeat(32))).is_ok());
+        assert!(parse_thread("group:ab").is_err());
+        assert!(parse_thread("contact:not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn quotes_preserve_pni_service_ids() {
+        let quote = make_quote(42, "PNI:11111111-1111-1111-1111-111111111111", "quoted").unwrap();
+        assert_eq!(quote.author_aci.as_deref(), Some("PNI:11111111-1111-1111-1111-111111111111"));
+        assert!(make_quote(42, "11111111-1111-1111-1111-111111111111", "quoted").is_ok());
+        assert!(make_quote(42, "not-a-service-id", "quoted").is_err());
     }
 
     #[test]

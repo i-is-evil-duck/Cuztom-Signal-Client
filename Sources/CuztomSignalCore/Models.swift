@@ -111,6 +111,24 @@ public struct AttachmentMeta: Sendable, Codable, Hashable {
     }
 }
 
+/// Stable reference to the message quoted by a reply. The native protocol
+/// identifies the target by store timestamp and author, not the Swift UUID.
+public struct MessageReference: Identifiable, Hashable, Sendable, Codable {
+    public var storeTs: Int64
+    public var authorID: String?
+    public var body: String?
+
+    public var id: String {
+        "\(storeTs):\(authorID ?? "")"
+    }
+
+    public init(storeTs: Int64, authorID: String? = nil, body: String? = nil) {
+        self.storeTs = storeTs
+        self.authorID = authorID
+        self.body = body
+    }
+}
+
 public struct ChatMessage: Identifiable, Sendable, Codable {
     public var id: UUID
     public var conversationId: String
@@ -120,6 +138,8 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
     public var status: MessageStatus
     public var sentAt: Date
     public var attachments: [AttachmentMeta]
+    /// Optional quoted-message reference for reply rendering/navigation.
+    public var replyTo: MessageReference?
     /// Store-clock timestamp (SQLite `ts` column basis) for paging/lookup.
     /// Nil for mock/local messages, which page trivially.
     public var storeTs: Int64?
@@ -139,6 +159,7 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
         status: MessageStatus = .queued,
         sentAt: Date = Date(),
         attachments: [AttachmentMeta] = [],
+        replyTo: MessageReference? = nil,
         storeTs: Int64? = nil,
         reactions: [String] = [],
         readBy: [String] = [],
@@ -152,6 +173,7 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
         self.status = status
         self.sentAt = sentAt
         self.attachments = attachments
+        self.replyTo = replyTo
         self.storeTs = storeTs
         self.reactions = reactions
         self.readBy = readBy

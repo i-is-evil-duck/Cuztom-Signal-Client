@@ -143,6 +143,11 @@ private func testCtx(
     await controller.select("c1")
     // Mock seed never grows: loadMore finds nothing new.
     #expect(!(await controller.loadMore(chunk: 10)))
+    if case .exhausted = await controller.loadMoreResult(chunk: 10) {
+        // expected
+    } else {
+        Issue.record("expected exhausted history result")
+    }
 }
 
 @Test func pluginRegisterReplacesSameId() async {

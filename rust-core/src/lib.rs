@@ -13,6 +13,7 @@
 //!   `core_cmd_is_linked() -> i32`        1 / 0
 //!   `core_last_error() -> *const c_char` copy immediately, valid until next call
 //!   `core_free_string(*mut c_char)`
+//!   `core_cmd_wipe() -> i32` acknowledged native session/database wipe
 //!
 //! M1b (next): receive loop + send + contacts/groups sync over the same pipe.
 
@@ -263,6 +264,9 @@ enum Command {
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
+    Wipe {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     // M3: Message edits
     SendMessageEdit {
         thread: String,
@@ -280,7 +284,9 @@ enum Command {
 
 /// Control plane into the running sync loop (which owns `&mut Manager`).
 enum LoopCtrl {
-    Shutdown,
+    Shutdown {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     RequestContacts {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
@@ -518,6 +524,7 @@ struct Core {
 
 static CORE: OnceLock<Core> = OnceLock::new();
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+static ACTIVE_DB_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 /// The current sync-loop control sender. RingRTC's bridge is started once
 /// and survives logout/re-login; it waits while this slot is empty.
@@ -786,6 +793,10 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
                             let result = cmd_logout(&mut state).await;
                             let _ = reply.send(result);
                         }
+                        Command::Wipe { reply } => {
+                            let result = cmd_wipe(&mut state).await;
+                            let _ = reply.send(result);
+                        }
                     }
                 }
             });
@@ -794,9 +805,44 @@ fn spawn_worker() -> tmpsc::UnboundedSender<Command> {
     tx
 }
 
+fn set_active_db_path(path: &str) {
+    if let Ok(mut slot) = ACTIVE_DB_PATH.lock() {
+        *slot = Some(path.to_string());
+    }
+}
+
+fn same_db_path(left: &str, right: &str) -> bool {
+    let normalize = |path: &str| {
+        std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+    };
+    normalize(left) == normalize(right)
+}
+
 async fn init_state(state: &mut WorkerState, db_path: &str) -> Result<bool, String> {
-    if matches!(state, WorkerState::Linked { .. }) {
-        return Ok(true);
+    match state {
+        WorkerState::Linked(linked) if same_db_path(&linked.db_path, db_path) => {
+            return Ok(true);
+        }
+        WorkerState::Ready { db_path: existing, .. }
+        | WorkerState::Linking { db_path: existing, .. }
+            if same_db_path(existing, db_path) =>
+        {
+            return Ok(false);
+        }
+        WorkerState::Linked(linked) => {
+            return Err(format!(
+                "native core already owns database: {}",
+                linked.db_path
+            ));
+        }
+        WorkerState::Ready { db_path: existing, .. }
+        | WorkerState::Linking { db_path: existing, .. } => {
+            return Err(format!(
+                "native core already owns database: {}",
+                existing
+            ));
+        }
+        WorkerState::Fresh => {}
     }
     if let Some(parent) = std::path::Path::new(db_path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -810,6 +856,7 @@ async fn init_state(state: &mut WorkerState, db_path: &str) -> Result<bool, Stri
         .map_err(|e| format!("open store: {e}"))?;
     match Manager::load_registered(store).await {
         Ok(manager) => {
+            set_active_db_path(db_path);
             *state = WorkerState::Linked(Box::new(LinkedState::new(db_path.to_string(), manager)));
             Ok(true)
         }
@@ -817,6 +864,7 @@ async fn init_state(state: &mut WorkerState, db_path: &str) -> Result<bool, Stri
             let store = SqliteStore::open(db_path, OnNewIdentity::Trust)
                 .await
                 .map_err(|e| format!("reopen store: {e}"))?;
+            set_active_db_path(db_path);
             *state = WorkerState::Ready { store, db_path: db_path.to_string() };
             Ok(false)
         }
@@ -950,7 +998,13 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
     }
     if let Some(old_ctrl) = linked.ctrl.take() {
         set_sync_ctrl(None);
-        let _ = old_ctrl.send(LoopCtrl::Shutdown);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        if old_ctrl
+            .send(LoopCtrl::Shutdown { reply: shutdown_tx })
+            .is_ok()
+        {
+            let _ = shutdown_rx.await;
+        }
     }
     linked.events = None;
     linked.sync_alive.store(false, Ordering::Release);
@@ -993,6 +1047,10 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                     // A message queued during logout belongs to the old
                     // account. Drop it while the current control loop is
                     // absent rather than forwarding it after re-linking.
+                    if pending.session_generation != call::session_generation() {
+                        call::call_message_send_failure(pending.call_id);
+                        continue;
+                    }
                     if let Some(sender) = current_sync_ctrl() {
                         let call_id = pending.call_id;
                         if sender
@@ -1011,6 +1069,15 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
             tokio::task::spawn_local(async move {
                 while let Some(action) = action_rx.recv().await {
                     // Do not carry a deferred `proceed` into a new session.
+                    let action_generation = match &action {
+                        call::CallAction::Proceed {
+                            session_generation,
+                            ..
+                        } => *session_generation,
+                    };
+                    if action_generation != call::session_generation() {
+                        continue;
+                    }
                     if let Some(sender) = current_sync_ctrl() {
                         if sender.send(LoopCtrl::CallAction { action }).is_err() {
                             call::drop_active_call();
@@ -1026,6 +1093,7 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
     tokio::task::spawn_local(async move {
         use futures::StreamExt;
         let mut names = sync::load_names(&names_store).await;
+        let mut shutdown_reply = None;
         let send_listen = async {
             match manager.receive_messages().await {
                 Ok(stream) => {
@@ -1034,7 +1102,10 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                         tokio::select! {
                             biased;
                             ctrl = ctrl_rx.recv() => match ctrl {
-                                Some(LoopCtrl::Shutdown) => break,
+                                Some(LoopCtrl::Shutdown { reply }) => {
+                                    shutdown_reply = Some(reply);
+                                    break;
+                                }
                                 Some(LoopCtrl::RequestContacts { reply }) => {
                                     let r = manager.request_contacts().await
                                         .map_err(|e| format!("request contacts: {e}"));
@@ -1049,15 +1120,17 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::SendReply { thread, body, quote_ts, quote_author, quote_body, reply }) => {
-                                    let quote = sync::make_quote(quote_ts, &quote_author, &quote_body);
-                                    let r = sync::do_send_full(
-                                        &mut manager,
-                                        &thread,
-                                        &body,
-                                        Vec::new(),
-                                        sync::SendExtras { quote: Some(quote), delete_ts: None },
-                                    )
-                                    .await;
+                                    let r = match sync::make_quote(quote_ts, &quote_author, &quote_body) {
+                                        Ok(quote) => sync::do_send_full(
+                                            &mut manager,
+                                            &thread,
+                                            &body,
+                                            Vec::new(),
+                                            sync::SendExtras { quote: Some(quote), delete_ts: None },
+                                        )
+                                        .await,
+                                        Err(e) => Err(e),
+                                    };
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::SendDelete { thread, target_ts, reply }) => {
@@ -1205,14 +1278,15 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                             },
                             next = stream.next() => match next {
                                 Some(Received::Content(c)) => {
-                                    // Reactions + receipts + call signaling travel as
-                                    // message envelopes; emit them as events, never rows.
+                                    // Reactions, receipts, edits, deletes, typing,
+                                    // and calls travel as message envelopes; emit
+                                    // them as events, never as chat rows.
                                     if let Some(rv) = sync::receipt_part(&c, &names) {
                                         let _ = event_tx.send(rv.to_string());
                                     } else if let Some(rv) = sync::call_signal_part(&c, &names) {
-                                        // Call offer/answer/ICE/hangup/busy. These are
-                                        // real Signal call envelopes and must reach
-                                        // the call state machine, not the message store.
+                                        // Call offer/answer/ICE/hangup/busy. These
+                                        // must reach the call state machine, not the
+                                        // message store.
                                         eprintln!(
                                             "[core] call signal kind={} thread={} from={}",
                                             rv.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),
@@ -1223,7 +1297,50 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                             let _ = event_tx.send(rv.to_string());
                                         }
                                     } else {
-                                        if let Some(rv) = sync::reaction_part(&c, &names) {
+                                        if let Some(rv) = sync::reaction_part(&c, &names, &self_aci) {
+                                            let _ = event_tx.send(rv.to_string());
+                                        }
+                                        if let Some(rv) = sync::edit_part(&c, &names, &self_aci) {
+                                            if let (Some(thread), Some(target)) = (
+                                                rv.get("thread").and_then(|v| v.as_str()),
+                                                rv.get("target_sts").and_then(|v| v.as_u64()),
+                                            ) {
+                                                let native_store = names_store.clone();
+                                                if let (Some(body), Some(author)) = (
+                                                    rv.get("body").and_then(|v| v.as_str()),
+                                                    rv.get("sender").and_then(|v| v.as_str()),
+                                                ) {
+                                                    let _ = sync::reconcile_edit(
+                                                        &native_store,
+                                                        thread,
+                                                        target,
+                                                        body,
+                                                        author,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            let _ = event_tx.send(rv.to_string());
+                                        }
+                                        if let Some(rv) = sync::delete_part(&c, &names, &self_aci) {
+                                            if let (Some(thread), Some(target)) = (
+                                                rv.get("thread").and_then(|v| v.as_str()),
+                                                rv.get("target_sts").and_then(|v| v.as_u64()),
+                                            ) {
+                                                let mut native_store = names_store.clone();
+                                                if let Some(author) = rv.get("sender").and_then(|v| v.as_str()) {
+                                                    let _ = sync::reconcile_delete(
+                                                        &mut native_store,
+                                                        thread,
+                                                        target,
+                                                        author,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            let _ = event_tx.send(rv.to_string());
+                                        }
+                                        if let Some(rv) = sync::typing_part(&c, &names) {
                                             let _ = event_tx.send(rv.to_string());
                                         }
                                         if let Some((mut v, pointers)) =
@@ -1234,53 +1351,52 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                                 .and_then(|b| b.as_str())
                                                 .map(|b| b.is_empty())
                                                 .unwrap_or(true);
-                                            let reaction_only =
-                                                body_empty && pointers.is_empty();
-                                            if !reaction_only {
-                                        // Eagerly fetch small media so the UI can
-                                        // render inline. Other file types stay
-                                        // metadata-only (manual Download).
-                                        let thread = v.get("thread")
-                                            .and_then(|t| t.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        // Use the store/client timestamp for cache identity.
-                                        let ts = v
-                                            .get("sts")
-                                            .and_then(|t| t.as_u64())
-                                            .filter(|t| *t != 0)
-                                            .or_else(|| v.get("ts").and_then(|t| t.as_u64()))
-                                            .unwrap_or(0);
-                                        for (i, ptr) in pointers.iter().enumerate() {
-                                            let is_media = sync::is_media_attachment(ptr);
-                                            if !is_media {
-                                                continue;
-                                            }
-                                            match sync::download_attachment(
-                                                &mut manager, ptr, &thread, ts, i,
-                                            )
-                                            .await
-                                            {
-                                                Ok(Some(path)) => {
-                                                    v["attachments"][i]["path"] =
-                                                        serde_json::Value::String(path);
+                                            let is_chat = !body_empty || !pointers.is_empty();
+                                            if is_chat {
+                                                // Eagerly fetch small media so the UI
+                                                // can render inline. Other file types
+                                                // stay metadata-only (manual Download).
+                                                let thread = v.get("thread")
+                                                    .and_then(|t| t.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                // Use the store/client timestamp for
+                                                // cache identity.
+                                                let ts = v
+                                                    .get("sts")
+                                                    .and_then(|t| t.as_u64())
+                                                    .filter(|t| *t != 0)
+                                                    .or_else(|| v.get("ts").and_then(|t| t.as_u64()))
+                                                    .unwrap_or(0);
+                                                for (i, ptr) in pointers.iter().enumerate() {
+                                                    if !sync::is_media_attachment(ptr) {
+                                                        continue;
+                                                    }
+                                                    match sync::download_attachment(
+                                                        &mut manager, ptr, &thread, ts, i,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(Some(path)) => {
+                                                            v["attachments"][i]["path"] =
+                                                                serde_json::Value::String(path);
+                                                        }
+                                                        Ok(None) => {}
+                                                        Err(e) => {
+                                                            let _ = event_tx.send(format!(
+                                                                r#"{{"type":"attachment_error","error":{}}}"#,
+                                                                serde_json::json!(e)
+                                                            ));
+                                                        }
+                                                    }
                                                 }
-                                                Ok(None) => {}
-                                                Err(e) => {
-                                                    let _ = event_tx.send(format!(
-                                                        r#"{{"type":"attachment_error","error":{}}}"#,
-                                                        serde_json::json!(e)
-                                                    ));
-                                                }
+                                                let _ = event_tx.send(
+                                                    serde_json::json!({"type": "message", "message": v})
+                                                        .to_string(),
+                                                );
                                             }
-                                        }
-                                        let _ = event_tx.send(
-                                            serde_json::json!({"type": "message", "message": v})
-                                                .to_string(),
-                                        );
                                         }
                                     }
-                                }
                                 }
                                 Some(received) => {
                                     if matches!(received, Received::Contacts) {
@@ -1307,6 +1423,13 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
             }
         };
         send_listen.await;
+        // Awaiting the future consumes it, releasing its Manager handle. Drop
+        // the cloned names store explicitly before acknowledging shutdown so
+        // SQLite has no remaining native handle in this task.
+        drop(names_store);
+        if let Some(reply) = shutdown_reply {
+            let _ = reply.send(());
+        }
         if SYNC_GENERATION.load(Ordering::Acquire) == sync_generation {
             sync_alive.store(false, Ordering::Release);
             set_sync_ctrl(None);
@@ -1322,13 +1445,20 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
 async fn cmd_logout(state: &mut WorkerState) -> Result<(), String> {
     let db_path = match state {
         WorkerState::Linked(linked) => {
-            call::drop_active_call();
-            call::clear_events();
+            call::invalidate_session();
             linked.sync_alive.store(false, Ordering::Release);
             SYNC_GENERATION.fetch_add(1, Ordering::AcqRel);
             set_sync_ctrl(None);
             if let Some(ctrl) = linked.ctrl.take() {
-                let _ = ctrl.send(LoopCtrl::Shutdown);
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                if ctrl
+                    .send(LoopCtrl::Shutdown { reply: shutdown_tx })
+                    .is_ok()
+                {
+                    shutdown_rx
+                        .await
+                        .map_err(|_| "sync loop dropped shutdown acknowledgement".to_string())?;
+                }
             }
             linked.manager.take();
             linked.events.take();
@@ -1344,6 +1474,55 @@ async fn cmd_logout(state: &mut WorkerState) -> Result<(), String> {
         .await
         .map_err(|e| format!("clear: {e}"))?;
     *state = WorkerState::Ready { store, db_path };
+    Ok(())
+}
+
+async fn cmd_wipe(state: &mut WorkerState) -> Result<(), String> {
+    call::invalidate_session();
+    set_sync_ctrl(None);
+    SYNC_GENERATION.fetch_add(1, Ordering::AcqRel);
+
+    let db_path = match state {
+        WorkerState::Linked(_) => {
+            cmd_logout(state).await?;
+            match state {
+                WorkerState::Ready { db_path, .. } => db_path.clone(),
+                _ => return Err("logout did not release native store".to_string()),
+            }
+        }
+        WorkerState::Ready { db_path, .. } => db_path.clone(),
+        WorkerState::Linking { task, db_path } => {
+            task.abort();
+            let _ = task.await;
+            db_path.clone()
+        }
+        WorkerState::Fresh => ACTIVE_DB_PATH
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default(),
+    };
+
+    // Drop every native handle before unlinking the database and sidecars.
+    let _ = std::mem::replace(state, WorkerState::Fresh);
+    if db_path.is_empty() {
+        return Ok(());
+    }
+
+    let remove = |path: std::path::PathBuf| -> Result<(), String> {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("remove {}: {e}", path.display())),
+        }
+    };
+    remove(std::path::PathBuf::from(&db_path))?;
+    remove(std::path::PathBuf::from(format!("{db_path}-wal")))?;
+    remove(std::path::PathBuf::from(format!("{db_path}-shm")))?;
+    remove(std::path::PathBuf::from(format!("{db_path}-journal")))?;
+    if let Ok(mut slot) = ACTIVE_DB_PATH.lock() {
+        *slot = None;
+    }
     Ok(())
 }
 
@@ -1509,30 +1688,7 @@ async fn send_reaction_inner(
         ..Default::default()
     };
     let content_body: presage::libsignal_service::content::ContentBody = msg.into();
-    if let Some(hexkey) = thread.strip_prefix("group:") {
-        let bytes = hex::decode(hexkey).map_err(|_| "bad group id".to_string())?;
-        manager
-            .send_message_to_group(&bytes, content_body, ts)
-            .await
-            .map(|_| ts)
-            .map_err(|e| format!("send: {e}"))
-    } else if let Some(uuid) = thread.strip_prefix("contact:") {
-        let bare = uuid.strip_prefix("PNI:").unwrap_or(uuid);
-        let parsed: uuid::Uuid = bare.parse().map_err(|_| "bad contact id".to_string())?;
-        manager
-            .send_message(
-                presage::libsignal_service::protocol::ServiceId::Aci(
-                    presage::libsignal_service::protocol::Aci::from(parsed),
-                ),
-                content_body,
-                ts,
-            )
-            .await
-            .map(|_| ts)
-            .map_err(|e| format!("send: {e}"))
-    } else {
-        Err("bad thread id".to_string())
-    }
+    sync::send_content(manager, thread, content_body, ts).await
 }
 
 /// Profile display-name lookup (network). Errors when no profile key exists.
@@ -2342,6 +2498,18 @@ pub extern "C" fn core_cmd_logout() -> i32 {
     }
 }
 
+/// Wipe the native session and database. 0 ok, -1 error.
+#[no_mangle]
+pub extern "C" fn core_cmd_wipe() -> i32 {
+    match roundtrip(|reply| Command::Wipe { reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
 /// Older history page: newest `limit` messages in `thread` before
 /// `before_ts` (`u64::MAX` = latest). JSON `{"messages":[…]}`, or null.
 #[no_mangle]
@@ -2353,7 +2521,7 @@ pub extern "C" fn core_cmd_thread(thread: *const c_char, limit: u64, before_ts: 
             return std::ptr::null_mut();
         }
     };
-    let limit = (limit.max(1).min(500)) as usize;
+    let limit = (limit.max(1).min(5_000)) as usize;
     match roundtrip(|reply| Command::ThreadPage { thread_id: t, limit, before_ts, reply }) {
         Ok(Ok(json)) => ok_string(json),
         Ok(Err(e)) | Err(e) => {

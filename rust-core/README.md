@@ -14,8 +14,10 @@ link the Rust crate directly; it loads the release dylib at runtime.
 
 - QR link provisioning, linked-session resume, roster/whoami, contact sync,
   websocket events, and local SQLite message storage.
-- 1:1 and group text, attachments, replies, edits, reactions, delete
-  tombstones, receipts, and incoming typing events.
+- 1:1 and group text, attachments, replies (including quote-only rows), edits,
+  reactions, delete tombstones, receipts, and incoming typing events.
+- Native roster/page snapshots retain reply references and aggregate reaction
+  summaries for hydrated messages.
 - Stable client/store-timestamp message keys, UUID migration support, and
   logical deduplication in the Swift store.
 - Attachment MIME/name normalization, extensionless GIF-compatible cache
@@ -78,7 +80,8 @@ The exact declarations are in `src/lib.rs`; the important groups are:
 - Session/sync: `core_cmd_init`, `core_cmd_begin_link`,
   `core_cmd_poll_link`, `core_cmd_is_linked`, `core_cmd_roster`,
   `core_cmd_thread`, `core_cmd_whoami`, `core_cmd_request_contacts`,
-  `core_cmd_start_sync`, `core_cmd_poll_event`, and `core_cmd_logout`.
+  `core_cmd_start_sync`, `core_cmd_poll_event`, `core_cmd_logout`, and the
+  acknowledged full-wipe command `core_cmd_wipe`.
 - Messaging: `core_cmd_send`, `core_cmd_send_attachment`,
   `core_cmd_send_reply`, `core_cmd_send_delete`, `core_cmd_send_reaction`,
   `core_cmd_send_receipt`, `core_cmd_send_message_edit`,
@@ -117,9 +120,9 @@ and downloaded media. User data and the local app bundle are gitignored.
 ## Verification status
 
 - `cargo check`: passed.
-- `cargo test --lib`: 6 tests passed.
+- `cargo test --lib`: 8 tests passed.
 - `cargo build --release`: passed.
-- Full Xcode `swift test`: 38 tests passed.
+- Full Xcode `swift test`: 48 tests passed.
 - Manual verification: fresh QR link/resume, contacts/groups, name resolution,
   duplicate cleanup, message routing, and native 1:1 voice calling.
 

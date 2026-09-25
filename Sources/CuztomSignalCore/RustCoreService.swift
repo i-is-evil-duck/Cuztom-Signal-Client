@@ -19,6 +19,17 @@ public struct RosterPayload: Decodable, Sendable {
         public var id: String
         public var title: String
     }
+    public struct ReplyReference: Decodable, Sendable {
+        public var targetSts: Int64
+        public var author: String?
+        public var body: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case targetSts = "target_sts"
+            case author, body
+        }
+    }
+
     public struct Message: Decodable, Sendable {
         public var key: String
         public var thread: String
@@ -29,15 +40,21 @@ public struct RosterPayload: Decodable, Sendable {
         public var sts: Int64
         public var outgoing: Bool
         public var attachments: [WireAttachment]
+        public var replyTo: ReplyReference?
+        public var reactions: [String]
 
         private enum CodingKeys: String, CodingKey {
             case key, thread, sender, body, ts, sts, outgoing, attachments
             case senderName = "sender_name"
+            case replyTo = "reply_to"
+            case reactions
         }
 
         public init(
             key: String, thread: String, sender: String, senderName: String,
-            body: String, ts: Int64, outgoing: Bool, attachments: [WireAttachment] = []
+            body: String, ts: Int64, outgoing: Bool,
+            attachments: [WireAttachment] = [], replyTo: ReplyReference? = nil,
+            reactions: [String] = []
         ) {
             self.key = key
             self.thread = thread
@@ -48,6 +65,8 @@ public struct RosterPayload: Decodable, Sendable {
             self.sts = ts
             self.outgoing = outgoing
             self.attachments = attachments
+            self.replyTo = replyTo
+            self.reactions = reactions
         }
 
         public init(from decoder: Decoder) throws {
@@ -62,6 +81,8 @@ public struct RosterPayload: Decodable, Sendable {
             sts = try c.decodeIfPresent(Int64.self, forKey: .sts) ?? ts
             outgoing = try c.decode(Bool.self, forKey: .outgoing)
             attachments = try c.decodeIfPresent([WireAttachment].self, forKey: .attachments) ?? []
+            replyTo = try c.decodeIfPresent(ReplyReference.self, forKey: .replyTo)
+            reactions = try c.decodeIfPresent([String].self, forKey: .reactions) ?? []
         }
     }
 
@@ -98,9 +119,11 @@ struct LiveEvent: Decodable {
     // typing
     var started: Bool?
     var typingSender: String?
+    // edit/delete
+    var body: String?
 
     private enum CodingKeys: String, CodingKey {
-        case type, message, thread, emoji, remove, sender, kind, timestamps
+        case type, message, thread, emoji, remove, sender, kind, timestamps, body
         case targetSts = "target_sts"
         case senderName = "sender_name"
         case started
@@ -356,17 +379,18 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     public func fetchMessages(conversationId: String, limit: Int) async throws -> [ChatMessage] {
         guard linked || isLinkedNow() else { throw SignalError.notLinked }
+        let requestedLimit = max(0, limit)
         // Merge the seed roster with older pages until `limit` is satisfied.
         // `sts` (store clock) is the ONLY correct paging basis — the SQLite
         // range runs over the client timestamp, not the server one.
         // History only goes back to link time: Signal never syncs older
         // messages to a new linked device (protocol limitation, not a bug).
         var cached = threadCache(conversationId)
-        if cached.count < limit {
-            let oldest = cached.map(\.sts).min() ?? Int64.max
-            let before: UInt64 = oldest <= 0 ? 0 : UInt64(bitPattern: oldest)
+        if cached.count < requestedLimit {
+            let oldest = cached.map(\.sts).filter { $0 > 0 }.min()
+            let before: UInt64 = oldest.map { UInt64(bitPattern: $0) } ?? UInt64.max
             do {
-                let page = try await threadPage(conversationId, limit: limit, before: before)
+                let page = try await threadPage(conversationId, limit: requestedLimit, before: before)
                 Log.info("thread page \(conversationId): \(page.count) rows before \(before)")
                 for m in page { messageCache[m.key] = m }
                 cached = threadCache(conversationId)
@@ -375,11 +399,17 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 throw error
             }
         }
-        return Array(cached.suffix(limit)).map { chatMessage($0) }
+        return Array(cached.suffix(requestedLimit)).map { chatMessage($0) }
     }
 
     private func threadCache(_ conversationId: String) -> [RosterPayload.Message] {
-        messageCache.values.filter { $0.thread == conversationId }.sorted { $0.ts < $1.ts }
+        messageCache.values
+            .filter { $0.thread == conversationId }
+            .sorted {
+                let left = $0.sts == 0 ? $0.ts : $0.sts
+                let right = $1.sts == 0 ? $1.ts : $1.sts
+                return left == right ? $0.ts < $1.ts : left < right
+            }
     }
 
     private struct ThreadPage: Decodable {
@@ -840,52 +870,69 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         guard sym.logout() == 0 else {
             throw SignalError.network("logout failed: \(lastError(sym))")
         }
-        pumpTask?.cancel()
+        detachCallbacks()
+        let pump = pumpTask
         pumpTask = nil
+        pump?.cancel()
+        await pump?.value
         linked = false
         messageCache = [:]
         uuidCache = [:]
+        pathCache = [:]
+        localPaths = [:]
         lastRosterSummary = "never"
     }
 
-    /// Complete data wipe: logout + delete all local databases, caches, and keychain entries.
+    /// Complete data wipe: stop the native session, delete the native store,
+    /// then remove account-bound Swift caches. The native worker acknowledges
+    /// shutdown before its SQLite handle is released.
     public func clearAllData() async throws {
-        // 1. Logout from Signal when a session still exists. The operation is
-        // intentionally idempotent because the UI also clears its Swift-side
-        // state immediately afterward.
-        if linked || isLinkedNow() {
-            try await logout()
+        let sym = try await initCore()
+        detachCallbacks()
+        let pump = pumpTask
+        pumpTask = nil
+        pump?.cancel()
+        await pump?.value
+
+        if let wipe = sym.wipe {
+            guard wipe() == 0 else {
+                throw SignalError.storage("native data wipe failed: \(lastError(sym))")
+            }
         } else {
-            linked = false
-            pumpTask?.cancel()
-            pumpTask = nil
+            // Compatibility path for an older dylib. It still fails closed and
+            // never silently ignores filesystem errors.
+            if linked || sym.isLinked() == 1 {
+                guard sym.logout() == 0 else {
+                    throw SignalError.network("logout failed: \(lastError(sym))")
+                }
+            }
+            let dbURL = URL(fileURLWithPath: dbPath)
+            try removeIfPresent(dbURL)
+            try removeIfPresent(URL(fileURLWithPath: dbPath + "-wal"))
+            try removeIfPresent(URL(fileURLWithPath: dbPath + "-shm"))
+            try removeIfPresent(URL(fileURLWithPath: dbPath + "-journal"))
         }
 
-        // 2. Delete SQLite database file
-        let dbURL = URL(fileURLWithPath: dbPath)
-        try? FileManager.default.removeItem(at: dbURL)
-        // Also delete WAL/SHM files if they exist
-        try? FileManager.default.removeItem(at: dbURL.appendingPathExtension("wal"))
-        try? FileManager.default.removeItem(at: dbURL.appendingPathExtension("shm"))
-
-        // 3. Delete attachment paths cache and downloaded media
-        try? FileManager.default.removeItem(at: pathCacheURL)
+        try removeIfPresent(pathCacheURL)
         let cachesRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("CuztomSignal", isDirectory: true)
-        if let cachesRoot { try? FileManager.default.removeItem(at: cachesRoot) }
+        if let cachesRoot { try removeIfPresent(cachesRoot) }
+        try removeIfPresent(uuidCacheURL)
 
-        // 4. Delete UUID cache
-        try? FileManager.default.removeItem(at: uuidCacheURL)
-
-        // 5. Clear in-memory caches
+        didInit = false
+        linked = false
         messageCache = [:]
         uuidCache = [:]
         pathCache = [:]
         localPaths = [:]
         lastRosterSummary = "never"
         selfAci = nil
+        Log.info("RustCoreService: cleared all data (native DB and Swift caches)")
+    }
 
-        Log.info("RustCoreService: cleared all data (DB, caches, keychain)")
+    private func removeIfPresent(_ url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
     }
 
     // MARK: - private FFI
@@ -930,6 +977,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let profile: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let whoami: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let logout: @convention(c) () -> Int32
+        /// Present in rebuilt native cores; nil is tolerated for older dylibs.
+        let wipe: (@convention(c) () -> Int32)?
         let lastError: @convention(c) () -> UnsafePointer<CChar>?
         let freeString: @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
     }
@@ -940,7 +989,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private var _onCallState: ((CallStateEvent) -> Void)?
     private var _onReaction: ((String, Int64, String, Bool, String) -> Void)?
     private var _onReceipt: ((String, String, [Int64]) -> Void)?
+    private var _onReceiptScoped: ((String?, String, String, [Int64]) -> Void)?
     private var _onTyping: ((String, String, Bool) -> Void)?
+    private var _onTypingWithID: ((String, String, String, Bool) -> Void)?
+    private var _onEdit: ((String, Int64, String, String, String) -> Void)?
+    private var _onDelete: ((String, Int64, String, String) -> Void)?
 
     /// Non-message sync traffic ("queue_empty", "contacts_synced",
     /// "sync_error:…"). Fires on an internal task — hop threads as needed.
@@ -972,10 +1025,49 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         set { callbackLock.lock(); _onReceipt = newValue; callbackLock.unlock() }
     }
 
-    /// Live typing: (thread, sender name, started: Bool)
+    /// Live receipt scoped to a direct-contact thread when the native
+    /// envelope exposes one: (thread, sender ID, kind, timestamps).
+    public var onReceiptScoped: ((String?, String, String, [Int64]) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onReceiptScoped }
+        set { callbackLock.lock(); _onReceiptScoped = newValue; callbackLock.unlock() }
+    }
+
     public var onTyping: ((String, String, Bool) -> Void)? {
         get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onTyping }
         set { callbackLock.lock(); _onTyping = newValue; callbackLock.unlock() }
+    }
+
+    /// Live typing with stable sender identity: (thread, sender ID, name, started).
+    public var onTypingWithID: ((String, String, String, Bool) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onTypingWithID }
+        set { callbackLock.lock(); _onTypingWithID = newValue; callbackLock.unlock() }
+    }
+
+    /// Live edit: (thread, target store timestamp, body, sender ID, sender name).
+    public var onEdit: ((String, Int64, String, String, String) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onEdit }
+        set { callbackLock.lock(); _onEdit = newValue; callbackLock.unlock() }
+    }
+
+    /// Live delete: (thread, target store timestamp, sender ID, sender name).
+    public var onDelete: ((String, Int64, String, String) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onDelete }
+        set { callbackLock.lock(); _onDelete = newValue; callbackLock.unlock() }
+    }
+
+    private func detachCallbacks() {
+        callbackLock.lock()
+        _onSyncEvent = nil
+        _onCallSignal = nil
+        _onCallState = nil
+        _onReaction = nil
+        _onReceipt = nil
+        _onReceiptScoped = nil
+        _onTyping = nil
+        _onTypingWithID = nil
+        _onEdit = nil
+        _onDelete = nil
+        callbackLock.unlock()
     }
 
     /// "12 contacts, 3 groups, 45 msgs @ 22:01" or "never".
@@ -1069,6 +1161,13 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let id = uuidForMessage(m)
         let threadComponents = ThreadID.parse(m.thread)
         let groupMasterKey = threadComponents.groupMasterKey
+        let replyTo = m.replyTo.map {
+            MessageReference(
+                storeTs: $0.targetSts,
+                authorID: $0.author,
+                body: $0.body
+            )
+        }
         var metas: [AttachmentMeta] = []
         for (index, a) in m.attachments.enumerated() {
             // Newest source wins: live/on-demand override, then persisted
@@ -1121,7 +1220,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             status: m.outgoing ? .sent : .delivered,
             sentAt: Date(timeIntervalSince1970: Double(m.ts) / 1000),
             attachments: metas,
-            storeTs: m.sts
+            replyTo: replyTo,
+            storeTs: m.sts,
+            reactions: m.reactions
         )
     }
 
@@ -1187,11 +1288,27 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 if let thread = event.thread,
                    let sender = event.typingSender,
                    let started = event.started {
-                    onTyping?(thread, sender, started)
+                    onTypingWithID?(thread, sender, event.senderName ?? sender, started)
+                    onTyping?(thread, event.senderName ?? sender, started)
                 }
             case "receipt":
                 if let kind = event.kind, let stamps = event.timestamps {
-                    onReceipt?(event.senderName ?? event.sender ?? "?", kind, stamps)
+                    let sender = event.sender ?? event.senderName ?? "?"
+                    if let scoped = onReceiptScoped {
+                        scoped(event.thread, sender, kind, stamps)
+                    } else {
+                        onReceipt?(sender, kind, stamps)
+                    }
+                }
+            case "edit":
+                if let thread = event.thread,
+                   let sts = event.targetSts,
+                   let body = event.body {
+                    onEdit?(thread, sts, body, event.sender ?? "?", event.senderName ?? "?")
+                }
+            case "delete":
+                if let thread = event.thread, let sts = event.targetSts {
+                    onDelete?(thread, sts, event.sender ?? "?", event.senderName ?? "?")
                 }
             default:
                 onSyncEvent?(event.type)
@@ -1268,6 +1385,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
 
     private static func resolve(in handle: UnsafeMutableRawPointer) -> Symbols? {
         #if canImport(Darwin)
+        let wp = dlsym(handle, "core_cmd_wipe")
         guard let i = dlsym(handle, "core_cmd_init"),
               let b = dlsym(handle, "core_cmd_begin_link"),
               let p = dlsym(handle, "core_cmd_poll_link"),
@@ -1347,6 +1465,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             profile: unsafeBitCast(pf, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             whoami: unsafeBitCast(w, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             logout: unsafeBitCast(o, to: (@convention(c) () -> Int32).self),
+            wipe: wp.map { unsafeBitCast($0, to: (@convention(c) () -> Int32).self) },
             lastError: unsafeBitCast(e, to: (@convention(c) () -> UnsafePointer<CChar>?).self),
             freeString: unsafeBitCast(f, to: (@convention(c) (UnsafeMutablePointer<CChar>?) -> Void).self)
         )

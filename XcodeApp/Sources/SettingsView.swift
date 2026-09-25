@@ -15,7 +15,7 @@ struct SettingsView: View {
                 Button("Log out…", role: .destructive) {
                     Task { await vm.logout() }
                 }
-                .disabled(!vm.isLinked)
+                .disabled(!vm.isLinked || vm.isLoggingOut)
                 Text("Logging out wipes keys and the session. The next launch shows a fresh QR code.")
                     .font(.caption).foregroundStyle(.secondary)
             }

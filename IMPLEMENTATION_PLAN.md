@@ -34,10 +34,10 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 38/38 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 48/48 passed |
 | `swift build --target CuztomSignalCore` | Passed |
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed with warnings |
-| `cargo test --all-targets` | 6/6 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
+| `cargo test --all-targets` | 8/8 passed |
 | `cargo check --all-targets` | Passed with warnings |
 | `cargo build --release` | Passed with warnings |
 | `cargo clippy --all-targets -- -D warnings` | Not run: Clippy component unavailable |
@@ -269,9 +269,10 @@ cache used for live/sent attachments, with validation and eviction.
 - Receipt settings do not control actual network behavior.
 - Read receipts are repeatedly sent because there is no local read cursor.
 - Reactions store only `[String]` and cannot represent multiple senders.
-- Composer state is global rather than scoped to a conversation.
-- Clipboard image staging deletes its own source before copying.
-- Same-basename attachments overwrite each other.
+- [x] Scope composer state to a conversation; keep regression coverage for
+  delayed sends and account switches.
+- [x] Fix clipboard image staging so it does not delete its own source.
+- [x] Isolate same-basename attachments in conversation-scoped staging paths.
 - Failed attachment sends still delete staged files.
 - Edit failures close the editor and discard the draft.
 - SQLite errors are converted into empty/false results indistinguishable from
@@ -293,7 +294,8 @@ cache used for live/sent attachments, with validation and eviction.
 - Negative paging limits can trap.
 - SQLite schema migration is not versioned.
 - Attachment images are loaded synchronously on the UI path.
-- Video playback and thumbnail tasks are not fully cancellation-safe.
+- [x] Make expanded video playback and thumbnail tasks URL-keyed and
+  cancellation-safe, with one visible transport bar.
 
 ---
 
@@ -329,30 +331,42 @@ fails CI if the native library is missing or ABI-incompatible.
 
 **Goal:** Make the existing text-message experience correct under normal use.
 
-- [ ] Add `ChatController.stateDidChange` and connect it to the view model.
-- [ ] Ensure live messages, reactions, receipts, and connection changes update
+- [x] Add `ChatController.onStateChange` and connect it to the view model.
+- [x] Ensure live messages, reactions, receipts, and connection changes update
       the UI immediately.
-- [ ] Fix `SQLiteMessageStore.messages(in:limit:)` to return the newest page
+- [x] Fix `SQLiteMessageStore.messages(in:limit:)` to return the newest page
       in chronological display order.
-- [ ] Replace `loadMore()` boolean semantics with success/exhausted/failure
+- [x] Replace `loadMore()` boolean semantics with success/exhausted/failure
       results.
-- [ ] Protect `loadMore()` and refresh results with a selection/session
+- [x] Protect `loadMore()` and refresh results with a selection/session
       generation.
-- [ ] Fix initial paging when the Swift cache is empty.
-- [ ] Push store-timestamp ordering and limits into the native SQLite query.
-- [ ] Filter non-chat control envelopes before applying native page limits.
-- [ ] Preserve unread counts during roster metadata upserts.
-- [ ] Add a separate historical import mode that does not mark old history
+- [x] Fix initial paging when the Swift cache is empty.
+- [x] Push store-timestamp ordering and limits into the native SQLite query.
+- [x] Filter non-chat control envelopes before applying native page limits.
+- [x] Preserve unread counts during roster metadata upserts.
+- [x] Add a separate historical import mode that does not mark old history
       unread.
-- [ ] Merge duplicate message records instead of replacing them.
-- [ ] Recompute conversation preview/activity/unread state after deletion.
-- [ ] Make storage APIs failure-aware (`throws` or typed results).
-- [ ] Add production SQLite tests with 201+ messages, refreshes, replay,
-      unread state, and failed writes.
+- [x] Merge duplicate message records instead of replacing them.
+- [x] Recompute conversation preview/activity/unread state after deletion.
+- [x] Add a failure-aware authoritative storage wipe path.
+- [x] Add production SQLite tests with 201+ messages, refreshes, replay, and
+      unread state.
+- [ ] Add storage failure-injection tests.
 
 **Exit criteria:** Live messages appear without manual refresh, 500-message
 paging has no gaps/duplicates, unread state survives refresh, and local
 metadata survives replay.
+
+#### P0 rendering follow-up (completed 2026-09-24)
+
+- [x] Persist and hydrate reply references, including quote-only messages.
+- [x] Render reaction chips and hydrate reaction summaries from native roster
+      snapshots; route self-authored control envelopes by destination.
+- [x] Render reply previews and navigate/scroll to loaded quoted messages.
+- [x] Bound link, image, GIF, and video media to a chat bubble width.
+- [x] Rebuild the expanded video surface with one visible transport bar and
+      URL-keyed/cancellation-safe loading.
+- [x] Isolate drafts, replies, staged files, errors, and upload state per chat.
 
 ---
 
@@ -363,23 +377,23 @@ metadata survives replay.
 - [ ] Convert `RustCoreService` to an actor or serialize all mutable state on a
       private executor.
 - [ ] Move blocking FFI calls to a controlled background executor.
-- [ ] Enforce one native worker/account per process.
-- [ ] Reject initialization with a different database path while linked.
-- [ ] Add account/session epochs to Rust events, call signals, call actions,
+- [x] Enforce one native worker/account per process.
+- [x] Reject initialization with a different database path while linked.
+- [ ] Add account/session epochs to all events, call signals, call actions,
       Swift tasks, and cache keys.
-- [ ] Drain or invalidate queued RingRTC signals/actions during logout before
+- [x] Drain or invalidate queued RingRTC signals/actions during logout before
       allowing relink.
 - [ ] Guard call startup so rapid taps cannot create duplicate native calls.
 - [ ] Track and await all controller/service tasks.
 - [ ] Cancel watcher, refresh, selection, auto-fetch, and diagnostic tasks
       before logout/retry.
-- [ ] Make `clearAllData()` throw on any failure and never continue relinking
+- [x] Make `clearAllData()` throw on any failure and never continue relinking
       after failure.
-- [ ] Add a native shutdown/reset operation that closes stores and returns
+- [x] Add a native shutdown/reset operation that closes stores and returns
       the worker to a genuinely fresh state.
-- [ ] Reset `didInit`, `selfAci`, path maps, UUID maps, resolver state, and
+- [x] Reset `didInit`, `selfAci`, path maps, UUID maps, resolver state, and
       pending composer/call state.
-- [ ] Clear pending files and drafts on account switch.
+- [x] Clear pending files and drafts on account switch.
 - [ ] Add tests for logout failure, relink, account switching, task
       cancellation, and queued native work.
 
@@ -392,20 +406,27 @@ or task from account A can update account B.
 
 **Goal:** Make the advertised messaging features work for incoming traffic.
 
-- [ ] Add native `edit`, `delete`, and `typing` event extraction.
-- [ ] Add Swift event models and store reconciliation handlers.
-- [ ] Preserve PNI service IDs in contact, reaction, receipt, edit, and quote
-      paths.
+- [x] Add native `edit`, `delete`, and `typing` event extraction.
+- [x] Add Swift event models and store reconciliation handlers.
+- [x] Extract quote metadata from direct and synchronized messages, including
+      quote-only rows.
+- [x] Aggregate native roster reaction summaries and preserve them through
+      Swift store hydration.
+- [x] Preserve PNI service IDs in quote paths.
+- [ ] Preserve PNI service IDs in contact, reaction, receipt, and edit paths.
 - [ ] Include thread and stable sender identity in receipt events/models.
 - [ ] Persist manually downloaded attachment paths through the account-scoped
       path cache.
-- [ ] Attach GroupsV2 context/revision to all group control messages.
-- [ ] Validate group IDs and all FFI lengths before native calls.
+- [x] Attach GroupsV2 context/revision to all group control messages.
+- [x] Validate group IDs before native calls.
 - [ ] Add exact attachment lookup by stable message identity rather than a
       loose timestamp range.
 - [ ] Distinguish empty event queues from worker errors.
 - [ ] Wait for initial sync/session readiness before allowing first send.
-- [ ] Add PNI, group, edit, delete, typing, and malformed-input tests.
+- [x] Add reply, reaction-snapshot, quote-only, paging, and replay regression
+      tests.
+- [ ] Add the remaining PNI, group, edit, delete, typing, and malformed-input
+      integration tests.
 
 **Exit criteria:** Remote edits/deletes/typing update immediately, PNI and
 group control messages route correctly, and malformed input returns an error

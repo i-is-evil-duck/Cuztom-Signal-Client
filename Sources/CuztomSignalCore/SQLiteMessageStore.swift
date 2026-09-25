@@ -7,7 +7,8 @@ import GRDB
 /// Schema:
 /// - conversations: id (PK), title, peer_json, lastMessagePreview, lastActiveAt, unreadCount
 /// - messages: id (PK), conversationId (FK), author_json, body, direction, status,
-///             sentAt, attachments_json, storeTs, reactions_json, readBy_json, deliveredTo_json
+///             sentAt, attachments_json, reply_json, storeTs, reactions_json,
+///             readBy_json, deliveredTo_json
 ///
 /// Indexes on messages(conversationId, sentAt) for paging.
 public actor SQLiteMessageStore: MessageStoring {
@@ -50,12 +51,20 @@ public actor SQLiteMessageStore: MessageStoring {
             t.column("status", .text).notNull()
             t.column("sentAt", .double).notNull()
             t.column("attachments_json", .text).notNull()
+            t.column("reply_json", .text)
             t.column("storeTs", .integer)
             t.column("reactions_json", .text).notNull()
             t.column("readBy_json", .text).notNull()
             t.column("deliveredTo_json", .text).notNull()
         }
         try db.create(index: "idx_messages_conversation_sentAt", on: "messages", columns: ["conversationId", "sentAt"], ifNotExists: true)
+        try db.create(index: "idx_messages_conversation_storeTs", on: "messages", columns: ["conversationId", "storeTs"], ifNotExists: true)
+        let hasReplyJSON = try db.columns(in: "messages").contains(where: { $0.name == "reply_json" })
+        if !hasReplyJSON {
+            try db.alter(table: "messages") { table in
+                table.add(column: "reply_json", .text)
+            }
+        }
         // Reaction, delete, and other control envelopes can be stored as
         // empty DataMessages by older roster builders. They are not chat
         // messages and must not acquire a sender chip in the UI.
@@ -64,6 +73,7 @@ public actor SQLiteMessageStore: MessageStoring {
             WHERE storeTs IS NOT NULL
               AND body = ''
               AND COALESCE(json_array_length(attachments_json), 0) = 0
+              AND COALESCE(reply_json, '') = ''
             """)
         // Older builds could persist the same Signal message under two local
         // UUIDs when roster and live delivery arrived during startup. Keep the
@@ -75,10 +85,6 @@ public actor SQLiteMessageStore: MessageStoring {
                 SELECT MIN(rowid) FROM messages
                 WHERE storeTs IS NOT NULL
                 GROUP BY conversationId, storeTs, direction,
-                    CASE
-                        WHEN body = '[attachment]' AND COALESCE(json_array_length(attachments_json), 0) > 0 THEN ''
-                        ELSE body
-                    END,
                     CASE
                         WHEN direction = 'outgoing' THEN ''
                         ELSE lower(coalesce(json_extract(author_json, '$.uuidString'), ''))
@@ -110,6 +116,24 @@ public actor SQLiteMessageStore: MessageStoring {
            isPlaceholderTitle(c.title),
            !isPlaceholderTitle(oldTitle) {
             c.title = oldTitle
+        }
+        let oldState = try Row.fetchOne(
+            db,
+            sql: "SELECT lastMessagePreview, lastActiveAt, unreadCount FROM conversations WHERE id = ?",
+            arguments: [c.id]
+        )
+        if let oldState {
+            let oldPreview: String? = oldState["lastMessagePreview"]
+            let oldActiveAt: Double = oldState["lastActiveAt"]
+            let oldUnread: Int = oldState["unreadCount"]
+            let hasNewerActivity = c.lastActiveAt.timeIntervalSince1970 > oldActiveAt
+            c.unreadCount = max(c.unreadCount, oldUnread)
+            if c.lastMessagePreview == nil || !hasNewerActivity {
+                c.lastMessagePreview = oldPreview
+            }
+            if !hasNewerActivity {
+                c.lastActiveAt = Date(timeIntervalSince1970: oldActiveAt)
+            }
         }
         let peerData = try JSONEncoder().encode(c.peer)
         let peerJSON = String(data: peerData, encoding: .utf8)!
@@ -182,9 +206,14 @@ public actor SQLiteMessageStore: MessageStoring {
 
     @discardableResult
     public func saveMessage(_ message: ChatMessage) async -> Bool {
+        await saveMessage(message, countsAsUnread: true)
+    }
+
+    @discardableResult
+    public func saveMessage(_ message: ChatMessage, countsAsUnread: Bool) async -> Bool {
         do {
             return try await dbQueue.write { db in
-                try Self.saveMessage(db, message)
+                try Self.saveMessage(db, message, countsAsUnread: countsAsUnread)
             }
         } catch {
             Log.error("saveMessage failed: \(error)")
@@ -192,14 +221,18 @@ public actor SQLiteMessageStore: MessageStoring {
         }
     }
 
-    private static func saveMessage(_ db: Database, _ message: ChatMessage) throws -> Bool {
+    private static func saveMessage(
+        _ db: Database,
+        _ message: ChatMessage,
+        countsAsUnread: Bool = true
+    ) throws -> Bool {
         var messageToSave = message
         var isNew = true
 
         // First preserve an existing local UUID for the same stable message
         // identity. Roster pagination and the live receive stream can deliver
         // one Signal message with different generated UUIDs.
-        if let storeTs = message.storeTs {
+        if let storeTs = message.storeTs, storeTs > 0 {
             let candidates = try Row.fetchAll(
                 db,
                 sql: """
@@ -216,24 +249,12 @@ public actor SQLiteMessageStore: MessageStoring {
                       let author = try? JSONDecoder().decode(SignalAddress.self, from: authorData) else {
                     continue
                 }
-                let existingBody: String = row["body"]
-                let existingAttachmentsJSON: String = row["attachments_json"]
-                let existingBodyValue = Self.logicalBody(
-                    existingBody,
-                    attachmentsJSON: existingAttachmentsJSON
-                )
-                let messageBodyValue = Self.logicalBody(
-                    message.body,
-                    attachmentsJSON: String(
-                        data: (try? JSONEncoder().encode(message.attachments)) ?? Data("[]".utf8),
-                        encoding: .utf8
-                    ) ?? "[]"
-                )
-                guard existingBodyValue == messageBodyValue else { continue }
                 let sameAuthor = author.uuidString == message.author.uuidString
                     || (message.direction == .outgoing
                         && (author.uuidString == "self" || message.author.uuidString == "self"))
                 if sameAuthor {
+                    let existing = ChatMessage(row: row)
+                    messageToSave = Self.merge(existing: existing, incoming: message)
                     messageToSave.id = id
                     isNew = false
                     break
@@ -242,12 +263,15 @@ public actor SQLiteMessageStore: MessageStoring {
         }
 
         if isNew {
-            let existingIDCount = try Int.fetchOne(
+            if let existing = try ChatMessage.fetchOne(
                 db,
-                sql: "SELECT COUNT(*) FROM messages WHERE id = ?",
+                sql: "SELECT * FROM messages WHERE id = ?",
                 arguments: [message.id.uuidString]
-            ) ?? 0
-            isNew = existingIDCount == 0
+            ) {
+                messageToSave = Self.merge(existing: existing, incoming: message)
+                messageToSave.id = message.id
+                isNew = false
+            }
         }
 
         let authorData = try JSONEncoder().encode(messageToSave.author)
@@ -260,11 +284,13 @@ public actor SQLiteMessageStore: MessageStoring {
         let readByJSON = String(data: readByData, encoding: .utf8)!
         let deliveredToData = try JSONEncoder().encode(messageToSave.deliveredTo)
         let deliveredToJSON = String(data: deliveredToData, encoding: .utf8)!
+        let replyJSON = try messageToSave.replyTo.map { try JSONEncoder().encode($0) }
+            .flatMap { String(data: $0, encoding: .utf8) }
 
         try db.execute(
             sql: """
-            INSERT INTO messages (id, conversationId, author_json, body, direction, status, sentAt, attachments_json, storeTs, reactions_json, readBy_json, deliveredTo_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO messages (id, conversationId, author_json, body, direction, status, sentAt, attachments_json, reply_json, storeTs, reactions_json, readBy_json, deliveredTo_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 conversationId = excluded.conversationId,
                 author_json = excluded.author_json,
@@ -273,6 +299,7 @@ public actor SQLiteMessageStore: MessageStoring {
                 status = excluded.status,
                 sentAt = excluded.sentAt,
                 attachments_json = excluded.attachments_json,
+                reply_json = excluded.reply_json,
                 storeTs = excluded.storeTs,
                 reactions_json = excluded.reactions_json,
                 readBy_json = excluded.readBy_json,
@@ -287,6 +314,7 @@ public actor SQLiteMessageStore: MessageStoring {
                 messageToSave.status.rawValue,
                 messageToSave.sentAt.timeIntervalSince1970,
                 attachmentsJSON,
+                replyJSON,
                 messageToSave.storeTs,
                 reactionsJSON,
                 readByJSON,
@@ -298,12 +326,15 @@ public actor SQLiteMessageStore: MessageStoring {
         // message. Replays must not inflate unread counts.
         let preview = String(messageToSave.body.prefix(120))
         let lastActive = messageToSave.sentAt.timeIntervalSince1970
-        let unreadDelta = isNew && messageToSave.direction == .incoming ? 1 : 0
+        let unreadDelta = isNew && countsAsUnread && messageToSave.direction == .incoming ? 1 : 0
         try db.execute(sql: """
             INSERT INTO conversations (id, title, peer_json, lastMessagePreview, lastActiveAt, unreadCount)
             VALUES (?, '', '{}', ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                lastMessagePreview = excluded.lastMessagePreview,
+                lastMessagePreview = CASE
+                    WHEN excluded.lastActiveAt >= lastActiveAt THEN excluded.lastMessagePreview
+                    ELSE lastMessagePreview
+                END,
                 lastActiveAt = MAX(lastActiveAt, excluded.lastActiveAt),
                 unreadCount = unreadCount + excluded.unreadCount
             """,
@@ -326,11 +357,14 @@ public actor SQLiteMessageStore: MessageStoring {
         do {
             return try await dbQueue.read { db in
                 try ChatMessage.fetchAll(db, sql: """
-                    SELECT * FROM messages
-                    WHERE conversationId = ?
-                    ORDER BY sentAt ASC
-                    LIMIT ?
-                    """, arguments: [conversationId, limit])
+                    SELECT * FROM (
+                        SELECT * FROM messages
+                        WHERE conversationId = ?
+                        ORDER BY sentAt DESC, id DESC
+                        LIMIT ?
+                    ) AS newest_page
+                    ORDER BY sentAt ASC, id ASC
+                    """, arguments: [conversationId, max(0, limit)])
             }
         } catch {
             Log.error("messages failed: \(error)")
@@ -364,6 +398,21 @@ public actor SQLiteMessageStore: MessageStoring {
         }
     }
 
+    public func message(conversationId: String, storeTs: Int64) async -> ChatMessage? {
+        do {
+            return try await dbQueue.read { db in
+                try ChatMessage.fetchOne(
+                    db,
+                    sql: "SELECT * FROM messages WHERE conversationId = ? AND storeTs = ? ORDER BY sentAt DESC, id DESC LIMIT 1",
+                    arguments: [conversationId, storeTs]
+                )
+            }
+        } catch {
+            Log.error("message(conversationId:storeTs:) failed: \(error)")
+            return nil
+        }
+    }
+
     public func updateMessage(id: UUID, transform: @escaping @Sendable (inout ChatMessage) -> Void) async -> Bool {
         do {
             return try await dbQueue.write { db in
@@ -386,7 +435,7 @@ public actor SQLiteMessageStore: MessageStoring {
                 guard let msg = try ChatMessage.fetchOne(db, sql: "SELECT * FROM messages WHERE id = ?", arguments: [id.uuidString]) else {
                     return nil
                 }
-                try db.execute(sql: "DELETE FROM messages WHERE id = ?", arguments: [id.uuidString])
+                try Self.deleteMessageRow(db, msg)
                 return msg
             }
         } catch {
@@ -395,12 +444,85 @@ public actor SQLiteMessageStore: MessageStoring {
         }
     }
 
-    private static func logicalBody(_ body: String, attachmentsJSON: String) -> String {
-        let hasAttachments = (try? JSONDecoder().decode([AttachmentMeta].self, from: Data(attachmentsJSON.utf8)))?.isEmpty == false
-        if body == "[attachment]" && hasAttachments {
-            return ""
+    public func deleteMessage(conversationId: String, storeTs: Int64) async -> ChatMessage? {
+        do {
+            return try await dbQueue.write { db in
+                guard let msg = try ChatMessage.fetchOne(
+                    db,
+                    sql: "SELECT * FROM messages WHERE conversationId = ? AND storeTs = ? ORDER BY sentAt DESC, id DESC LIMIT 1",
+                    arguments: [conversationId, storeTs]
+                ) else {
+                    return nil
+                }
+                try Self.deleteMessageRow(db, msg)
+                return msg
+            }
+        } catch {
+            Log.error("deleteMessage(conversationId:storeTs:) failed: \(error)")
+            return nil
         }
-        return body
+    }
+
+    private static func deleteMessageRow(_ db: Database, _ message: ChatMessage) throws {
+        try db.execute(sql: "DELETE FROM messages WHERE id = ?", arguments: [message.id.uuidString])
+        let unreadDelta = message.direction == .incoming ? 1 : 0
+        try db.execute(
+            sql: "UPDATE conversations SET unreadCount = MAX(0, unreadCount - ?) WHERE id = ?",
+            arguments: [unreadDelta, message.conversationId]
+        )
+        if let remaining = try ChatMessage.fetchOne(
+            db,
+            sql: "SELECT * FROM messages WHERE conversationId = ? ORDER BY sentAt DESC, id DESC LIMIT 1",
+            arguments: [message.conversationId]
+        ) {
+            let preview = String(remaining.body.prefix(120))
+            let activeAt = remaining.sentAt.timeIntervalSince1970
+            try db.execute(
+                sql: "UPDATE conversations SET lastMessagePreview = ?, lastActiveAt = ? WHERE id = ?",
+                arguments: [preview, activeAt, message.conversationId]
+            )
+        } else {
+            try db.execute(
+                sql: "UPDATE conversations SET lastMessagePreview = NULL, lastActiveAt = ? WHERE id = ?",
+                arguments: [Date.distantPast.timeIntervalSince1970, message.conversationId]
+            )
+        }
+    }
+
+    private static func merge(existing: ChatMessage, incoming: ChatMessage) -> ChatMessage {
+        var merged = incoming
+        merged.reactions = orderedUnion(existing.reactions, incoming.reactions)
+        merged.readBy = orderedUnion(existing.readBy, incoming.readBy)
+        merged.deliveredTo = orderedUnion(existing.deliveredTo, incoming.deliveredTo)
+        if incoming.status == .queued, existing.status != .queued {
+            merged.status = existing.status
+        } else if existing.status == .failed, incoming.status == .sent {
+            merged.status = .failed
+        }
+        if incoming.author.displayName?.isEmpty != false {
+            merged.author.displayName = existing.author.displayName
+        }
+        if incoming.replyTo == nil {
+            merged.replyTo = existing.replyTo
+        }
+        if incoming.attachments.isEmpty {
+            merged.attachments = existing.attachments
+        } else if !existing.attachments.isEmpty {
+            for index in merged.attachments.indices
+                where merged.attachments[index].localURL == nil
+                    && index < existing.attachments.count {
+                merged.attachments[index].localURL = existing.attachments[index].localURL
+            }
+        }
+        return merged
+    }
+
+    private static func orderedUnion<T: Hashable>(_ first: [T], _ second: [T]) -> [T] {
+        var result = first
+        for value in second where !result.contains(value) {
+            result.append(value)
+        }
+        return result
     }
 
     private static func isPlaceholderTitle(_ title: String) -> Bool {
@@ -425,13 +547,27 @@ public actor SQLiteMessageStore: MessageStoring {
 
     public func clearAllData() async {
         do {
-            try await dbQueue.write { db in
-                try db.execute(sql: "DELETE FROM messages")
-                try db.execute(sql: "DELETE FROM conversations")
-            }
+            try await clearAllDataChecked()
             Log.info("SQLiteMessageStore: cleared all data")
         } catch {
             Log.error("clearAllData failed: \(error)")
+        }
+    }
+
+    public func clearAllDataChecked() async throws {
+        try await dbQueue.write { db in
+            try db.execute(sql: "DELETE FROM messages")
+            try db.execute(sql: "DELETE FROM conversations")
+        }
+        // Keep the open GRDB queue, but reclaim pages and verify that the
+        // presentation tables are empty before logout reports success.
+        try await dbQueue.writeWithoutTransaction { db in
+            try db.execute(sql: "VACUUM")
+            let messages = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messages") ?? 0
+            let conversations = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM conversations") ?? 0
+            guard messages == 0, conversations == 0 else {
+                throw SignalError.storage("presentation store wipe verification failed")
+            }
         }
     }
 }
@@ -462,6 +598,8 @@ extension ChatMessage: FetchableRecord {
         sentAt = Date(timeIntervalSince1970: row["sentAt"])
         let attachmentsJSON: String = row["attachments_json"]
         attachments = (try? JSONDecoder().decode([AttachmentMeta].self, from: Data(attachmentsJSON.utf8))) ?? []
+        let replyJSON: String? = row["reply_json"]
+        replyTo = replyJSON.flatMap { try? JSONDecoder().decode(MessageReference.self, from: Data($0.utf8)) }
         storeTs = row["storeTs"]
         let reactionsJSON: String = row["reactions_json"]
         reactions = (try? JSONDecoder().decode([String].self, from: Data(reactionsJSON.utf8))) ?? []

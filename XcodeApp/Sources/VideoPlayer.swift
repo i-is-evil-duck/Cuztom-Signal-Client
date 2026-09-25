@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVKit
 import AVFoundation
+import CryptoKit
 
 /// Video playback via AppKit directly.
 ///
@@ -15,8 +16,13 @@ struct AppKitVideoPlayer: NSViewRepresentable {
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.player = player
-        // Native Apple controls (user asked); scrub timeline included.
-        view.controlsStyle = .inline
+        // The expanded viewer owns one explicit transport bar. Keeping the
+        // AppKit surface control-free avoids two competing scrubbers and
+        // stale play/pause state on macOS 26.
+        view.controlsStyle = .none
+        view.videoGravity = .resizeAspect
+        view.showsFullScreenToggleButton = false
+        view.allowsMagnification = true
         return view
     }
 
@@ -24,10 +30,14 @@ struct AppKitVideoPlayer: NSViewRepresentable {
         if nsView.player !== player {
             nsView.player = player
         }
+        nsView.controlsStyle = .none
+        nsView.videoGravity = .resizeAspect
+        nsView.showsFullScreenToggleButton = false
     }
 
     static func dismantleNSView(_ nsView: AVPlayerView, coordinator: ()) {
         nsView.player?.pause()
+        nsView.player?.replaceCurrentItem(with: nil)
         nsView.player = nil
     }
 }
@@ -54,7 +64,7 @@ struct VideoThumbnail: View {
                         Rectangle().fill(Color.gray.opacity(0.2))
                     }
                 }
-                .frame(width: 240, height: 140)
+                .frame(width: 280, height: 164)
                 .cornerRadius(6)
                 .clipped()
                 Image(systemName: "play.circle.fill")
@@ -64,12 +74,11 @@ struct VideoThumbnail: View {
             }
         }
         .buttonStyle(.plain)
-        .task {
-            if thumb == nil {
-                thumb = await Task.detached(priority: .utility) {
-                    cachedVideoThumbnail(url: url)
-                }.value
-            }
+        .task(id: url) {
+            thumb = nil
+            thumb = await Task.detached(priority: .utility) {
+                cachedVideoThumbnail(url: url)
+            }.value
         }
     }
 }
@@ -80,7 +89,10 @@ private func thumbsDir() -> URL {
 }
 
 private func cachedVideoThumbnail(url: URL) -> NSImage? {
-    let key = "\(url.path.hashValue)-\(url.lastPathComponent)"
+    let digest = SHA256.hash(data: Data(url.path.utf8))
+        .map { String(format: "%02x", $0) }
+        .joined()
+    let key = "\(digest)-\(url.lastPathComponent)"
     let dest = thumbsDir().appendingPathComponent(key).appendingPathExtension("jpg")
     if let img = NSImage(contentsOf: dest) {
         return img

@@ -19,6 +19,7 @@ struct ContentView: View {
                 } detail: {
                     ZStack {
                         MessageListView()
+                            .id(vm.selectedId)
                         // Incoming call overlay
                         if let call = vm.incomingCall, vm.activeCall == nil {
                             IncomingCallView(
@@ -125,7 +126,6 @@ struct SidebarView: View {
 
 struct MessageListView: View {
     @Environment(ChatViewModel.self) private var vm
-    @State private var draft = ""
     @State private var loadingMore = false
     @State private var dropActive = false
 
@@ -167,16 +167,24 @@ struct MessageListView: View {
                 }
                 // Typing indicator
                 if let id = vm.selectedId,
-                   let typing = vm.typingUsers[id],
-                   typing.1 {
-                    HStack {
-                        Text("\(typing.0) is typing…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
+                   let users = vm.typingUsers[id],
+                   !users.isEmpty {
+                    let names = users.values
+                        .filter { $0.1 }
+                        .map(\.0)
+                    if !names.isEmpty {
+                        let label = names.count == 1
+                            ? "\(names[0]) is typing…"
+                            : "\(names.joined(separator: ", ")) are typing…"
+                        HStack {
+                            Text(label)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 2)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                     }
-                    .padding(.horizontal, 12).padding(.vertical, 2)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
                 if vm.selectedId != nil {
                     if vm.historyExhausted {
@@ -200,7 +208,13 @@ struct MessageListView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
                             ForEach(Array(vm.messages.enumerated()), id: \.element.id) { index, msg in
-                                MessageRow(msg: msg, showsSender: shouldShowSender(at: index))
+                                MessageRow(
+                                    msg: msg,
+                                    showsSender: shouldShowSender(at: index),
+                                    onOpenReply: { reference in
+                                        openReply(reference, proxy: proxy)
+                                    }
+                                )
                             }
                             Color.clear
                                 .frame(height: 1)
@@ -244,7 +258,7 @@ struct MessageListView: View {
                                 HStack(spacing: 4) {
                                     Image(systemName: "doc.fill")
                                     Text(url.lastPathComponent).font(.caption).lineLimit(1)
-                                    Button { vm.pendingFiles.removeAll { $0 == url } } label: {
+                                    Button { vm.removePendingFile(url) } label: {
                                         Image(systemName: "xmark.circle.fill")
                                     }
                                     .buttonStyle(.plain)
@@ -289,10 +303,16 @@ struct MessageListView: View {
                     }
                     .buttonStyle(.plain)
                     .help("Paste clipboard images/files as attachments")
-                    TextField("Message  (/help for commands)", text: $draft)
+                    TextField(
+                        "Message  (/help for commands)",
+                        text: Binding(
+                            get: { vm.draft },
+                            set: { vm.draft = $0 }
+                        )
+                    )
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { send() }
-                        .onChange(of: draft) { _, newValue in
+                        .onChange(of: vm.draft) { _, newValue in
                             if !newValue.isEmpty {
                                 Task { await vm.sendTyping(started: true) }
                             } else {
@@ -301,7 +321,7 @@ struct MessageListView: View {
                         }
                     Button(vm.sendingAttachment ? "Sending…" : "Send") { send() }
                         .keyboardShortcut(.return)
-                        .disabled((draft.trimmingCharacters(in: .whitespaces).isEmpty && vm.pendingFiles.isEmpty) || vm.sendingAttachment)
+                        .disabled((vm.draft.trimmingCharacters(in: .whitespaces).isEmpty && vm.pendingFiles.isEmpty) || vm.sendingAttachment)
                 }
                 .padding()
                 .onDrop(of: [.fileURL], isTargeted: $dropActive) { providers in
@@ -363,6 +383,39 @@ struct MessageListView: View {
         }
     }
 
+    private func openReply(_ reference: MessageReference, proxy: ScrollViewProxy) {
+        if let target = message(for: reference) {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(target.id, anchor: .center)
+            }
+            return
+        }
+
+        // Replies can point outside the currently loaded page. Grow the page
+        // once, then either jump to the target or leave a useful non-blocking
+        // status instead of presenting a blank/failed navigation action.
+        Task { @MainActor in
+            await vm.loadMore()
+            guard !Task.isCancelled, let target = message(for: reference) else {
+                vm.sendError = "The quoted message is not loaded yet"
+                return
+            }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(target.id, anchor: .center)
+            }
+        }
+    }
+
+    private func message(for reference: MessageReference) -> ChatMessage? {
+        vm.messages.first { message in
+            guard message.storeTs == reference.storeTs else { return false }
+            guard let authorID = reference.authorID,
+                  !authorID.isEmpty,
+                  let messageAuthor = message.author.uuidString else { return true }
+            return messageAuthor == authorID
+        }
+    }
+
     private func shouldShowSender(at index: Int) -> Bool {
         let message = vm.messages[index]
         guard message.direction == .incoming, message.author.groupId != nil else {
@@ -379,20 +432,27 @@ struct MessageListView: View {
     }
 
     private func send() {
-        let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = vm.draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty || !vm.pendingFiles.isEmpty,
               let targetID = vm.selectedId else { return }
-        draft = ""
+        vm.draft = ""
         // Capture the destination at the moment Send is tapped. An async
         // history refresh must never redirect this message to the old chat.
         Task { await vm.send(body, to: targetID) }
     }
 }
 
+private struct ReactionSummary: Identifiable {
+    let emoji: String
+    let count: Int
+    var id: String { emoji }
+}
+
 struct MessageRow: View {
     @Environment(ChatViewModel.self) private var vm
     var msg: ChatMessage
     var showsSender = true
+    var onOpenReply: (MessageReference) -> Void = { _ in }
 
     private let quickEmojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
 
@@ -423,6 +483,33 @@ struct MessageRow: View {
                     }
                     .padding(.bottom, 2)
                 }
+                if let reply = msg.replyTo {
+                    Button {
+                        onOpenReply(reply)
+                    } label: {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "arrowshape.turn.up.left")
+                                .font(.caption2)
+                                .foregroundStyle(Color.accentColor)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(replyAuthorName(reply))
+                                    .font(.caption2)
+                                    .foregroundStyle(Color.accentColor)
+                                    .lineLimit(1)
+                                Text(replyPreview(reply))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        .frame(maxWidth: 380, alignment: .leading)
+                        .padding(6)
+                        .background(Color.accentColor.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Open quoted message")
+                }
                 if !msg.body.isEmpty {
                     Text(msg.body)
                         .textSelection(.enabled)
@@ -434,12 +521,34 @@ struct MessageRow: View {
                 ForEach(Array(msg.attachments.enumerated()), id: \.offset) { idx, att in
                     AttachmentRow(msg: msg, index: idx, att: att)
                 }
-                if !msg.reactions.isEmpty {
-                    Text(msg.reactions.joined(separator: " "))
-                        .font(.caption)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Color.gray.opacity(0.12))
-                        .cornerRadius(8)
+                if !reactionSummary.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(reactionSummary, id: \.emoji) { reaction in
+                            Button {
+                                Task { await vm.react(message: msg, emoji: reaction.emoji) }
+                            } label: {
+                                HStack(spacing: 3) {
+                                    Text(reaction.emoji)
+                                    if reaction.count > 1 {
+                                        Text("\(reaction.count)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .font(.caption)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(
+                                    msg.reactions.contains(reaction.emoji)
+                                        ? Color.accentColor.opacity(0.22)
+                                        : Color.gray.opacity(0.12)
+                                )
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Reaction \(reaction.emoji)")
+                        }
+                    }
                 }
                 if msg.direction == .outgoing && (!msg.readBy.isEmpty || !msg.deliveredTo.isEmpty) {
                     Button {
@@ -450,6 +559,7 @@ struct MessageRow: View {
                     .buttonStyle(.plain)
                 }
             }
+            .frame(maxWidth: 560, alignment: .leading)
             .padding(8)
             .background(msg.direction == .outgoing ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -483,6 +593,28 @@ struct MessageRow: View {
         }
     }
 
+    private var reactionSummary: [ReactionSummary] {
+        var order: [String] = []
+        var counts: [String: Int] = [:]
+        for emoji in msg.reactions where !emoji.isEmpty {
+            if counts[emoji] == nil { order.append(emoji) }
+            counts[emoji, default: 0] += 1
+        }
+        return order.map { ReactionSummary(emoji: $0, count: counts[$0] ?? 0) }
+    }
+
+    private func replyAuthorName(_ reference: MessageReference) -> String {
+        guard let authorID = reference.authorID, !authorID.isEmpty else {
+            return "Quoted message"
+        }
+        return vm.displayName(for: authorID, in: msg.conversationId)
+    }
+
+    private func replyPreview(_ reference: MessageReference) -> String {
+        let body = reference.body?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return body.isEmpty ? "[attachment]" : String(body.prefix(160))
+    }
+
     private var receiptLine: String {
         var parts: [String] = []
         if !msg.readBy.isEmpty {
@@ -512,7 +644,7 @@ struct AnimatedGIFView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSImageView {
         let view = NSImageView()
-        view.imageScaling = .scaleProportionallyUpOrDown
+        view.imageScaling = .scaleProportionallyDown
         view.animates = true
         view.image = image
         return view
@@ -535,8 +667,9 @@ struct AttachmentRow: View {
             if isGIF, let url = existingURL,
                let image = AttachmentImageLoader.load(from: url) {
                 AnimatedGIFView(image: image)
-                    .frame(maxWidth: .infinity, maxHeight: 240)
-                    .cornerRadius(6)
+                    .frame(width: 280, height: 180)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .accessibilityIdentifier("attachment-gif")
                     .onTapGesture {
                         vm.preview = PreviewItem(url: url, mime: att.normalizedMIMEType, filename: att.filename)
                     }
@@ -545,8 +678,9 @@ struct AttachmentRow: View {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(maxHeight: 240)
-                    .cornerRadius(6)
+                    .frame(maxWidth: 280, maxHeight: 220)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .accessibilityIdentifier("attachment-image")
                     .onTapGesture {
                         vm.preview = PreviewItem(url: url, mime: att.normalizedMIMEType, filename: att.filename)
                     }
@@ -572,6 +706,7 @@ struct AttachmentRow: View {
                     }
                 }
                 .padding(6)
+                .frame(maxWidth: 480, alignment: .leading)
                 .background(Color.gray.opacity(0.1))
                 .cornerRadius(6)
             }
@@ -604,111 +739,272 @@ struct AttachmentPreview: View {
     var item: PreviewItem
 
     var body: some View {
-        VStack(spacing: 12) {
-            Text(item.filename).font(.headline).lineLimit(1)
-            Group {
-                let meta = AttachmentMeta(filename: item.filename, mimeType: item.mime, byteCount: 0, localURL: item.url)
-                if meta.isGIF, let image = AttachmentImageLoader.load(from: item.url) {
-                    AnimatedGIFView(image: image)
-                        .frame(maxWidth: .infinity, maxHeight: 460)
-                } else if meta.isImage, let image = AttachmentImageLoader.load(from: item.url) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                } else if meta.isVideo {
-                    SheetVideoPlayer(url: item.url)
-                } else {
-                    Image(systemName: "doc").font(.system(size: 64))
-                    Text(item.mime).foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text(item.filename)
+                    .font(.headline)
+                    .lineLimit(1)
+                Spacer()
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
                 }
+                .buttonStyle(.plain)
+                .help("Close preview")
             }
-            .frame(minWidth: 500, minHeight: 400)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            GeometryReader { proxy in
+                Group {
+                    let meta = AttachmentMeta(
+                        filename: item.filename,
+                        mimeType: item.mime,
+                        byteCount: 0,
+                        localURL: item.url
+                    )
+                    if meta.isGIF, let image = AttachmentImageLoader.load(from: item.url) {
+                        AnimatedGIFView(image: image)
+                            .frame(
+                                width: min(720, proxy.size.width),
+                                height: min(520, proxy.size.height)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    } else if meta.isImage, let image = AttachmentImageLoader.load(from: item.url) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(maxWidth: 720, maxHeight: 520)
+                    } else if meta.isVideo {
+                        SheetVideoPlayer(url: item.url)
+                    } else {
+                        VStack(spacing: 12) {
+                            Image(systemName: "doc").font(.system(size: 64))
+                            Text(item.mime).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(16)
+            }
+            .frame(minWidth: 600, idealWidth: 900, minHeight: 400, idealHeight: 620)
+            .background(Color.black.opacity(0.92))
+
+            Divider()
+
             HStack {
                 Button("Reveal in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([item.url])
                 }
                 Spacer()
-                Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
             }
+            .padding(16)
         }
-        .padding()
-        .frame(minWidth: 600, minHeight: 520)
+        .frame(minWidth: 600, idealWidth: 900, minHeight: 480, idealHeight: 680)
     }
 }
 
-/// Video player: Play/Pause + time readout, auto-sized to the media.
-/// Deliberately NO scrub timeline (scroll-to-seek removed by design).
+/// Expanded video player with one authoritative transport bar. The AppKit
+/// player surface is intentionally control-free; this view owns play/pause,
+/// seeking, time, restart, and mute so the controls cannot disagree with the
+/// actual `AVPlayer` state.
 struct SheetVideoPlayer: View {
-    var url: URL
+    let url: URL
     @State private var player: AVPlayer?
-    @State private var playing = false
+    @State private var isPlaying = false
+    @State private var isMuted = false
     @State private var aspect: CGFloat = 16.0 / 9.0
-    @State private var total: Double = 0
+    @State private var duration: Double = 0
+    @State private var currentTime: Double = 0
+    @State private var loadError: String?
 
     var body: some View {
-        VStack(spacing: 8) {
-            Group {
+        VStack(spacing: 0) {
+            ZStack {
+                Color.black
                 if let player {
                     AppKitVideoPlayer(player: player)
-                        .frame(width: frameSize.width, height: frameSize.height)
-                        .cornerRadius(8)
+                        .aspectRatio(aspect, contentMode: .fit)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let loadError {
+                    VStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.title)
+                        Text(loadError)
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding()
                 } else {
-                    ProgressView().frame(width: 480, height: 270)
+                    ProgressView("Loading video…")
                 }
             }
-            // Media controls: transport + time, no seek bar.
-            HStack(spacing: 12) {
-                Button(playing ? "Pause" : "Play") {
-                    guard let player else { return }
-                    if playing { player.pause() } else { player.play() }
-                    playing.toggle()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityIdentifier("video-surface")
+
+            VStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Text(fmt(currentTime))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .trailing)
+                    Slider(value: seekBinding, in: 0...max(duration, 1))
+                        .disabled(duration <= 0 || player == nil)
+                        .accessibilityIdentifier("video-scrubber")
+                    Text(fmt(duration))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .leading)
                 }
-                .keyboardShortcut(.space)
-                .buttonStyle(.borderedProminent)
-                TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-                    Text("\(fmt(currentSeconds)) / \(fmt(total))")
-                        .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+
+                HStack(spacing: 12) {
+                    Button {
+                        togglePlayback()
+                    } label: {
+                        Label(isPlaying ? "Pause" : "Play", systemImage: isPlaying ? "pause.fill" : "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.space)
+                    .disabled(player == nil)
+                    .accessibilityIdentifier("video-play-pause")
+
+                    Button {
+                        restart()
+                    } label: {
+                        Label("Restart", systemImage: "gobackward")
+                    }
+                    .disabled(player == nil)
+                    .accessibilityIdentifier("video-restart")
+
+                    Spacer()
+
+                    Button {
+                        isMuted.toggle()
+                        player?.isMuted = isMuted
+                    } label: {
+                        Label(isMuted ? "Unmute" : "Mute", systemImage: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    }
+                    .disabled(player == nil)
+                    .accessibilityIdentifier("video-mute")
                 }
-                Spacer()
-                Button("Restart") {
-                    player?.seek(to: .zero)
-                    player?.play()
-                    playing = true
-                }
-                .font(.caption)
             }
+            .padding(16)
+            .background(.regularMaterial)
         }
-        .task {
-            let p = AVPlayer(url: url)
-            player = p
-            aspect = await videoAspect(url: url) ?? (16.0 / 9.0)
-            if let d = try? await p.currentItem?.asset.load(.duration), d.isValid, !d.isIndefinite {
-                total = CMTimeGetSeconds(d)
-            }
-            p.play()
-            playing = true
+        .task(id: url) {
+            await prepare()
         }
         .onDisappear {
-            player?.pause()
+            teardown()
         }
     }
 
-    private var currentSeconds: Double {
-        guard let t = player?.currentTime(), t.isValid else { return 0 }
-        return CMTimeGetSeconds(t)
+    private var seekBinding: Binding<Double> {
+        Binding(
+            get: {
+                guard duration.isFinite, duration > 0 else { return 0 }
+                return min(max(currentTime, 0), duration)
+            },
+            set: { value in
+                let clamped = min(max(value, 0), max(duration, 0))
+                currentTime = clamped
+                player?.seek(
+                    to: CMTime(seconds: clamped, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                )
+            }
+        )
     }
 
-    private var frameSize: CGSize {
-        let maxW: CGFloat = 640
-        let maxH: CGFloat = 460
-        let h = min(maxH, maxW / aspect)
-        return CGSize(width: h * aspect, height: h)
+    @MainActor
+    private func prepare() async {
+        teardown()
+        loadError = nil
+
+        do {
+            let asset = AVURLAsset(url: url)
+            let loadedDuration = try await asset.load(.duration)
+            let loadedAspect = await videoAspect(url: url) ?? (16.0 / 9.0)
+            guard !Task.isCancelled else { return }
+
+            let value = CMTimeGetSeconds(loadedDuration)
+            duration = value.isFinite && value > 0 ? value : 0
+            aspect = loadedAspect
+            let newPlayer = AVPlayer(url: url)
+            newPlayer.isMuted = isMuted
+            player = newPlayer
+            newPlayer.play()
+            isPlaying = true
+
+            while !Task.isCancelled {
+                let time = newPlayer.currentTime()
+                if time.isValid {
+                    currentTime = max(0, CMTimeGetSeconds(time))
+                }
+                isPlaying = newPlayer.timeControlStatus == .playing
+                if duration > 0, currentTime >= max(0, duration - 0.05), isPlaying {
+                    newPlayer.pause()
+                    currentTime = duration
+                    isPlaying = false
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            loadError = error.localizedDescription
+            player = nil
+            isPlaying = false
+        }
     }
 
-    private func fmt(_ s: Double) -> String {
-        guard s.isFinite && s >= 0 else { return "0:00" }
-        let i = Int(s)
-        return String(format: "%d:%02d", i / 60, i % 60)
+    @MainActor
+    private func togglePlayback() {
+        guard let player else { return }
+        if isPlaying {
+            player.pause()
+            isPlaying = false
+        } else {
+            if duration > 0, currentTime >= duration - 0.05 {
+                player.seek(to: .zero)
+                currentTime = 0
+            }
+            player.play()
+            isPlaying = true
+        }
+    }
+
+    @MainActor
+    private func restart() {
+        guard let player else { return }
+        player.seek(to: .zero)
+        currentTime = 0
+        player.play()
+        isPlaying = true
+    }
+
+    @MainActor
+    private func teardown() {
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        isPlaying = false
+        currentTime = 0
+        duration = 0
+        aspect = 16.0 / 9.0
+    }
+
+    private func fmt(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "0:00" }
+        let total = Int(seconds.rounded(.down))
+        return String(format: "%d:%02d", total / 60, total % 60)
     }
 }
 
@@ -829,6 +1125,10 @@ struct LinkPreviewsView: View {
                     }
             }
         }
+        .frame(maxWidth: 520, alignment: .leading)
+        .task(id: text) {
+            previews = [:]
+        }
     }
 
     private func fetchPreview(for url: URL) async {
@@ -875,31 +1175,35 @@ struct LinkPreviewRow: View {
     let preview: LinkPreview?
 
     var body: some View {
-        HStack(spacing: 8) {
-            if let preview = preview,
-               let imageURL = preview.imageURL {
-                AsyncImage(url: imageURL) { image in
-                    image.resizable().aspectRatio(contentMode: .fill)
-                } placeholder: {
-                    Color.gray.opacity(0.2)
+        Link(destination: url) {
+            HStack(spacing: 8) {
+                if let preview = preview,
+                   let imageURL = preview.imageURL {
+                    AsyncImage(url: imageURL) { image in
+                        image.resizable().aspectRatio(contentMode: .fill)
+                    } placeholder: {
+                        Color.gray.opacity(0.2)
+                    }
+                    .frame(width: 60, height: 60)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
-                .frame(width: 60, height: 60)
-                .cornerRadius(6)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(preview?.title ?? url.host ?? url.absoluteString)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    Text(url.absoluteString)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(preview?.title ?? url.host ?? url.absoluteString)
-                    .font(.caption)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                Text(url.absoluteString)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
+            .frame(maxWidth: 520, alignment: .leading)
+            .padding(8)
+            .background(Color.gray.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
-        .padding(8)
-        .background(Color.gray.opacity(0.08))
-        .cornerRadius(8)
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("link-preview")
     }
     }

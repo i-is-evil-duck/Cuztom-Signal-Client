@@ -56,6 +56,36 @@ private let rosterFixture = """
     #expect(event.message?.body == "hi")
 }
 
+@Test func replyReferenceMapsFromRoster() throws {
+    let json = """
+    {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],"messages":[{
+      "key":"k","thread":"contact:x","sender":"x","sender_name":"X",
+      "body":"reply","ts":10,"sts":20,"outgoing":false,
+      "reply_to":{"target_sts":9,"author":"y","body":"original"}
+    }]}
+    """
+    let payload = try JSONDecoder().decode(RosterPayload.self, from: Data(json.utf8))
+    let svc = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
+    let message = svc.chatMessage(payload.messages[0])
+    #expect(message.replyTo?.storeTs == 9)
+    #expect(message.replyTo?.authorID == "y")
+    #expect(message.replyTo?.body == "original")
+}
+
+@Test func reactionSummaryMapsFromRoster() throws {
+    let json = """
+    {"self":{"aci":"a","number":"+1"},"contacts":[],"groups":[],"messages":[{
+      "key":"k","thread":"contact:x","sender":"x","sender_name":"X",
+      "body":"reacted","ts":10,"sts":20,"outgoing":false,
+      "reactions":["👍","👍","❤️"]
+    }]}
+    """
+    let payload = try JSONDecoder().decode(RosterPayload.self, from: Data(json.utf8))
+    let message = RustCoreService(libraryPath: "/nonexistent/lib.dylib")
+        .chatMessage(payload.messages[0])
+    #expect(message.reactions == ["👍", "👍", "❤️"])
+}
+
 @Test func attachmentMetadataMaps() throws {
     // chatMessage only links paths that exist on disk (stale cache prune).
     let real = FileManager.default.temporaryDirectory.appendingPathComponent("cuztom-test-photo.jpg")

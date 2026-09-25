@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -61,6 +61,7 @@ use crate::sync::StoredManager;
 
 /// A Signal `CallMessage` waiting to be sent through libsignal.
 pub struct PendingCallSignal {
+    pub session_generation: u64,
     pub thread: String,
     pub call_id: u64,
     pub proto: Vec<u8>,
@@ -70,7 +71,10 @@ pub struct PendingCallSignal {
 /// directly: it is invoked while RingRTC's internal worker is active. The core
 /// loop drains this channel instead.
 pub enum CallAction {
-    Proceed { call_id: u64 },
+    Proceed {
+        session_generation: u64,
+        call_id: u64,
+    },
 }
 
 static CALL_SIGNAL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<PendingCallSignal>> =
@@ -89,6 +93,7 @@ static CALL_MANAGER: OnceLock<Mutex<CallManager<NativePlatform>>> = OnceLock::ne
 static CALL_CONTEXT: OnceLock<NativeCallContext> = OnceLock::new();
 static CALL_AUDIO_TRACK: OnceLock<AudioTrack> = OnceLock::new();
 static LOCAL_DEVICE_ID: AtomicU32 = AtomicU32::new(1);
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn signal_tx() -> Option<&'static tokio::sync::mpsc::UnboundedSender<PendingCallSignal>> {
     CALL_SIGNAL_TX.get()
@@ -129,6 +134,19 @@ pub fn try_event() -> Option<String> {
 
 pub fn clear_events() {
     while try_event().is_some() {}
+}
+
+pub fn session_generation() -> u64 {
+    SESSION_GENERATION.load(Ordering::Acquire)
+}
+
+/// Invalidate all queued RingRTC work before an account boundary. The
+/// process-wide bridge remains alive, but messages/actions stamped with the
+/// previous generation are discarded instead of being sent after relink.
+pub fn invalidate_session() {
+    SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    clear_events();
+    drop_active_call();
 }
 
 pub fn set_self_uuid(uuid: &str) {
@@ -217,6 +235,7 @@ impl SignalingSender for CuztomSignalingSender {
             return Err(std::io::Error::other("call signaling is not initialized").into());
         };
         tx.send(PendingCallSignal {
+            session_generation: session_generation(),
             thread: recipient_id.to_string(),
             call_id: call_id.as_u64(),
             proto: proto.encode_to_vec(),
@@ -316,6 +335,7 @@ impl CallStateHandler for CuztomStateHandler {
         if matches!(state, CallState::Incoming(_) | CallState::Outgoing(_)) {
             if let Some(tx) = action_tx() {
                 let _ = tx.send(CallAction::Proceed {
+                    session_generation: session_generation(),
                     call_id: call_id.as_u64(),
                 });
             }
@@ -544,7 +564,13 @@ pub fn drop_active_call() {
 
 /// Execute an action requested by RingRTC's state callback.
 pub fn call_action(action: CallAction) {
-    let CallAction::Proceed { call_id } = action;
+    let CallAction::Proceed {
+        session_generation: action_generation,
+        call_id,
+    } = action;
+    if action_generation != session_generation() {
+        return;
+    }
     let (Some(manager), Some(context)) = (manager(), context()) else {
         return;
     };
@@ -1021,6 +1047,9 @@ pub async fn send_call_signal(
 }
 
 pub async fn transmit(manager: &mut StoredManager, pending: PendingCallSignal) -> Result<(), String> {
+    if pending.session_generation != session_generation() {
+        return Err("stale call session".to_string());
+    }
     send_call_signal(manager, &pending.thread, &base64::engine::general_purpose::STANDARD.encode(pending.proto))
         .await
 }
