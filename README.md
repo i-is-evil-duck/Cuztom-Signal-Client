@@ -137,7 +137,7 @@ then ad-hoc sign the bundle. The UI build tag comes from
 
 | Area | Status |
 |---|---|
-| Swift core tests | **66 passed** with full Xcode |
+| Swift core tests | **67 passed** with full Xcode |
 | Rust library tests | **11 passed** |
 | Rust release build | Passed; produces the native dylib |
 | Swift app build | Passed with full Xcode |

@@ -34,7 +34,7 @@ The following checks were run during the latest review:
 
 | Check | Result |
 |---|---|
-| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 66/66 passed |
+| `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` | 67/67 passed |
 | `swift build --target CuztomSignalCore` | Passed |
 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product CuztomSignal` | Passed |
 | `cargo test --all-targets` | 11/11 passed |
@@ -466,7 +466,8 @@ metadata survives replay.
       checks and a process-wide serial background executor.
 - [x] Drain or invalidate queued RingRTC signals/actions during logout before
       allowing relink.
-- [ ] Guard call startup so rapid taps cannot create duplicate native calls.
+- [x] Guard call startup so rapid taps cannot create duplicate native calls;
+      the in-flight flag and lifecycle generation fence the post-FFI commit.
 - [ ] Track and await all controller/service tasks.
 - [x] Track app selection/diagnostics tasks and await them before retry/logout.
 - [ ] Cancel watcher, refresh, selection, auto-fetch, and diagnostic tasks
@@ -482,6 +483,8 @@ metadata survives replay.
       cancellation semantics, lifecycle-gate ordering, idempotent unlinked
       logout, explicit relink gating, failed native/presentation teardown
       poisoning, and cross-instance refusal.
+- [x] Add a delayed-service integration regression proving a stale
+      `finish()` continuation cannot publish after logout.
 - [ ] Add full controller/native integration coverage for logout failure,
       account switching, task cancellation, and queued call actions.
 
