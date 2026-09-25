@@ -1007,6 +1007,150 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         )
     }
 
+    /// Wire shape of the native `group_update` event.
+    private struct GroupCallUpdateEvent: Decodable {
+        let update: String
+        let clientId: UInt32
+        let state: String?
+        let reason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case update, state, reason
+            case clientId = "client_id"
+        }
+
+        /// An unknown update is dropped rather than guessed at, so a newer core
+        /// cannot make this build act on a state it does not understand.
+        func groupCallUpdate() -> GroupCallUpdate? {
+            guard let kind = GroupCallUpdate.Kind(rawValue: update) else { return nil }
+            return GroupCallUpdate(
+                kind: kind,
+                clientId: clientId,
+                state: state,
+                reason: reason
+            )
+        }
+    }
+
+    /// A state change from a native group call.
+    ///
+    /// `requestMembershipProof` is the one that matters for actually joining:
+    /// RingRTC will not send its SFU join request until a proof is presented, so
+    /// the host has to fetch a ZK credential, redeem it at the CDN, and answer
+    /// with `groupCallSetMembershipProof(clientId:token:)`.
+    public struct GroupCallUpdate: Sendable, Equatable {
+        public enum Kind: String, Sendable, Equatable {
+            case requestMembershipProof = "request_membership_proof"
+            case requestGroupMembers = "request_group_members"
+            case connectionStateChanged = "connection_state_changed"
+            case joinStateChanged = "join_state_changed"
+            case ended
+            case reactions
+            case raisedHands = "raised_hands"
+            case speechEvent = "speech_event"
+            case remoteMute = "remote_mute"
+            case observedRemoteMute = "observed_remote_mute"
+        }
+
+        public let kind: Kind
+        public let clientId: UInt32
+        public let state: String?
+        public let reason: String?
+
+        public init(
+            kind: Kind,
+            clientId: UInt32,
+            state: String? = nil,
+            reason: String? = nil
+        ) {
+            self.kind = kind
+            self.clientId = clientId
+            self.state = state
+            self.reason = reason
+        }
+    }
+
+    /// A native group call asked the host for something it cannot do itself.
+    public var onGroupCallUpdate: ((GroupCallUpdate) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onGroupCallUpdate }
+        set { callbackLock.lock(); _onGroupCallUpdate = newValue; callbackLock.unlock() }
+    }
+
+    /// Hand a group-call membership proof to RingRTC.
+    ///
+    /// This is the step that unblocks the SFU join, so a failure here means the
+    /// call cannot connect rather than degrading quietly.
+    public func groupCallSetMembershipProof(clientId: UInt32, token: [UInt8]) async throws {
+        let tokenSession = try sessionEpoch.capture()
+        let proof = token
+        try await withCore(token: tokenSession) { sym in
+            let rc = proof.withUnsafeBufferPointer { buffer in
+                sym.groupCallSetMembershipProof(clientId, buffer.baseAddress, buffer.count)
+            }
+            guard rc == 0 else {
+                throw SignalError.network(
+                    "group membership proof rejected: \(Self.lastError(sym))"
+                )
+            }
+        }
+    }
+
+    /// Flatten member identities into the C ABI's three parallel buffers.
+    ///
+    /// Kept as a pure function so the `withCore` closure captures immutable
+    /// values, which Swift 6 concurrency requires.
+    static func flattenGroupMembers(
+        _ members: [(userId: [UInt8], memberId: [UInt8])]
+    ) throws -> (userIds: [UInt8], memberLens: [UInt32], memberIds: [UInt8]) {
+        var userIds = [UInt8]()
+        var memberLens = [UInt32]()
+        var memberIds = [UInt8]()
+        for (index, member) in members.enumerated() {
+            guard member.userId.count == 16, !member.memberId.isEmpty else {
+                throw SignalError.network("group member \(index) identity was malformed")
+            }
+            userIds.append(contentsOf: member.userId)
+            memberLens.append(UInt32(member.memberId.count))
+            memberIds.append(contentsOf: member.memberId)
+        }
+        return (userIds, memberLens, memberIds)
+    }
+
+    /// Supply the member identities the SFU needs to attribute call traffic.
+    ///
+    /// Encrypted-UID ciphertexts are variable length, so an explicit length per
+    /// member is sent rather than a fixed stride. Malformed entries are
+    /// rejected here rather than being passed on to be read out of bounds.
+    public func groupCallSetGroupMembers(
+        clientId: UInt32,
+        members: [(userId: [UInt8], memberId: [UInt8])]
+    ) async throws {
+        let (userIdBytes, memberLengths, memberIdBytes) =
+            try Self.flattenGroupMembers(members)
+        let count = UInt32(members.count)
+        let memberBytes = UInt32(memberIdBytes.count)
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = userIdBytes.withUnsafeBufferPointer { userBuffer in
+                memberLengths.withUnsafeBufferPointer { lengthBuffer in
+                    memberIdBytes.withUnsafeBufferPointer { memberBuffer in
+                        sym.groupCallSetGroupMembers(
+                            clientId,
+                            count,
+                            userBuffer.baseAddress,
+                            lengthBuffer.baseAddress,
+                            memberBuffer.baseAddress,
+                            memberBytes
+                        )
+                    }
+                }
+            }
+            guard rc == 0 else {
+                throw SignalError.network("group members rejected: \(Self.lastError(sym))")
+            }
+        }
+    }
+
     /// An SFU request RingRTC raised and handed to the host to perform.
     ///
     /// RingRTC has no HTTP transport in this core, so every SFU request stalls
@@ -1098,6 +1242,15 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 body: body
             )
         }
+    }
+
+    /// Decode a `group_update` event. Exposed for tests only; the production
+    /// path is `drainEvents`, which additionally guards on the session epoch.
+    static func decodeGroupCallUpdateForTesting(_ data: Data) -> GroupCallUpdate? {
+        guard let event = try? JSONDecoder().decode(GroupCallUpdateEvent.self, from: data) else {
+            return nil
+        }
+        return event.groupCallUpdate()
     }
 
     /// Decode an `http_request` event. Exposed for tests only; the production
@@ -1514,6 +1667,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let callSetMuted: @convention(c) (Int32) -> Int32
         let httpResponse: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupAuthCredentials: @convention(c) () -> UnsafeMutablePointer<CChar>?
+        let groupCallSetMembershipProof: @convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32
+        let groupCallSetGroupMembers: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32
         // Call signaling integration
         let sendCallSignal: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
         let buildCallOffer: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -1538,6 +1693,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     private var _onCallSignal: ((CallSignal) -> Void)?
     private var _onCallState: ((CallStateEvent) -> Void)?
     private var _onHTTPRequest: ((PendingHTTPRequest) -> Void)?
+    private var _onGroupCallUpdate: ((GroupCallUpdate) -> Void)?
     private var _onReaction: ((String, Int64, String, Bool, String) -> Void)?
     private var _onReceipt: ((String, String, [Int64]) -> Void)?
     private var _onReceiptScoped: ((String?, String, String, [Int64]) -> Void)?
@@ -1618,6 +1774,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         _onCallSignal = nil
         _onCallState = nil
         _onHTTPRequest = nil
+        _onGroupCallUpdate = nil
         _onReaction = nil
         _onReceipt = nil
         _onReceiptScoped = nil
@@ -1843,6 +2000,14 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                    sessionEpoch.isCurrent(token),
                    let pending = request.pendingRequest() {
                     onHTTPRequest?(pending)
+                }
+                continue
+            }
+            if event.type == "group_update" {
+                if let update = try? JSONDecoder().decode(GroupCallUpdateEvent.self, from: data),
+                   sessionEpoch.isCurrent(token),
+                   let groupUpdate = update.groupCallUpdate() {
+                    onGroupCallUpdate?(groupUpdate)
                 }
                 continue
             }
@@ -2133,6 +2298,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let csm = dlsym(handle, "core_cmd_call_set_muted"),
               let chr = dlsym(handle, "core_cmd_http_response"),
               let cgac = dlsym(handle, "core_cmd_group_auth_credentials"),
+              let cgcsm = dlsym(handle, "core_cmd_group_call_set_membership_proof"),
+              let cgcs = dlsym(handle, "core_cmd_group_call_set_group_members"),
               let scs = dlsym(handle, "core_cmd_send_call_signal"),
               let bco = dlsym(handle, "core_cmd_build_call_offer"),
               let bca = dlsym(handle, "core_cmd_build_call_answer"),
@@ -2177,6 +2344,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             callSetMuted: unsafeBitCast(csm, to: (@convention(c) (Int32) -> Int32).self),
             httpResponse: unsafeBitCast(chr, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupAuthCredentials: unsafeBitCast(cgac, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
+            groupCallSetMembershipProof: unsafeBitCast(cgcsm, to: (@convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
+            groupCallSetGroupMembers: unsafeBitCast(cgcs, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32).self),
             sendCallSignal: unsafeBitCast(scs, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self),
             buildCallOffer: unsafeBitCast(bco, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             buildCallAnswer: unsafeBitCast(bca, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),

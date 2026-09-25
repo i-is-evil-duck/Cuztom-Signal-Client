@@ -78,6 +78,26 @@ int32_t core_cmd_call_set_muted(int32_t muted);
  * released with core_free_string(), or NULL on error. */
 char *core_cmd_group_auth_credentials(void);
 
+/* Hand a group-call membership proof to RingRTC. RingRTC asks for this via a
+ * `request_membership_proof` group update and will not send its SFU join request
+ * until one arrives. Returns 0 on success, -1 on error. */
+int32_t core_cmd_group_call_set_membership_proof(
+    uint32_t client_id,
+    const uint8_t *proof,
+    size_t proof_len);
+
+/* Supply the member identities the SFU needs to attribute call traffic.
+ * `user_ids` is `count` concatenated 16-byte service ids, `member_lens` is
+ * `count` u32 byte lengths, and `member_ids` holds the concatenated encrypted-UID
+ * ciphertexts. Returns 0 on success, -1 on error. */
+int32_t core_cmd_group_call_set_group_members(
+    uint32_t client_id,
+    uint32_t count,
+    const uint8_t *user_ids,
+    const uint32_t *member_lens,
+    const uint8_t *member_ids,
+    uint32_t member_count);
+
 /* Deliver an SFU HTTP response that the host performed for RingRTC.
  * RingRTC raises SFU requests as `http_request` events and stalls until this
  * is called with the matching request id. A `status` of 0 reports that the

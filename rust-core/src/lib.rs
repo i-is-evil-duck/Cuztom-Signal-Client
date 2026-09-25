@@ -278,6 +278,23 @@ enum Command {
     GroupAuthCredentials {
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Hand a group-call membership proof to RingRTC, unblocking the SFU join.
+    GroupCallSetMembershipProof {
+        client_id: u32,
+        token: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Supply the member identities the SFU needs to attribute call traffic.
+    /// Encrypted ids are variable length, so an explicit length per entry is
+    /// sent rather than a fixed stride.
+    GroupCallSetGroupMembers {
+        client_id: u32,
+        count: u32,
+        user_ids: Vec<u8>,
+        member_lens: Vec<u32>,
+        member_ids: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Logout {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -851,6 +868,27 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::GroupAuthCredentials { reply } => {
                             let result = cmd_group_auth_credentials(&state).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallSetMembershipProof { client_id, token, reply } => {
+                            let result = call::set_group_membership_proof(client_id, token);
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallSetGroupMembers {
+                            client_id,
+                            count,
+                            user_ids,
+                            member_lens,
+                            member_ids,
+                            reply,
+                        } => {
+                            let result = call::set_group_members(
+                                client_id,
+                                count,
+                                user_ids,
+                                member_lens,
+                                member_ids,
+                            );
                             let _ = reply.send(result);
                         }
                         Command::Logout { reply } => {
@@ -2058,6 +2096,45 @@ fn cmd_call_set_muted(state: &WorkerState, muted: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Hand a group-call membership proof to RingRTC.
+///
+/// RingRTC asks for this via `RequestMembershipProof` and will not send its SFU
+/// join request until one arrives, so a failure here means the call cannot
+/// connect rather than degrading quietly.
+fn cmd_group_call_set_membership_proof(
+    state: &WorkerState,
+    client_id: u32,
+    token: Vec<u8>,
+) -> Result<(), String> {
+    if !matches!(state, WorkerState::Linked(_)) {
+        return Err("not linked".to_string());
+    }
+    if token.is_empty() {
+        return Err("membership proof was empty".to_string());
+    }
+    call::set_group_membership_proof(client_id, token)
+}
+
+/// Supply the member identities the SFU needs to attribute call traffic.
+///
+/// `user_ids` is `count` concatenated 16-byte service ids, `member_lens` is
+/// `count` `u32` byte lengths, and `member_ids` holds the concatenated
+/// ciphertexts. The lengths are validated here rather than trusted from the
+/// caller.
+fn cmd_group_call_set_group_members(
+    state: &WorkerState,
+    client_id: u32,
+    count: u32,
+    user_ids: Vec<u8>,
+    member_lens: Vec<u32>,
+    member_ids: Vec<u8>,
+) -> Result<(), String> {
+    if !matches!(state, WorkerState::Linked(_)) {
+        return Err("not linked".to_string());
+    }
+    call::set_group_members(client_id, count, user_ids, member_lens, member_ids)
+}
+
 /// Deliver an SFU response the host performed for RingRTC.
 ///
 /// RingRTC has no HTTP transport of its own here, so every SFU request/peek
@@ -3138,6 +3215,71 @@ pub extern "C" fn core_cmd_call_hangup() -> i32 {
 #[no_mangle]
 pub extern "C" fn core_cmd_call_set_muted(muted: i32) -> i32 {
     match roundtrip(|reply| Command::CallSetMuted { muted: muted != 0, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Hand a group-call membership proof to RingRTC.
+///
+/// RingRTC asks for this via a `request_membership_proof` group update and will
+/// not send its SFU join request until one arrives, so a failure here means the
+/// call cannot connect rather than degrading quietly. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_set_membership_proof(
+    client_id: u32,
+    proof: *const u8,
+    proof_len: usize,
+) -> i32 {
+    let token = if proof.is_null() || proof_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(proof, proof_len).to_vec() }
+    };
+    match roundtrip(|reply| Command::GroupCallSetMembershipProof { client_id, token, reply }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
+/// Supply the member identities the SFU needs to attribute call traffic.
+///
+/// `user_ids` is `count` concatenated 16-byte service ids, `member_lens` is
+/// `count` `u32` byte lengths, and `member_ids` holds the concatenated
+/// encrypted-UID ciphertexts. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_set_group_members(
+    client_id: u32,
+    count: u32,
+    user_ids: *const u8,
+    member_lens: *const u32,
+    member_ids: *const u8,
+    member_count: u32,
+) -> i32 {
+    let user_count = count as usize;
+    let users = if user_ids.is_null() || user_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(user_ids, user_count * 16).to_vec() }
+    };
+    let lens = if member_lens.is_null() || user_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(member_lens, user_count).to_vec() }
+    };
+    let ids = if member_ids.is_null() || member_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(member_ids, member_count as usize).to_vec() }
+    };
+    match roundtrip(|reply| Command::GroupCallSetGroupMembers {
+        client_id,
+        count,
+        user_ids: users,
+        member_lens: lens,
+        member_ids: ids,
+        reply,
+    }) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
     }

@@ -136,7 +136,7 @@ hop and all lifecycle/UI work are better in Swift.
 | 2 | Authenticated credential fetch | presage patch → Rust FFI | Vendored presage | **Done** — 12 Rust + 6 Swift tests |
 | 3 | CDN token fetch (`GET /v2/groups/token`) | Swift | Mock transport | **Done** — 13 tests | ✅ |
 | 4 | SFU request/response bridge | Rust + Swift | Injected synthetic response | **Done** — ABI 3, 6 tests | ✅ |
-| 5 | Group-call lifecycle + opaque signaling transport | Rust | Fake SFU client | Not started | ⬜ |
+| 5 | Group-call lifecycle + opaque signaling transport | Rust | Fake SFU client | **In progress** — proof trigger + member framing done | 🟡 |
 | 6 | `GroupCallController` + UI | Swift | Against the fake bridge | Not started | ⬜ |
 
 Increments 3 and 4 come early on purpose: a wrong basic-auth header or a
@@ -149,6 +149,23 @@ pieces most worth proving with tests before anything is built on top of them.
 Swift loader rejects them at `core_abi_version` instead of loading a core that
 would leave every SFU request unanswered. A pre-ABI-3 bundle therefore fails
 loudly at startup rather than hanging on join.
+
+### Still to do in increment 5
+
+The membership-proof trigger and the member-identity framing are in place, so
+the proof path is now complete from RingRTC's request through to the token being
+handed back. Remaining:
+
+- Commands to create a group call client, `connect`, `join`, `leave`, and
+  `delete`, backed by `CallManager::create_group_call_client`.
+- Outbound signaling: `SignalingSender::send_call_message_to_group` still
+  returns "group calls are not supported". It needs the RingRTC bytes wrapped
+  in a Signal `CallMessage.opaque` and sent via presage's
+  `send_message_to_group`, which requires resolving RingRTC's 32-byte group id
+  back to the group master key.
+- Inbound signaling: `sync::call_signal_part` drops a `CallMessage` that
+  carries only `opaque`, so group-call messages never reach
+  `CallManager::received_call_message`.
 
 ### Open decision: how to carry the presage patch
 

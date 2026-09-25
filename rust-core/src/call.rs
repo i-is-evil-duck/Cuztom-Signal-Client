@@ -314,6 +314,31 @@ fn state_name(state: &CallState) -> &'static str {
     }
 }
 
+/// Wire name for a call end reason, shared by 1:1 state events and group-call
+/// `ended` updates so the UI sees one vocabulary.
+fn end_reason_name(reason: CallEndReason) -> &'static str {
+    match reason {
+        CallEndReason::LocalHangup => "ended_local",
+        CallEndReason::RemoteHangup => "ended_remote",
+        CallEndReason::RemoteHangupNeedPermission => "ended_need_permission",
+        CallEndReason::RemoteHangupAccepted => "ended_accepted",
+        CallEndReason::RemoteHangupDeclined => "ended_declined",
+        CallEndReason::RemoteHangupBusy => "ended_busy",
+        CallEndReason::RemoteBusy => "busy",
+        CallEndReason::RemoteGlare => "glare",
+        CallEndReason::RemoteReCall => "recall",
+        CallEndReason::Timeout => "timeout",
+        CallEndReason::InternalFailure => "failed",
+        CallEndReason::SignalingFailure => "signaling_failed",
+        CallEndReason::ConnectionFailure => "connection_failed",
+        CallEndReason::AppDroppedCall => "dropped",
+        CallEndReason::DeviceExplicitlyDisconnected => "disconnected",
+        CallEndReason::ServerExplicitlyDisconnected => "server_disconnected",
+        CallEndReason::DeniedRequestToJoinCall => "denied",
+        _ => "ended",
+    }
+}
+
 struct CuztomStateHandler;
 
 impl CallStateHandler for CuztomStateHandler {
@@ -383,7 +408,92 @@ impl CallStateHandler for CuztomStateHandler {
 
 struct CuztomGroupHandler;
 impl GroupUpdateHandler for CuztomGroupHandler {
-    fn handle_group_update(&self, _update: GroupUpdate) -> ringrtc::common::Result<()> {
+    /// Surface the updates the host has to act on.
+    ///
+    /// `RequestMembershipProof` is the one that starts a group call joining:
+    /// RingRTC will not send its SFU join request until a proof is presented, so
+    /// this update is what triggers the host to fetch a ZK credential, redeem it
+    /// at the CDN, and hand the token back.
+    ///
+    /// `RequestGroupMembers` is surfaced for the same reason: the SFU needs the
+    /// member map before it can attribute encrypted call traffic.
+    ///
+    /// The remaining updates are observational and are emitted too, so the UI
+    /// can show real state instead of guessing. Anything that would otherwise
+    /// be dropped is emitted as a single `group_update` JSON event on the same
+    /// bounded channel the call-state events use; if the host is not draining
+    /// it, the update is dropped rather than blocking RingRTC.
+    fn handle_group_update(&self, update: GroupUpdate) -> ringrtc::common::Result<()> {
+        let payload = match &update {
+            GroupUpdate::RequestMembershipProof(client_id) => serde_json::json!({
+                "type": "group_update",
+                "update": "request_membership_proof",
+                "client_id": *client_id,
+            }),
+            GroupUpdate::RequestGroupMembers(client_id) => serde_json::json!({
+                "type": "group_update",
+                "update": "request_group_members",
+                "client_id": *client_id,
+            }),
+            GroupUpdate::ConnectionStateChanged(client_id, state) => serde_json::json!({
+                "type": "group_update",
+                "update": "connection_state_changed",
+                "client_id": *client_id,
+                "state": format!("{state:?}"),
+            }),
+            GroupUpdate::JoinStateChanged(client_id, state) => serde_json::json!({
+                "type": "group_update",
+                "update": "join_state_changed",
+                "client_id": *client_id,
+                "state": format!("{state:?}"),
+            }),
+            GroupUpdate::Ended(client_id, reason, _summary) => serde_json::json!({
+                "type": "group_update",
+                "update": "ended",
+                "client_id": *client_id,
+                "reason": end_reason_name(*reason),
+            }),
+            GroupUpdate::Reactions(client_id, reactions) => serde_json::json!({
+                "type": "group_update",
+                "update": "reactions",
+                "client_id": *client_id,
+                "reactions": reactions.iter().map(|r| r.value.clone()).collect::<Vec<_>>(),
+            }),
+            GroupUpdate::RaisedHands(client_id, demux_ids) => serde_json::json!({
+                "type": "group_update",
+                "update": "raised_hands",
+                "client_id": *client_id,
+                "count": demux_ids.len(),
+            }),
+            GroupUpdate::SpeechEvent(client_id, event) => serde_json::json!({
+                "type": "group_update",
+                "update": "speech_event",
+                "client_id": *client_id,
+                "event": format!("{event:?}"),
+            }),
+            GroupUpdate::RemoteMute { client_id, mute_source } => serde_json::json!({
+                "type": "group_update",
+                "update": "remote_mute",
+                "client_id": *client_id,
+                "demux_id": *mute_source,
+            }),
+            GroupUpdate::ObservedRemoteMute { client_id, mute_source, mute_target } => {
+                serde_json::json!({
+                    "type": "group_update",
+                    "update": "observed_remote_mute",
+                    "client_id": *client_id,
+                    "demux_id": *mute_source,
+                    "target_demux_id": *mute_target,
+                })
+            }
+            // Ringing, stats, audio levels, bandwidth hints and network routes
+            // are not represented in the UI yet. They are dropped here rather
+            // than guessed at.
+            _ => return Ok(()),
+        };
+        if let Some(tx) = event_tx() {
+            let _ = tx.try_send(payload.to_string());
+        }
         Ok(())
     }
 }
@@ -419,6 +529,87 @@ impl http::Delegate for CuztomHttpDelegate {
             );
         }
     }
+}
+
+/// Hand a group-call membership proof to RingRTC.
+pub fn set_group_membership_proof(client_id: u32, token: Vec<u8>) -> Result<(), String> {
+    let manager = manager().ok_or_else(|| "call stack not initialized".to_string())?;
+    let mut guard = manager
+        .lock()
+        .map_err(|_| "call manager lock poisoned".to_string())?;
+    guard.set_membership_proof(client_id, token);
+    Ok(())
+}
+
+/// Supply the member identities the SFU needs to attribute call traffic.
+///
+/// Encrypted-UID ciphertexts are variable length, so the members are framed
+/// with an explicit length per entry rather than a fixed stride:
+///
+/// * `user_ids` — `count` concatenated 16-byte service ids
+/// * `member_lens` — `count` `u32` byte lengths
+/// * `member_ids` — the concatenated ciphertexts
+///
+/// Every length is validated here rather than trusted, so a malformed buffer is
+/// rejected instead of being read out of bounds.
+pub fn set_group_members(
+    client_id: u32,
+    count: u32,
+    user_ids: Vec<u8>,
+    member_lens: Vec<u32>,
+    member_ids: Vec<u8>,
+) -> Result<(), String> {
+    use ringrtc::lite::sfu::GroupMember;
+
+    const USER_ID_LEN: usize = 16;
+    let count = count as usize;
+    if user_ids.len() != count * USER_ID_LEN {
+        return Err(format!(
+            "expected {} user id bytes, got {}",
+            count * USER_ID_LEN,
+            user_ids.len()
+        ));
+    }
+    if member_lens.len() != count {
+        return Err(format!(
+            "expected {count} member id lengths, got {}",
+            member_lens.len()
+        ));
+    }
+    let expected_total: usize = member_lens.iter().map(|len| *len as usize).sum();
+    if expected_total != member_ids.len() {
+        return Err(format!(
+            "member id lengths total {expected_total} but {} bytes were supplied",
+            member_ids.len()
+        ));
+    }
+
+    let mut members = Vec::with_capacity(count);
+    let mut cursor = 0usize;
+    for (index, len) in member_lens.iter().enumerate() {
+        let len = *len as usize;
+        if len == 0 {
+            return Err(format!("member {index} had an empty encrypted id"));
+        }
+        let user_start = index * USER_ID_LEN;
+        let mut user_id: [u8; USER_ID_LEN] = [0u8; USER_ID_LEN];
+        user_id.copy_from_slice(&user_ids[user_start..user_start + USER_ID_LEN]);
+        if user_id == [0u8; USER_ID_LEN] {
+            return Err(format!("member {index} had an all-zero service id"));
+        }
+        members.push(GroupMember {
+            user_id: user_id.to_vec(),
+            member_id: member_ids[cursor..cursor + len].to_vec(),
+        });
+        cursor += len;
+    }
+
+    let manager = manager().ok_or_else(|| "call stack not initialized".to_string())?;
+    let mut guard = manager
+        .lock()
+        .map_err(|_| "call manager lock poisoned".to_string())?;
+    guard.set_group_members(client_id, members);
+    Ok(())
 }
 
 /// Hand an SFU response back to RingRTC.
