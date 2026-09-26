@@ -346,12 +346,21 @@ impl SignalingSender for CuztomSignalingSender {
         let Some(tx) = signal_tx() else {
             return Err(std::io::Error::other("call signaling is not initialized").into());
         };
+        // Logged, because whether RingRTC asks for a targeted send at all is the
+        // difference between "the key is not being sent" and "it is sent and the
+        // peer still cannot decode it", and nothing else in this build can tell
+        // those apart. RingRTC's own logging is not visible here.
+        eprintln!(
+            "[core] group media key to one recipient thread={thread} bytes={}",
+            proto.len()
+        );
         tx.try_send(PendingCallSignal::Targeted {
             session_generation: session_generation(),
             thread,
             proto,
         })
         .map_err(|error| {
+            eprintln!("[core] targeted group signal not queued: {error}");
             std::io::Error::other(match error {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => "call signaling queue is full",
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => "call signaling receiver is closed",
@@ -385,6 +394,11 @@ impl SignalingSender for CuztomSignalingSender {
             matches!(urgency, SignalingMessageUrgency::HandleImmediately),
         )
         .map_err(|e| std::io::Error::other(format!("group call signal: {e}")))?;
+        eprintln!(
+            "[core] group media key to the group members={} bytes={}",
+            _recipients_override.len(),
+            proto.len()
+        );
 
         let Some(tx) = signal_tx() else {
             return Err(std::io::Error::other("call signaling is not initialized").into());
