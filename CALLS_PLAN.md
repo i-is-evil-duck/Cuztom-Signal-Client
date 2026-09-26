@@ -413,6 +413,25 @@ is logged so a mismatch names itself.
   (`a_targeted_group_signal_is_carried_in_the_same_opaque_envelope`,
   `a_ringrtc_recipient_id_becomes_the_thread_it_is_addressed_by`)
 
+- **A group call says whether its microphone is muted.** RingRTC starts a group
+  call with `outgoing_heartbeat_state.audio_muted: None` and reads that as
+  **muted**:
+
+  ```rust
+  !state.outgoing_heartbeat_state.audio_muted.unwrap_or(true)   // None ⇒ muted
+  ```
+
+  Nothing in the call path ever said otherwise, so the heartbeat broadcast to the
+  other members reported this client as having its microphone off, and its own
+  speaking detection treated it as silent. A peer reported exactly that — "mic and
+  camera turned off" — alongside "can't receive audio and video".
+  `CallManager::set_outgoing_audio_muted` already existed; the host simply never
+  called it. It is now called on both entry points, before the join, so the very
+  first heartbeat already says the microphone is live. The default is fail-closed,
+  which is the right default and the wrong one for a host that has already asked
+  the user and been told yes.
+  (`everyGroupCallSaysItsMicrophoneIsLive`)
+
 ## Where the group-call join actually stands
 **A group call connects.** Verified 2026-09-25 against the real SFU,
 `sfu.voip.signal.org`:

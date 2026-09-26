@@ -159,7 +159,10 @@ struct LiveEvent: Decodable {
 public final class RustCoreService: SignalService, @unchecked Sendable {
     /// ABI 5 added `core_cmd_sfu_http_request`, so the SFU's own requests are
     /// performed on a client trusted with the service certificate authority.
-    public static let expectedNativeABI: UInt32 = 5
+    /// ABI 6 added `core_cmd_group_call_set_audio_muted`: RingRTC reads an unset
+    /// audio-muted heartbeat as muted, so a group call has to say otherwise or
+    /// the rest of the call believes it is silent.
+    public static let expectedNativeABI: UInt32 = 6
     /// The production Signal SFU. Group calls use it unless a staging build
     /// explicitly overrides it, and it is never inferred from the environment.
     public static let defaultSFUURL = "https://sfu.voip.signal.org"
@@ -1506,6 +1509,22 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     ///
     /// This is the step that unblocks the SFU join, so a failure here means the
     /// call cannot connect rather than degrading quietly.
+    /// Say whether this device's microphone is muted in a group call.
+    ///
+    /// Not optional, and not cosmetic. RingRTC starts a group call with the
+    /// audio-muted heartbeat field unset and reads that as muted, so without this
+    /// the rest of the call is told this client has its microphone off — and its
+    /// own speaking detection treats it as silent.
+    public func groupCallSetAudioMuted(clientId: UInt32, muted: Bool) async throws {
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = sym.groupCallSetAudioMuted(clientId, muted ? 1 : 0)
+            guard rc == 0 else {
+                throw SignalError.network("could not set group call audio: \(Self.lastError(sym))")
+            }
+        }
+    }
+
     public func groupCallSetMembershipProof(clientId: UInt32, token: [UInt8]) async throws {
         let tokenSession = try sessionEpoch.capture()
         let proof = token
@@ -2231,6 +2250,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let groupCallProofAuthorization: @convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?
         let groupCallGroupId: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let groupCallMemberIdentities: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+        let groupCallSetAudioMuted: @convention(c) (UInt32, UInt32) -> Int32
         let groupCallSetMembershipProof: @convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupCallSetGroupMembers: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32
         let groupCallStart: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64
@@ -2893,6 +2913,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cgcpa = dlsym(handle, "core_cmd_group_call_proof_authorization"),
               let cgcid = dlsym(handle, "core_cmd_group_call_group_id"),
               let cgcmi = dlsym(handle, "core_cmd_group_call_member_identities"),
+              let cgcas = dlsym(handle, "core_cmd_group_call_set_audio_muted"),
               let cgcsm = dlsym(handle, "core_cmd_group_call_set_membership_proof"),
               let cgcs = dlsym(handle, "core_cmd_group_call_set_group_members"),
               let cgcs2 = dlsym(handle, "core_cmd_group_call_start"),
@@ -2951,6 +2972,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             groupCallProofAuthorization: unsafeBitCast(cgcpa, to: (@convention(c) (UnsafePointer<UInt8>?, UInt32) -> UnsafeMutablePointer<CChar>?).self),
             groupCallGroupId: unsafeBitCast(cgcid, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             groupCallMemberIdentities: unsafeBitCast(cgcmi, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
+            groupCallSetAudioMuted: unsafeBitCast(cgcas, to: (@convention(c) (UInt32, UInt32) -> Int32).self),
             groupCallSetMembershipProof: unsafeBitCast(cgcsm, to: (@convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupCallSetGroupMembers: unsafeBitCast(cgcs, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32).self),
             groupCallStart: unsafeBitCast(cgcs2, to: (@convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64).self),

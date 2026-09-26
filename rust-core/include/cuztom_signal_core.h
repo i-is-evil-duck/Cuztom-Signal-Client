@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CUZTOM_SIGNAL_CORE_ABI_VERSION 5u
+#define CUZTOM_SIGNAL_CORE_ABI_VERSION 6u
 
 #ifdef __cplusplus
 extern "C" {
@@ -156,6 +156,14 @@ int32_t core_cmd_group_call_set_membership_proof(
     uint32_t client_id,
     const uint8_t *proof,
     size_t proof_len);
+
+/* Say whether this device's microphone is muted in a group call.
+ *
+ * RingRTC begins a group call with the audio-muted heartbeat field unset and
+ * reads that as muted, so a host that never calls this is a participant the rest
+ * of the call believes has its microphone off. `muted` is 0 or 1. Returns 0 on
+ * success, -1 on error. */
+int32_t core_cmd_group_call_set_audio_muted(uint32_t client_id, uint32_t muted);
 
 /* Supply the member identities the SFU needs to attribute call traffic.
  * `user_ids` is `count` concatenated 16-byte service ids, `member_lens` is

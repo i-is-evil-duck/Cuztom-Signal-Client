@@ -103,6 +103,10 @@ struct GroupCallControllerTests {
             steps.append("presentProof(\(token.count) bytes)")
         }
 
+        func groupCallSetAudioMuted(clientId: UInt32, muted: Bool) async throws {
+            steps.append("setAudioMuted(\(muted))")
+        }
+
         func groupCallSetGroupMembers(
             clientId: UInt32,
             members: [(userId: [UInt8], memberId: [UInt8])]
@@ -1302,6 +1306,46 @@ struct GroupCallControllerTests {
         // scratch - with the banner gone and the reason only in the log - is the
         // worst of the three options.
         #expect(answering.incoming != nil, "the ring survives so it can be retried")
+    }
+
+    /// A group call must say its microphone is live, or the call is silent.
+    ///
+    /// RingRTC starts a group call with the audio-muted heartbeat field unset and
+    /// reads that as muted. Nothing else in the path ever corrects it, so the
+    /// other participants are told this client has its microphone off — which is
+    /// what a peer reported, alongside "can't receive audio and video".
+    ///
+    /// Checked on both entry points, because a call is a call whichever way it
+    /// was entered, and the default is silent.
+    @Test @MainActor func everyGroupCallSaysItsMicrophoneIsLive() async throws {
+        // Outgoing.
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        #expect(
+            bridge.steps.contains("setAudioMuted(false)"),
+            "an outgoing group call unmutes itself"
+        )
+
+        // Answered.
+        var roster = FakeRoster()
+        roster.knownGroupIdHex = Self.groupIdHex
+        let answerBridge = FakeBridge()
+        let answering = makeController(bridge: answerBridge, roster: roster)
+        _ = await answering.answer(
+            GroupCallController.GroupCallRing(
+                groupIdHex: Self.groupIdHex,
+                ringId: 1,
+                senderIdHex: nil,
+                title: nil
+            )
+        )
+        await settle(answering)
+        #expect(
+            answerBridge.steps.contains("setAudioMuted(false)"),
+            "answering a ring unmutes too"
+        )
     }
 
     // MARK: - Inbound

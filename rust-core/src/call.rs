@@ -1930,6 +1930,25 @@ pub(crate) fn recipient_uuid_text_for_test(recipient: &[u8]) -> Option<String> {
     recipient_uuid_text(recipient)
 }
 
+/// Say whether this device's microphone is muted in a group call.
+///
+/// **This has to be called explicitly, and not calling it means muted.** RingRTC
+/// starts a group call with `outgoing_heartbeat_state.audio_muted: None` and
+/// reads `None` as muted, so the heartbeat broadcast to the other members says
+/// this client has its microphone off, and its own speaking detection treats it as
+/// silent. The default is fail-closed, which is the right default and the wrong
+/// one for a host that has already asked the user and been told yes.
+///
+/// `CallManager::set_outgoing_audio_muted` already exists; the host simply has
+/// to call it, which Signal Desktop does immediately after connecting a group
+/// call.
+pub fn set_group_call_audio_muted(client_id: u32, muted: bool) -> Result<(), String> {
+    require_tracked(client_id)?;
+    with_manager(|m| m.set_outgoing_audio_muted(client_id, muted))?;
+    eprintln!("[core] group call audio muted={muted} client={client_id}");
+    Ok(())
+}
+
 /// Ring a group, as the creator of the call.
 ///
 /// RingRTC owns the ring. It derives the `ring_id` from the SFU's `era_id`, asks

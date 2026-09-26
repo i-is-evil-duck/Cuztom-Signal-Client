@@ -329,6 +329,16 @@ enum Command {
         token: Vec<u8>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Say whether this device's microphone is muted in a group call.
+    ///
+    /// Not optional. RingRTC starts a group call with the audio-muted heartbeat
+    /// field unset and reads that as muted, so a host that never says otherwise
+    /// is a participant the rest of the call believes has its microphone off.
+    GroupCallSetAudioMuted {
+        client_id: u32,
+        muted: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Supply the member identities the SFU needs to attribute call traffic.
     /// Encrypted ids are variable length, so an explicit length per entry is
     /// sent rather than a fixed stride.
@@ -1014,6 +1024,10 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::GroupCallSetMembershipProof { client_id, token, reply } => {
                             let result = call::set_group_membership_proof(client_id, token);
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallSetAudioMuted { client_id, muted, reply } => {
+                            let result = call::set_group_call_audio_muted(client_id, muted);
                             let _ = reply.send(result);
                         }
                         Command::GroupCallStart { group_id, sfu_url, reply } => {
@@ -2955,7 +2969,7 @@ async fn cmd_fetch_attachment(
 /// 3 adds `core_cmd_http_response`, which lets the host perform the SFU
 /// requests RingRTC raises. Older dylibs lack that symbol, so the loader
 /// rejects them rather than stalling group calls on unanswered SFU requests.
-pub const CORE_ABI_VERSION: u32 = 5;
+pub const CORE_ABI_VERSION: u32 = 6;
 
 #[no_mangle]
 pub extern "C" fn core_abi_version() -> u32 {
@@ -3850,6 +3864,24 @@ pub extern "C" fn core_cmd_group_call_set_membership_proof(
     }
 }
 
+/// Say whether this device's microphone is muted in a group call.
+///
+/// RingRTC begins a group call with the audio-muted heartbeat field unset and
+/// reads that as muted, so this has to be called or the rest of the call is told
+/// this client has its microphone off. `muted` is 0 or 1. Returns 0 on success,
+/// -1 on error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_set_audio_muted(client_id: u32, muted: u32) -> i32 {
+    match roundtrip(|reply| Command::GroupCallSetAudioMuted {
+        client_id,
+        muted: muted != 0,
+        reply,
+    }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
 /// Supply the member identities the SFU needs to attribute call traffic.
 ///
 /// `user_ids` is `count` concatenated 16-byte service ids, `member_lens` is
@@ -4456,7 +4488,9 @@ mod tests {
         // 4 - the group call proof and the two host derivations
         // 5 - core_cmd_sfu_http_request, so the SFU's own requests are performed
         //     on a client trusted with the service certificate authority
-        assert_eq!(core_abi_version(), 5);
+        // 6 - core_cmd_group_call_set_audio_muted, because RingRTC reads an unset
+        //     audio-muted heartbeat as muted and the host has to say otherwise
+        assert_eq!(core_abi_version(), 6);
         assert_eq!(core_abi_version(), CORE_ABI_VERSION);
     }
 

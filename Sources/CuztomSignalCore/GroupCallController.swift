@@ -113,6 +113,14 @@ public protocol GroupCallNativeControlling: AnyObject, Sendable {
     func leaveGroupCall(_ call: RustCoreService.GroupCallHandle) async throws
     func endGroupCall(_ call: RustCoreService.GroupCallHandle) async throws
     func groupCallSetMembershipProof(clientId: UInt32, token: [UInt8]) async throws
+
+    /// Say whether this device's microphone is muted.
+    ///
+    /// Required, not cosmetic: RingRTC starts a group call with the audio-muted
+    /// heartbeat unset and reads that as muted, so a controller that never says
+    /// otherwise is a participant the rest of the call believes has no
+    /// microphone.
+    func groupCallSetAudioMuted(clientId: UInt32, muted: Bool) async throws
     func groupCallSetGroupMembers(
         clientId: UInt32,
         members: [(userId: [UInt8], memberId: [UInt8])]
@@ -444,6 +452,10 @@ public final class GroupCallController: ObservableObject {
         )
         // Joining is what raises the membership-proof request. The SFU join is
         // blocked until a proof is presented, so this must happen now.
+        // Before the join, so the very first heartbeat already says the
+        // microphone is live. RingRTC's default is muted and nothing else in this
+        // path would ever correct it.
+        await setAudioMuted(false, clientId: handle.clientId)
         try await bridge.joinGroupCall(handle)
         Log.info("[group-call] step=join-requested client=\(handle.clientId)")
         return current ?? GroupCallState(
@@ -931,6 +943,25 @@ public final class GroupCallController: ObservableObject {
     /// path can be exercised without a device or TCC approval.
     var microphonePermissionOverride: (@Sendable () async -> Bool)?
 
+    /// Say whether this device's microphone is muted, and report the default.
+    ///
+    /// Called as soon as a client exists, on every path, because RingRTC's
+    /// default is "muted" and a client that never says otherwise is a participant
+    /// the rest of the call believes is silent. A failure is reported rather than
+    /// fatal: the call is still a call, and a user who cannot unmute can hear
+    /// other people.
+    @discardableResult
+    private func setAudioMuted(_ muted: Bool, clientId: UInt32) async -> Bool {
+        guard let bridge else { return false }
+        do {
+            try await bridge.groupCallSetAudioMuted(clientId: clientId, muted: muted)
+            return true
+        } catch {
+            Log.error("[group-call] could not set audio muted=\(muted): \(Self.describe(error))")
+            return false
+        }
+    }
+
     /// A client created for an inbound call that has not been answered.
     ///
     /// RingRTC drops signaling for a group it has no client for, so one has to
@@ -1028,7 +1059,11 @@ public final class GroupCallController: ObservableObject {
                 phase: .connecting,
                 isOutgoing: false
             )
-            try await bridge.joinGroupCall(handle)
+            // Before the join, so the very first heartbeat already says the
+        // microphone is live. RingRTC's default is muted and nothing else in this
+        // path would ever correct it.
+        await setAudioMuted(false, clientId: handle.clientId)
+        try await bridge.joinGroupCall(handle)
             Log.info("[group-call] step=join-requested client=\(handle.clientId) (answered)")
             return current
         } catch {
