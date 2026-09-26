@@ -85,3 +85,33 @@ See `IMPLEMENTATION_PLAN.md` for the detailed status matrix and
       hardware/keyboard mic mute would present as a call that is mysteriously
       muted with no user action taken. Worth adding before chasing any further
       "the mic is muted" report.
+
+## Group call: gaps found by diffing against signalapp/Signal-Desktop
+
+Read against `ts/services/calling.preload.ts` and
+`ts/calling/VideoSupport.preload.ts`.
+
+- [ ] **No group call update message on join or leave.** When the local device
+      reaches `Joined`, Signal sends a `GroupCallUpdate` carrying the call's
+      `eraId` (`#onGroupCallJoined` ->
+      `ts/jobs/helpers/sendGroupCallUpdate.preload.ts`). That is how other
+      members' devices learn a call is happening, and it is what makes a call
+      discoverable by someone who is not being rung. This client never announces;
+      it only ever receives rings. A member who is not ringing us has no way to
+      know the call exists.
+- [ ] **No peeking before joining.** `peekGroupCall()` fetches a proof and peeks
+      without connecting, so the lobby can show the participant count, whether the
+      call is full (`maxDevices`), who is ringing, and whether joining is even
+      possible. This client joins blind and only learns the participant list once
+      it is already in the call.
+- [ ] **A denied microphone permission cancels the call here.** Signal logs
+      "Permissions were denied, but allow joining group call" and joins anyway.
+      This client refuses to start. That is a deliberate difference and arguably
+      the safer one, but it is a divergence and should be a decision rather than
+      an accident.
+- [ ] **Audio devices are selected once, at init.** Signal runs
+      `#startDeviceReselectionTimer()` so a device plugged in mid-call is picked
+      up. This client calls `select_default_audio_devices` a single time with a
+      5s deadline.
+- [ ] No global mute state. Signal keeps `muteStateChange` and mirrors it into
+      every call; see the system-mic-mute item above.

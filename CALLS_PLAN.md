@@ -664,6 +664,16 @@ per-call, so they are never printed.
 
 ### Cross-checked against Signal's own source
 
+Verified claim by claim against the repository rather than taken on trust. The
+flow matches ours closely, and one hypothesis died on contact:
+`enableCaptureAndSend` — the "start local media capture" step in the flow — turns
+out to be **video only** (`ts/calling/VideoSupport.preload.ts`), starting the
+camera and attaching the video sender. Audio capture is entirely inside RingRTC's
+native layer, driven by the track created with the peer connection factory, which
+is what this client already does. So there was no missing audio step here.
+
+
+
 The asar on disk is the shipped, minified client, so it settles behaviour but not
 intent. `signalapp/Signal-Desktop` confirms the same thing readably, on the actual
 group-call path (`ts/services/calling.preload.ts`, `ts/util/zkgroup.node.ts`):
