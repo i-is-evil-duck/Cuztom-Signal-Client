@@ -10,7 +10,7 @@ virtual audio device.
 > an App Store product; distribution should use a signed/notarized build with
 > appropriate licensing disclosures.
 
-## Current status — 2026-09-25
+## Current status — 2026-09-26
 
 ### Working
 
@@ -44,12 +44,26 @@ virtual audio device.
   session fences, cancellation-safe queued work, and cross-instance wipe poison.
 - Native RingRTC-backed 1:1 voice calls with ICE/DTLS, microphone capture,
   mute, hangup, incoming/outgoing state, and elapsed time UI.
+- Group calls that join Signal's production SFU: the ZK membership proof is
+  fetched, presented and redeemed natively, ICE connects, and media keys and
+  heartbeats flow in both directions. Group ringing is composed by RingRTC.
+  Two-party audio was silent until 2026-09-26, when the cause was found to be a
+  64-byte member id where the SFU hashes 65; the fix is in and awaiting one live
+  call to confirm it. See `GROUP_CALLS.md`.
 
 ### Not yet complete
 
-- Group calls. The 1:1 RingRTC path is intentionally isolated while Signal
-  membership-proof retrieval, group/member identity derivation, SFU HTTP
-  requests/responses, and opaque group-call signaling are implemented.
+- Two-party group call audio, pending confirmation of the member-id fix above.
+- The call never announces itself: unlike Signal, this client does not send a
+  group-call update carrying the call's `eraId` on join, so a member who is not
+  ringing has no way to learn the call exists.
+- No peeking before joining a group call, so there is no lobby participant
+  count, no capacity check, and no way to know joining is possible before
+  committing to it.
+- A group call has a banner, not a call screen. 1:1 video's "Start Video" is a
+  local flag with no media behind it, and incoming video renders nowhere.
+- The sync loop does not reconnect: when the message stream ends, every later
+  request fails, SFU requests included.
 - Authenticated TURN relay discovery and reliable calls to a fully offline
   peer. The current sender does not expose Signal's urgent-message flag.
 - APNs/VoIP push, launch-at-login/background keepalive, and killed-app
@@ -110,9 +124,10 @@ Important implementation areas:
 - `Sources/CuztomSignalCore/AudioOutputRouter.swift` — CoreAudio output routing
   for the call speaker toggle.
 - `Sources/CuztomSignalCore/GroupCallProofService.swift` — group-call
-  membership-proof redemption at the CDN. Partial: it takes the authorization
-  value from the native core, but nothing supplies that yet, so no group call
-  can complete. See `CALLS_PLAN.md`.
+  membership-proof redemption at the CDN, driven end to end by the native core.
+- `Sources/CuztomSignalCore/GroupCallController.swift` — group call lifecycle:
+  proof presentation, roster supply, ringing, answering, declining, and the
+  microphone and camera controls.
 
 ## Build and test
 
@@ -190,8 +205,10 @@ XcodeApp/Sources/               SwiftUI app and macOS notification coordinator
 Tests/CuztomSignalCoreTests/    Swift Testing coverage
 rust-core/                      Rust presage/libsignal/RingRTC core and C ABI
 scripts/                        Local app bundle build and preflight checks
+GROUP_CALLS.md                   Group calls: comparison against Signal, and
+                                 the ordered work list with acceptance criteria
 IMPLEMENTATION_PLAN.md           Detailed completion/open-work status
-CALLS_PLAN.md                    Native call implementation and limitations
+CALLS_PLAN.md                    Chronological record of the native call path
 TODO.md                          Prioritized remaining work
 ```
 

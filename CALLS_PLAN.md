@@ -1,15 +1,26 @@
 # Native call implementation status (RingRTC, macOS)
 
-_Last updated: 2026-09-24_
+_Last updated: 2026-09-26_
+
+**This file is the chronological record**: how the call path was built, what each
+bug turned out to be, and why each fix looks the way it does. For the current
+state, the comparison against Signal's own implementation, and the ordered list of
+what is left to build, see **[`GROUP_CALLS.md`](GROUP_CALLS.md)**.
 
 ## Goal and scope
 
 Cuztom Signal uses native RingRTC/WebRTC for calls. There is no `signal-cli`
 subprocess and no virtual-audio-device bridge.
 
-The supported release scope is **native 1:1 voice calling**. Group calls are
-intentionally disabled until Signal membership proofs, group/member identity
-derivation, SFU HTTP support, and opaque group signaling are implemented.
+**1:1 voice calling is verified working between two real clients.**
+
+Group calls join Signal's production SFU: the ZK membership proof is fetched,
+presented and redeemed natively, the SFU admits the client, ICE connects, media
+keys and heartbeats flow both ways, and RingRTC composes the ring. That much is
+verified live. Two-party audio was silent in both directions until 2026-09-26,
+when the cause was found to be a 64-byte member id where the SFU hashes 65 — see
+[the silence, explained end to end](#the-silence-explained-end-to-end). The fix
+is in and **awaiting one live call to confirm it**.
 
 ## Completed foundation
 
@@ -58,9 +69,17 @@ derivation, SFU HTTP support, and opaque group signaling are implemented.
   RingRTC.
 - Two-client 1:1 voice call with microphone capture was manually verified.
 
-## Group-call blocker
+## Group-call blocker — resolved 2026-09-26
 
-The group-call button remains disabled. **Research update 2026-09-25:** the
+> **Historical.** Every item below is done. The membership proof is fetched,
+> presented and redeemed natively; group ids, member identities, the SFU HTTP
+> bridge, opaque group signaling over `CallMessage.opaque`, the group-call FFI
+> commands and the Swift lifecycle and UI are all implemented and verified
+> against the production SFU. What remained afterwards was two-party audio, whose
+> cause is [the silence, explained end to end](#the-silence-explained-end-to-end).
+> Current state and remaining work: [`GROUP_CALLS.md`](GROUP_CALLS.md).
+
+The group-call button was disabled. **Research update 2026-09-25:** the
 membership proof — previously assumed to require an unimplemented calling
 server — is in fact obtainable. Traced from the installed Signal Desktop
 8.28.0 bundle (`app.asar` → `bundles/preload/main.js`):
