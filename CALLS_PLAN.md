@@ -285,6 +285,54 @@ evidence that the body is the message expected, and it is not evidence that a
 token was issued. Both are claimed only once the body is parsed, and the format
 is logged so a mismatch names itself.
 
+## Where the group-call join actually stands
+
+The ZK chain is verified against the real service:
+
+| Step | Evidence |
+| --- | --- |
+| credential fetched | `group credential response: 4666 bytes, credentials=4, days=[20721..20724]` |
+| presentation built | `presented 1461 hex chars` (97-byte public params + 633-byte presentation, matching a local probe exactly) |
+| token redeemed | `group token responded HTTP 200 OK, 170 bytes` |
+| token decoded | `step=proof-present … tokenBytes=165` |
+| delivered to RingRTC | `step=proof-accepted` |
+
+Unverified: everything after that. RingRTC's own SFU join request and the
+WebRTC connection.
+
+**Two things that are not what they were assumed to be**, both corrected against
+Signal Desktop 8.28.0 and its log:
+
+- The token is redeemed at `storage.signal.org/v2/groups/token`, not a CDN.
+- **ICE servers are not fetched for group calls.** `GET v2/calling/relays` is a
+  1:1 thing, and Signal's log shows it under `CallingClass.handleStartCall` for
+  an incoming 1:1 call. RingRTC's group call path hardcodes `let ice_servers =
+  vec![];` (`group_call.rs:1374`) and takes its configuration from the SFU's own
+  join response instead. So authenticated TURN is not a group-call blocker, and
+  implementing it would have been wasted work. It does remain a real limit on
+  1:1 connectivity.
+
+**The SFU is reachable and its certificate is the expected one:**
+`sfu.voip.signal.org` presents a Signal Messenger certificate, self-signed in
+chain as `verify error:num=19`, which is why a host HTTP client must be built
+with the service configuration's CA.
+
+### Superseded proof attempts must not report failure
+
+RingRTC asks for a membership proof more than once, and a second request arrives
+while the first is still inside a native call. `Task.cancel()` does not reach
+`groupCallProofAuthorization` or `fetchToken` - both are foreign calls that run
+to completion - so the replaced flow used to carry on and report its own
+cancellation through `fail()`. `CancellationError` has no description, so it fell
+through `describe`'s generic branch and produced "the call could not be
+completed" against a call that was still joining. A fabricated reason is worse
+than no reason.
+
+Attempts are now counted per client and compared before each step and before any
+reporting, so a replaced flow abandons quietly and logs why, and only the
+surviving flow delivers a token. `describe` names a cancellation instead of
+letting it reach the generic branch.
+
 Measurement used to establish this, against
 `storage.signal.org/v2/groups/token` directly:
 
@@ -313,3 +361,9 @@ Before changing call code, preserve:
   by `call::tests::an_authorization_header_appends_rather_than_replaces`, which
   pins the reqwest append behavior the `Unidentified` override works around, so
   the fix cannot be silently reverted by a dependency bump.
+- A repeated membership-proof request does not fail the call, does not release
+  the native client, and does not deliver a second token. Covered by
+  `aSecondProofRequestSupersedesTheFirstWithoutFailingTheCall` and
+  `aSupersededFlowDoesNotDeliverItsToken`.
+- A cancellation is never described as a join failure
+  (`aCancellationIsNotDescribedAsAJoinFailure`).

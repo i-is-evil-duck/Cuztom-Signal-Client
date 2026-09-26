@@ -153,7 +153,12 @@ answered `200` with a 170-byte body that the protobuf decoder refused, and a `2x
 alone cannot tell "a shape we do not know" from "no token". A `0x7b` opening byte
 means JSON; `1f 8b` means the service compressed a response this client cannot
 decompress, since no `gzip`/`brotli`/`zstd` feature is enabled anywhere in the
-dependency graph.
+dependency graph. The endpoint now answers protobuf and the token decodes.
+
+**`CUZTOM_LOG_SFU_BODIES` opts into printing the success body.** Off by default
+because that body is the call token. It exists for the one case the logged shape
+cannot resolve, and it is a local debug switch, not a diagnostic that should be
+left on.
 
 ## Why the alternative was rejected
 

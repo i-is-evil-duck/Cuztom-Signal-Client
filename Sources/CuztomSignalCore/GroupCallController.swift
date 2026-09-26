@@ -486,6 +486,11 @@ public final class GroupCallController: ObservableObject {
                 return
             }
             self.session = session
+            // Supersede any flow still running for this client. A second request
+            // while the first is still fetching a credential is normal - the
+            // native calls are not cancellable - so the older one is replaced
+            // rather than left to race this one to `set_membership_proof`.
+            beginAttempt("proof-\(update.clientId)")
             track("proof-\(update.clientId)") { [weak self] in
                 await self?.presentMembershipProof(clientId: update.clientId)
             }
@@ -522,12 +527,15 @@ public final class GroupCallController: ObservableObject {
     /// Every step is logged by name but never by value. The authorization string
     /// and the resulting token are both secret, and neither is written anywhere.
     private func presentMembershipProof(clientId: UInt32) async {
+        let key = "proof-\(clientId)"
+        let generation = beginAttempt(key)
         guard let bridge, let session, session.handle.clientId == clientId else { return }
         do {
             Log.info("[group-call] step=proof-fetch client=\(clientId)")
             let authorization = try await bridge.groupCallProofAuthorization(
                 groupIdHex: session.handle.groupIdHex
             )
+            if abandonIfSuperseded(key, generation, "proof-fetch") { return }
             Log.info("[group-call] step=proof-redeem client=\(clientId)")
             // The hosts come from the service configuration. Each is tried in
             // the order the service lists them: a host that is simply not
@@ -566,15 +574,33 @@ public final class GroupCallController: ObservableObject {
                 )
             }
             Log.info("[group-call] step=proof-present client=\(clientId) tokenBytes=\(proof.token.count)")
+            if abandonIfSuperseded(key, generation, "proof-present") { return }
             guard self.session?.handle.clientId == clientId else {
                 // The call ended while the CDN round trip was in flight. The
                 // token is dropped rather than handed to a dead client.
                 return
             }
+            // Enter and return are both logged because this is the call the whole
+            // join is waiting on, and a return that never arrives is
+            // indistinguishable from a join that never proceeds. Nothing is
+            // written about the token.
+            Log.info("[group-call] step=proof-deliver-begin client=\(clientId)")
             try await bridge.groupCallSetMembershipProof(clientId: clientId, token: proof.token)
+            Log.info("[group-call] step=proof-deliver-end client=\(clientId)")
             self.session?.proofPresented = true
             Log.info("[group-call] step=proof-accepted client=\(clientId)")
         } catch {
+            // A cancelled task is this flow being replaced, not the call failing.
+            // Reporting it as a failure is how a successful join gets a fabricated
+            // reason attached to it.
+            if error is CancellationError || Task.isCancelled {
+                Log.info("[group-call] step=proof-cancelled client=\(clientId); a newer attempt owns the join")
+                return
+            }
+            if isSuperseded(key, generation) {
+                Log.info("[group-call] step=proof-failed-superseded client=\(clientId) error=\(Self.describe(error))")
+                return
+            }
             fail("Could not join the call: \(Self.describe(error))")
         }
     }
@@ -704,9 +730,52 @@ public final class GroupCallController: ObservableObject {
         trackedTasks[key] = Task { @MainActor in await body() }
     }
 
+    /// Whether a superseded task is being run, per tracked key.
+    ///
+    /// `track` cancels the previous `Task`, but cancellation does not reach the
+    /// native calls: `groupCallProofAuthorization` and `fetchToken` are foreign
+    /// function calls that run to completion whatever the Swift task state is.
+    /// A superseded flow therefore finishes normally, and used to report its own
+    /// cancellation as a join failure - which is worse than no reporting, because
+    /// `CancellationError` has no description and lands on `describe`'s generic
+    /// fallback, producing "the call could not be completed" for a call that
+    /// might be about to succeed. That is a fabricated reason, in the one place
+    /// a real reason is needed.
+    ///
+    /// A counter rather than a flag: two requests can supersede each other and
+    /// come back out of order, and a bool would let an older flow clear a newer
+    /// one's flag.
+    private var supersededGenerations: [String: UInt64] = [:]
+
+    /// Mark the current attempt for `key` as replaced and return the new
+    /// generation. A flow captures this and compares before every step and
+    /// before reporting anything.
+    private func beginAttempt(_ key: String) -> UInt64 {
+        let next = (supersededGenerations[key] ?? 0) &+ 1
+        supersededGenerations[key] = next
+        return next
+    }
+
+    /// True when a newer attempt for `key` has started since `generation` was
+    /// issued, meaning this flow's work is redundant and its outcome is not news.
+    private func isSuperseded(_ key: String, _ generation: UInt64) -> Bool {
+        supersededGenerations[key].map { $0 != generation } ?? false
+    }
+
+    /// Stop a superseded flow without reporting a failure.
+    ///
+    /// Returns true when the caller should return immediately. Logged, because a
+    /// silent return here would look exactly like a hang.
+    private func abandonIfSuperseded(_ key: String, _ generation: UInt64, _ step: String) -> Bool {
+        guard isSuperseded(key, generation) else { return false }
+        Log.info("[group-call] step=\(step) superseded; a newer attempt is in flight")
+        return true
+    }
+
     private func cancelTrackedTasks() {
         for task in trackedTasks.values { task.cancel() }
         trackedTasks.removeAll()
+        supersededGenerations.removeAll()
     }
 
     /// A request URL reduced to host and path, so an SFU request can be
@@ -725,6 +794,15 @@ public final class GroupCallController: ObservableObject {
     /// purpose. Anything else gets a generic message rather than a description
     /// of an arbitrary error's internals, which could name paths or endpoints.
     public static func describe(_ error: Error) -> String {
+        // Cancellation is not a fault and has no description. It is named here
+        // rather than falling through, because falling through attributes it to
+        // the generic "the call could not be completed" - a fabricated reason
+        // attached to a call that may be about to connect. Callers that can tell
+        // a cancellation apart should not be reporting one at all, but a stray
+        // one must still read as what it is.
+        if error is CancellationError {
+            return "the attempt was cancelled"
+        }
         if let localized = error as? LocalizedError, let description = localized.errorDescription {
             return description
         }

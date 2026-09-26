@@ -520,6 +520,18 @@ impl<S: Store> Manager<S, Registered> {
                 .take(400)
                 .collect();
             eprintln!("[core] group token rejected HTTP {status}: {shown}");
+        } else if std::env::var_os("CUZTOM_LOG_SFU_BODIES").is_some() {
+            // Opt-in, and off by default, because the success body is the call
+            // token itself. This exists for one narrow case: a 200 that will not
+            // decode and whose logged shape does not identify the format either.
+            // Reading the body is then the only diagnostic left, and it is worth
+            // having on a local debug run - which prints a credential, so it is
+            // for a debug run and nothing else.
+            let shown: String = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(600)
+                .collect();
+            eprintln!("[core] group token body (CUZTOM_LOG_SFU_BODIES): {shown}");
         } else {
             // Format only, never content: the declared content type, and the
             // leading bytes, which are a protobuf tag plus length or the opening

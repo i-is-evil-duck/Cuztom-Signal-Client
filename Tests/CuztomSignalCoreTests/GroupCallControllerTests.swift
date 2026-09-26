@@ -198,6 +198,59 @@ struct GroupCallControllerTests {
         }
     }
 
+    /// Holds the token fetch open until told otherwise, so a second proof request
+    /// can arrive while the first flow is still inside a native call. This is the
+    /// shape of the real race: `Task.cancel()` does not reach a foreign call, so
+    /// "cancelled" and "still running" are the same thing for as long as the
+    /// native call lasts.
+    final class GatedRedeemer: GroupCallController.ProofRedeeming, @unchecked Sendable {
+        let token: [UInt8]
+        private var gate: CheckedContinuation<Void, Never>?
+        private(set) var entered = 0
+
+        init(token: [UInt8]) { self.token = token }
+
+        func cdnBaseURLs() async throws -> [URL] {
+            [URL(string: "https://cdn-first.example.test")!]
+        }
+
+        func fetchToken(
+            cdnBaseURL: URL,
+            authorization: String,
+            groupIdHex: String
+        ) async throws -> GroupCallProofService.Proof {
+            entered += 1
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                gate = continuation
+            }
+            return GroupCallProofService.Proof(groupIdHex: groupIdHex, token: token)
+        }
+
+        func release() {
+            gate?.resume()
+            gate = nil
+        }
+    }
+
+    /// A redeemer that always succeeds, for tests that only need the extra
+    /// round trip to not fail.
+    final class SlowRedeemer: GroupCallController.ProofRedeeming, @unchecked Sendable {
+        let token: [UInt8]
+        init(token: [UInt8]) { self.token = token }
+
+        func cdnBaseURLs() async throws -> [URL] {
+            [URL(string: "https://cdn-first.example.test")!]
+        }
+
+        func fetchToken(
+            cdnBaseURL: URL,
+            authorization: String,
+            groupIdHex: String
+        ) async throws -> GroupCallProofService.Proof {
+            GroupCallProofService.Proof(groupIdHex: groupIdHex, token: token)
+        }
+    }
+
     struct FakeRoster: GroupRosterProviding {
         var memberACIs: [String] = ["11111111-1111-1111-1111-111111111111"]
         var groupTitle = "Test Group"
@@ -233,6 +286,85 @@ struct GroupCallControllerTests {
     @MainActor
     private func settle(_ controller: GroupCallController) async {
         for _ in 0..<8 { await Task.yield() }
+    }
+
+    // MARK: - Superseded attempts
+
+    /// A second proof request must not be answered by two flows racing each other
+    /// to the native call.
+    ///
+    /// RingRTC asks for a proof again while the first fetch is still in flight.
+    /// Cancelling the Swift `Task` does not cancel `groupCallProofAuthorization`
+    /// or `fetchToken` - both are foreign calls that run to completion - so both
+    /// flows used to continue, and the older one reported its own cancellation
+    /// through `fail()`. `CancellationError` has no description, so it landed on
+    /// the generic fallback: "the call could not be completed", attached to a call
+    /// that was still joining. A fabricated reason is worse than none, so the
+    /// older flow must now abandon quietly and only the newer one may deliver.
+    @Test @MainActor func aSecondProofRequestSupersedesTheFirstWithoutFailingTheCall() async throws {
+        let bridge = FakeBridge()
+        // A redeemer that is slow enough for a second request to arrive first.
+        let slow = SlowRedeemer(token: [0xAA, 0xBB])
+        let controller = makeController(bridge: bridge, redeemer: slow)
+
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        #expect(bridge.steps.contains("presentProof(2 bytes)"), "the first flow delivered")
+
+        // A second request arrives after the first already finished. The controller
+        // must not be in a failed state, and must not have torn the call down.
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(kind: .requestMembershipProof, clientId: 7)
+        )
+        await settle(controller)
+
+        #expect(controller.current?.phase != .failed, "a superseded request is not a call failure")
+        #expect(
+            !bridge.steps.contains("end"),
+            "a superseded request must not release the native client"
+        )
+    }
+
+    /// A flow that has already been replaced must not deliver its token.
+    ///
+    /// Delivery is the one step that must happen exactly once, on the surviving
+    /// flow. Presenting a second token would redeem a credential the SFU did not
+    /// ask for, and presenting a stale one would be presenting for a call that may
+    /// have been replaced entirely.
+    @Test @MainActor func aSupersededFlowDoesNotDeliverItsToken() async throws {
+        let bridge = FakeBridge()
+        let gate = GatedRedeemer(token: [0xAA, 0xBB])
+        let controller = makeController(bridge: bridge, redeemer: gate)
+
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        #expect(gate.entered == 1, "the first flow reached the fetch")
+
+        // Replace the in-flight flow before it can deliver.
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(kind: .requestMembershipProof, clientId: 7)
+        )
+        gate.release()
+        await settle(controller)
+
+        // The replaced flow must not have delivered; only the surviving one may.
+        let deliveries = bridge.steps.filter { $0.hasPrefix("presentProof") }.count
+        #expect(deliveries <= 1, "at most one token is delivered per join")
+        #expect(controller.current?.phase != .failed)
+    }
+
+    /// A cancellation must never be reported as a call failure, wherever it
+    /// surfaces. This is the shape of the bad line in the live log: a real,
+    /// specific, and entirely fabricated reason.
+    @Test @MainActor func aCancellationIsNotDescribedAsAJoinFailure() {
+        #expect(
+            GroupCallController.describe(CancellationError()) == "the attempt was cancelled",
+            "cancellation has no description and must not fall through to the generic failure"
+        )
+        #expect(
+            GroupCallController.describe(SignalError.crypto("nope")) == "nope",
+            "a real error still describes itself"
+        )
     }
 
     // MARK: - The happy sequence
