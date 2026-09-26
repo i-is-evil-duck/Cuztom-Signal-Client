@@ -406,6 +406,112 @@ impl<S: Store> Manager<S, Registered> {
         resolved
     }
 
+    /// Performs one of the SFU's own HTTP requests.
+    ///
+    /// Added for group calls. RingRTC does not perform its own SFU HTTP requests:
+    /// it raises them to the host and stalls until the host answers with the
+    /// response, so this is the only way they can be performed at all.
+    ///
+    /// **It has to be here rather than in the host.** The SFU serves a
+    /// certificate from Signal's own authority rather than the system roots, so a
+    /// host HTTP client rejects the connection at the TLS layer. Verified against
+    /// `sfu.voip.signal.org`: `verify error:num=19, self-signed certificate in
+    /// certificate chain`, depth 1 `O=Signal Messenger, LLC, CN=Signal Messenger`.
+    /// This client is already built with the service configuration's certificate
+    /// authority, so it accepts. The same reason the group token redemption is
+    /// native.
+    ///
+    /// The method, URL, headers and body are RingRTC's own, taken verbatim - they
+    /// are not this file's to interpret. Nothing about the request is logged:
+    /// RingRTC puts the membership proof in the `Authorization` header and the
+    /// request carries identifiers in the body, so a log line here would write a
+    /// credential. Only the status and body length are reported, on return.
+    ///
+    /// `status` of 0 in the result means the request could not be performed, which
+    /// RingRTC distinguishes from an HTTP error status, so a transport failure is
+    /// reported that way rather than as a refusal.
+    pub async fn sfu_http_request(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<(Option<u16>, Vec<u8>), Error<S::Error>> {
+        const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+        const TIMEOUT_SECS: u64 = 30;
+
+        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| {
+            eprintln!("[core] sfu request has an unparsable method: {e}");
+            Error::IoError(std::io::Error::other(e))
+        })?;
+        let url = url::Url::parse(url).map_err(|e| {
+            eprintln!("[core] sfu request has an unparsable url: {e}");
+            Error::IoError(std::io::Error::other(e))
+        })?;
+        if url.scheme() != "https" {
+            // The SFU carries the membership proof. A plaintext hop would leak
+            // it, and RingRTC never asks for one.
+            eprintln!("[core] sfu request refused: url was not https");
+            return Err(Error::IoError(std::io::Error::other(
+                "sfu request url must be https",
+            )));
+        }
+        // A client built here rather than borrowed from the service, because
+        // `PushService::client` is private in `libsignal-service` and patching
+        // that dependency is not worth an accessor. Same construction as
+        // `PushService::new` - the service configuration's certificate authority,
+        // HTTP/1.1 only, no proxy environment - because the trust decision is the
+        // whole reason this method exists and it must not silently differ from
+        // the client's.
+        let client = reqwest::Client::builder()
+            .tls_certs_only([reqwest::Certificate::from_pem(
+                self.state.service_configuration().certificate_authority.as_bytes(),
+            )
+            .map_err(|e| Error::IoError(std::io::Error::other(e)))?])
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .user_agent(crate::USER_AGENT)
+            .http1_only()
+            .build()
+            .map_err(|e| Error::IoError(std::io::Error::other(e)))?;
+        let mut builder = client.request(method, url);
+        for (name, value) in headers {
+            // `append` rather than `insert`: RingRTC's header set is authoritative
+            // and may legitimately repeat a name. A header value RingRTC supplied
+            // is not inspected or rewritten here.
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        if !body.is_empty() {
+            builder = builder.body(body.to_vec());
+        }
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                // Transport-level, and the single most useful line in this file:
+                // a TLS trust failure and a refused connection are otherwise the
+                // same opaque failure to the host.
+                eprintln!("[core] sfu request transport failure: {e}");
+                return Ok((None, Vec::new()));
+            }
+        };
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|e| {
+            eprintln!("[core] sfu response body failed: {e}");
+            Error::IoError(std::io::Error::other(e))
+        })?;
+        if bytes.len() > MAX_BODY_BYTES {
+            eprintln!("[core] sfu response too large: {} bytes", bytes.len());
+            return Err(Error::IoError(std::io::Error::other(
+                "sfu response too large",
+            )));
+        }
+        eprintln!(
+            "[core] sfu responded HTTP {status}, {} bytes",
+            bytes.len()
+        );
+        Ok((Some(status.as_u16()), bytes.to_vec()))
+    }
+
     /// Redeems a ZK group presentation for a call token.
     ///
     /// Added for group calls. Returns `(status, body)` so the caller can decide

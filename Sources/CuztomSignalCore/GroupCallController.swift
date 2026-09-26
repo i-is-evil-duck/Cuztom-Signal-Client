@@ -165,24 +165,43 @@ public final class GroupCallController: ObservableObject {
         func perform(_ request: RustCoreService.PendingHTTPRequest) async throws -> (status: Int, body: [UInt8])
     }
 
-    private struct LiveHTTP: HTTPPerforming {
-        let session: URLSession
+    /// Performs SFU requests through the native core.
+    ///
+    /// Not a `URLSession`. The SFU serves a certificate from Signal's own
+    /// authority rather than the system roots — `sfu.voip.signal.org` presents
+    /// `O=Signal Messenger, LLC` with `verify error:num=19, self-signed
+    /// certificate in certificate chain` — so `URLSession` refuses the connection
+    /// at the TLS layer. That arrives here as an opaque transport error with no
+    /// status and no usable description, which is why the previous version of
+    /// this reported "the call could not be completed" against a call that was
+    /// waiting on a perfectly reachable server.
+    ///
+    /// The native core is already built with the service configuration's
+    /// certificate authority, which is the same reason the group token redemption
+    /// is native.
+    private struct NativeHTTP: HTTPPerforming {
+        /// The live core. Injected rather than reached for globally, so the
+        /// controller keeps the same shape in tests and in the app.
+        let service: RustCoreService
 
         func perform(
             _ request: RustCoreService.PendingHTTPRequest
         ) async throws -> (status: Int, body: [UInt8]) {
-            guard let url = URL(string: request.url), url.scheme?.lowercased() == "https" else {
-                throw SignalError.network("SFU request URL was not https")
-            }
-            var urlRequest = URLRequest(url: url)
-            urlRequest.httpMethod = request.method
-            for (field, value) in request.headers {
-                urlRequest.setValue(value, forHTTPHeaderField: field)
-            }
-            urlRequest.httpBody = request.body.map { Data($0) }
-            let (data, response) = try await session.data(for: urlRequest)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            return (status, [UInt8](data))
+            let result = try await service.performSFUHTTPRequest(
+                method: request.method,
+                url: request.url,
+                // `PendingHTTPRequest.headers` is a dictionary, so header order is
+                // not preserved and a repeated name would already have been
+                // collapsed before this point. Order is not significant to the
+                // SFU; the pairing is.
+                headers: request.headers.map { ($0.key, $0.value) },
+                body: request.body ?? []
+            )
+            // A nil status means the request could not be performed at all, which
+            // RingRTC distinguishes from an HTTP error status. Reported as 0,
+            // which is the value `core_cmd_http_response` already documents for
+            // exactly this case.
+            return (result.status ?? 0, result.body)
         }
     }
 
@@ -220,18 +239,12 @@ public final class GroupCallController: ObservableObject {
         proofService: GroupCallProofService = GroupCallProofService(),
         sfuURL: String? = nil,
         roster: any GroupRosterProviding = EmptyGroupRoster(),
-        redeemer: (any ProofRedeeming)? = nil
+        redeemer: (any ProofRedeeming)? = nil,
+        service: RustCoreService = RustCoreService()
     ) {
         self.proofService = proofService
         self.redeemer = redeemer ?? proofService
-        self.http = LiveHTTP(session: {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.urlCache = nil
-            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-            configuration.timeoutIntervalForRequest = 20
-            configuration.httpShouldSetCookies = false
-            return URLSession(configuration: configuration)
-        }())
+        self.http = NativeHTTP(service: service)
         self.sfuURL = sfuURL
         self.roster = roster
     }
@@ -489,8 +502,11 @@ public final class GroupCallController: ObservableObject {
             // Supersede any flow still running for this client. A second request
             // while the first is still fetching a credential is normal - the
             // native calls are not cancellable - so the older one is replaced
-            // rather than left to race this one to `set_membership_proof`.
-            beginAttempt("proof-\(update.clientId)")
+            // rather than left to race this one to `set_membership_proof`. The
+            // returned generation is not used here: the flow captures its own in
+            // `presentMembershipProof`, and reading it back from the dictionary
+            // would race the next request arriving.
+            _ = beginAttempt("proof-\(update.clientId)")
             track("proof-\(update.clientId)") { [weak self] in
                 await self?.presentMembershipProof(clientId: update.clientId)
             }

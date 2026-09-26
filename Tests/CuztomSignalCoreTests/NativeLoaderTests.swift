@@ -11,8 +11,10 @@ import Testing
     #expect(!paths.contains(inferredRelease))
     #expect(!paths.contains(inferredDebug))
     // ABI 3 added core_cmd_http_response, which the SFU bridge needs. ABI 4
-    // added the group call proof and the two host derivations. A dylib older
-    // than those must fail to load rather than load with missing symbols and
-    // fail later with a misleading error.
-    #expect(RustCoreService.expectedNativeABI == 4)
+    // added the group call proof and the two host derivations. ABI 5 added
+    // core_cmd_sfu_http_request, so the SFU's own requests are performed on a
+    // client trusted with the service certificate authority. A dylib older than
+    // those must fail to load rather than load with missing symbols and fail later
+    // with a misleading error.
+    #expect(RustCoreService.expectedNativeABI == 5)
 }

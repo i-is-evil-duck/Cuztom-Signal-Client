@@ -5,6 +5,8 @@ Source: `https://github.com/whisperfish/presage` @
 
 Only two files differ from upstream. Keep this list accurate when updating.
 
+Four methods are added to `impl Registered`, all for group calls.
+
 ## 1. `presage/Cargo.toml`
 
 Added one dependency:
@@ -20,9 +22,9 @@ the TLS/cookie features that libsignal-service already enables.
 
 ## 2. `presage/src/manager/registered.rs`
 
-Three methods added to `impl Registered`, all for group calls. Together they
-cover the whole ZK group proof flow: fetch a credential, present it locally, and
-redeem the presentation for a call token.
+Methods 2a–2c cover the ZK group proof flow: fetch a credential, present it
+locally, and redeem the presentation for a call token. Method 2d is separate —
+it performs the SFU's own HTTP requests.
 
 ### 2a. `group_auth_credentials_raw`
 
@@ -160,6 +162,53 @@ because that body is the call token. It exists for the one case the logged shape
 cannot resolve, and it is a local debug switch, not a diagnostic that should be
 left on.
 
+## 3. `presage/src/manager/registered.rs` — fourth method
+
+### 2d. `sfu_http_request`
+
+```rust
+pub async fn sfu_http_request(
+    &self,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(Option<u16>, Vec<u8>), Error<S::Error>>
+```
+
+Performs one of the SFU's own HTTP requests. RingRTC does not perform these
+itself — it raises them to its host and stalls until they are answered, so the
+host is the only party that can.
+
+**It has to be here rather than in the host.** The SFU serves a certificate from
+Signal's own authority rather than the system roots. Verified against
+`sfu.voip.signal.org`: `verify error:num=19, self-signed certificate in
+certificate chain`, depth 1 `O=Signal Messenger, LLC, CN=Signal Messenger`. The
+same reason `group_call_token` is native. Left to the host, this produced
+"the call could not be completed" against a reachable server, because a TLS trust
+failure and a refusal are the same opaque transport error from outside.
+
+**The client is built here**, with the service configuration's certificate
+authority, HTTP/1.1 only and no proxy environment — the same construction as
+`PushService::new`. It is not borrowed from the service because
+`PushService::client` is private in `libsignal-service`, and patching that
+dependency is not worth an accessor. The trust decision is the entire reason
+this method exists, so it is written out rather than inherited, and the comment
+says so.
+
+**`Ok((None, _))` is a transport failure, not an error.** RingRTC distinguishes
+"could not be performed" from "the SFU refused", and reporting the first as the
+second tells it the server answered when nothing was sent. Transport failures are
+logged — the most useful line in the file, since a TLS trust failure and a
+refused connection are otherwise identical from outside.
+
+**Nothing about the request is logged.** RingRTC puts the membership proof in the
+`Authorization` header and the body carries identifiers, so a log line here
+would write a credential. Only the status and body length are reported.
+
+**A non-https URL is refused.** The SFU carries the membership proof; a plaintext
+hop would leak it, and RingRTC never asks for one.
+
 ## Why the alternative was rejected
 
 Reaching these endpoints without touching presage is not available:
@@ -169,9 +218,9 @@ authenticated service is only constructible from inside `Registered`.
 ## Re-applying after an upstream update
 
 1. Replace the tree with the new rev.
-2. Re-apply all three methods above, **including the `HttpAuthOverride::
+2. Re-apply all four methods above, **including the `HttpAuthOverride::
    Unidentified` choice, the `Vec<u8>` body, and the 4xx/success logging** in
-   `group_call_token`. All three are load-bearing and none is visible from the
+   `group_call_token`. All are load-bearing and none is visible from the
    signature alone.
 3. `cargo test --all-targets` in `rust-core/`. The test
    `call::tests::an_authorization_header_appends_rather_than_replaces` asserts

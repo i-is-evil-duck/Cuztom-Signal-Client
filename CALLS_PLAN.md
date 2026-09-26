@@ -162,6 +162,16 @@ Older dylibs lack these symbols, so the Swift loader rejects them at
 misleading error. A pre-ABI-4 bundle therefore fails loudly at startup rather
 than hanging on join.
 
+### ABI 5
+
+| Symbol | Why |
+|---|---|
+| `core_cmd_sfu_http_request` | Performs the SFU's own HTTP requests. RingRTC will not do it itself — it raises them and stalls — and a host HTTP client cannot reach any Signal service host, because they serve Signal's own CA rather than the system roots. Without this, every SFU request fails at the TLS layer and the join cannot proceed at all. |
+
+Without it, `URLSession` was asked to talk to `sfu.voip.signal.org` and failed
+with no status, which reached the user as "the call could not be completed". A
+dylib without this symbol is rejected at load, not discovered mid-call.
+
 ### Increment 6: complete
 
 `GroupCallController` owns the sequence, which is the only part where a bug can
@@ -273,6 +283,7 @@ actually happening, and what identifies it next time:
 | `401 Credentials are required…` (plain text) | reached the app; the credential was not accepted. This is the *normal* response to a placeholder or malformed proof, and the control every other observation is compared against | — |
 | `400` with a JSON body | the app parsed the request and rejected a parameter | the body, which is logged for non-2xx |
 | `200` that will not decode | the credential *was* issued; only the response envelope is unexpected. `Content-Type` and the first four body bytes are logged, which separates protobuf (`0a ..`) from JSON (`7b 22 ..`) from gzip (`1f 8b`) | `decoded as protobuf` / `decoded as JSON, keys=[..]` / `matched neither` |
+| `sfu request … failed` with **no status** | the request was never performed. Every Signal service host is a case like this, and a host HTTP client cannot reach any of them | `sfu request transport failure:` on the Rust side |
 
 The distinction that cost the most time: a bare nginx `400` HTML page is not the
 application saying the parameters are wrong. It says the request never got
@@ -316,6 +327,38 @@ Signal Desktop 8.28.0 and its log:
 `sfu.voip.signal.org` presents a Signal Messenger certificate, self-signed in
 chain as `verify error:num=19`, which is why a host HTTP client must be built
 with the service configuration's CA.
+
+### The SFU's own requests are performed natively (ABI 5)
+
+RingRTC raises SFU requests to its host and stalls until they are answered, so
+the host is the only party that can perform them. It was doing so with
+`URLSession`, and **every SFU request failed at the TLS layer** —
+`sfu.voip.signal.org` serves a certificate from Signal's own authority rather
+than the system roots, the same as `chat.signal.org` and `storage.signal.org`.
+
+This presented as the worst kind of failure: `sfu request 0 failed: the call
+could not be completed`, twice per call, with no status. The server was
+reachable and the request was never sent. It is the third time the private CA
+has been the cause, and the second time the symptom was swallowed by
+`describe`'s generic branch.
+
+`core_cmd_sfu_http_request` performs them natively now, on a client built with
+the service configuration's certificate authority. Two things are kept
+deliberately distinct:
+
+- **A request that could not be performed is not an error.** RingRTC
+  distinguishes "never happened" from "the SFU refused", so a transport failure
+  is reported as a null status in the reply JSON rather than through the return
+  value. Collapsing them tells RingRTC the server answered when nothing was sent.
+- **Transport failures are logged with the underlying cause.** A TLS trust
+  failure and a refused connection are otherwise the same opaque error, which is
+  precisely what made this hard to see.
+
+Also fixed at the source: `describe` reaching its generic branch for a
+`URLError` it had no name for. The SFU path is now native, so this specific
+instance is gone, but the generic fallback stays for anything unrecognised —
+it is the right default for a user-facing string, and the fix is to log the real
+cause alongside it, not to make the fallback more specific.
 
 ### Superseded proof attempts must not report failure
 
@@ -367,3 +410,7 @@ Before changing call code, preserve:
   `aSupersededFlowDoesNotDeliverItsToken`.
 - A cancellation is never described as a join failure
   (`aCancellationIsNotDescribedAsAJoinFailure`).
+- An SFU request that could not be performed is never decoded as an SFU refusal
+  (`aRequestThatCouldNotBePerformedIsNotAnSFURefusal`), and a header value
+  containing a NUL is refused rather than truncated into two headers
+  (`anSFUHeaderContainingNULIsRefused`).

@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CUZTOM_SIGNAL_CORE_ABI_VERSION 4u
+#define CUZTOM_SIGNAL_CORE_ABI_VERSION 5u
 
 #ifdef __cplusplus
 extern "C" {
@@ -168,6 +168,39 @@ int32_t core_cmd_group_call_set_group_members(
     const uint32_t *member_lens,
     const uint8_t *member_ids,
     uint32_t member_count);
+
+/* Perform one of the SFU's own HTTP requests, on RingRTC's behalf.
+ *
+ * RingRTC raises SFU requests to its host and stalls until they are answered, so
+ * this is the only way they can be performed. Done natively because the SFU serves
+ * a certificate from Signal's own authority rather than the system roots, which a
+ * host HTTP client rejects at the TLS layer.
+ *
+ *   method, url    - NUL-terminated UTF-8. `url` must be https; a plaintext hop
+ *                    would carry the membership proof in the clear.
+ *   header_count   - number of headers.
+ *   header_names,
+ *   header_values  - parallel arrays of `header_count` NUL-terminated UTF-8
+ *                    strings. Names and values are passed through untouched.
+ *   body, body_len - request body, which may be empty.
+ *
+ * Returns malloc'd JSON, {"status":<int|null>,"bodyB64":"<base64>"}, or NULL on
+ * error (see core_last_error). `status` is null when the request could not be
+ * performed at all, which RingRTC distinguishes from an HTTP error status; that
+ * is reported in the JSON rather than through the return value, because a
+ * transport failure is not the SFU refusing. `bodyB64` is base64 because the body
+ * is arbitrary bytes.
+ *
+ * Nothing about the request is logged. RingRTC puts the membership proof in the
+ * Authorization header. */
+char *core_cmd_sfu_http_request(
+    const char *method,
+    const char *url,
+    uint32_t header_count,
+    const char *const *header_names,
+    const char *const *header_values,
+    const uint8_t *body,
+    size_t body_len);
 
 /* Deliver an SFU HTTP response that the host performed for RingRTC.
  * RingRTC raises SFU requests as `http_request` events and stalls until this

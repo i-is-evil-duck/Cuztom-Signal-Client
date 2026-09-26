@@ -157,7 +157,9 @@ struct LiveEvent: Decodable {
 /// serialized on `SerialNativeExecutor`; the remaining mutable state is
 /// protected by the lock-backed boxes and state lock declared below.
 public final class RustCoreService: SignalService, @unchecked Sendable {
-    public static let expectedNativeABI: UInt32 = 4
+    /// ABI 5 added `core_cmd_sfu_http_request`, so the SFU's own requests are
+    /// performed on a client trusted with the service certificate authority.
+    public static let expectedNativeABI: UInt32 = 5
     /// The production Signal SFU. Group calls use it unless a staging build
     /// explicitly overrides it, and it is never inferred from the environment.
     public static let defaultSFUURL = "https://sfu.voip.signal.org"
@@ -1570,6 +1572,101 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// This is deliberately not session-token gated: an SFU request is issued
     /// by RingRTC, not by a caller, and a stale request id is simply ignored by
     /// RingRTC. The host still has to be the one that performed the request.
+    /// The result of one SFU request, performed natively.
+    public struct SFUHTTPResult: Sendable {
+        /// `nil` when the request could not be performed at all, which is not the
+        /// same as the SFU returning an error status.
+        public let status: Int?
+        public let body: [UInt8]
+    }
+
+    /// Perform one of the SFU's own HTTP requests, on RingRTC's behalf.
+    ///
+    /// Native rather than a `URLSession` because the SFU serves a certificate
+    /// from Signal's own authority rather than the system roots, so a host HTTP
+    /// client rejects the connection at the TLS layer with an error that carries
+    /// no status and no useful description.
+    /// Decode the native reply for one SFU request.
+    ///
+    /// Split out from the FFI call so the distinction that matters can be tested
+    /// without the native core present: a request that could not be *performed*
+    /// has a null status, and an SFU that *refused* has a status. Conflating them
+    /// tells RingRTC the server answered when nothing was sent.
+    static func decodeSFUResponse(_ json: String) throws -> SFUHTTPResult {
+        guard let data = json.data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let bodyB64 = decoded["bodyB64"] as? String,
+              let body = Data(base64Encoded: bodyB64)
+        else {
+            throw SignalError.storage("SFU response was malformed")
+        }
+        // Null is the documented "could not be performed" and stays distinct from
+        // a status rather than being collapsed to 0 here.
+        var status: Int?
+        if let number = decoded["status"] as? NSNumber, number.intValue > 0 {
+            status = number.intValue
+        }
+        return SFUHTTPResult(status: status, body: [UInt8](body))
+    }
+
+    /// Whether a header name or value can cross the C ABI intact.
+    ///
+    /// A NUL would end the C string early and turn one header into two, with a
+    /// value RingRTC never sent. Such a request is refused rather than truncated,
+    /// because a request the SFU did not receive must not be sent as one it did.
+    static func headersCrossABI(_ headers: [(String, String)]) -> Bool {
+        !headers.contains { $0.0.utf8.contains(0) || $0.1.utf8.contains(0) }
+    }
+
+    public func performSFUHTTPRequest(
+        method: String,
+        url: String,
+        headers: [(String, String)],
+        body: [UInt8]
+    ) async throws -> SFUHTTPResult {
+        let token = try sessionEpoch.capture()
+        return try await withCore(token: token) { sym in
+            // The FFI takes NUL-terminated C strings in parallel arrays, so each
+            // name and value gets its own `withCString` rather than passing Swift
+            // string pointers across.
+            guard Self.headersCrossABI(headers) else {
+                throw SignalError.network("SFU request header contained a NUL byte")
+            }
+            var nameStrings: [UnsafePointer<CChar>?] = []
+            var valueStrings: [UnsafePointer<CChar>?] = []
+            nameStrings.reserveCapacity(headers.count)
+            valueStrings.reserveCapacity(headers.count)
+            for (name, value) in headers {
+                nameStrings.append(name.withCString { UnsafePointer($0) })
+                valueStrings.append(value.withCString { UnsafePointer($0) })
+            }
+            let result = nameStrings.withUnsafeBufferPointer { nameBuffer in
+                valueStrings.withUnsafeBufferPointer { valueBuffer in
+                    body.withUnsafeBufferPointer { bodyBuffer in
+                        method.withCString { methodCString in
+                            url.withCString { urlCString in
+                                sym.sfuHTTPRequest(
+                                    methodCString,
+                                    urlCString,
+                                    UInt32(headers.count),
+                                    nameBuffer.baseAddress,
+                                    valueBuffer.baseAddress,
+                                    bodyBuffer.baseAddress,
+                                    bodyBuffer.count
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            guard let pointer = result else {
+                throw SignalError.network("SFU request failed: \(Self.lastError(sym))")
+            }
+            defer { sym.freeString(pointer) }
+            return try Self.decodeSFUResponse(String(cString: pointer))
+        }
+    }
+
     public func deliverHTTPResponse(requestId: UInt32, status: Int?, body: [UInt8]) async throws {
         let token = try sessionEpoch.capture()
         try await withCore(token: token, allowStale: true, lifecycleOwned: false) { sym in
@@ -2057,6 +2154,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let callHangup: @convention(c) () -> Int32
         let callSetMuted: @convention(c) (Int32) -> Int32
         let httpResponse: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32
+        let sfuHTTPRequest: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UInt32, UnsafePointer<UnsafePointer<CChar>?>?, UnsafePointer<UnsafePointer<CChar>?>?, UnsafePointer<UInt8>?, Int) -> UnsafeMutablePointer<CChar>?
         let groupAuthCredentials: @convention(c) () -> UnsafeMutablePointer<CChar>?
         let groupRoster: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let cdnUrls: @convention(c) () -> UnsafeMutablePointer<CChar>?
@@ -2718,6 +2816,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cah = dlsym(handle, "core_cmd_call_hangup"),
               let csm = dlsym(handle, "core_cmd_call_set_muted"),
               let chr = dlsym(handle, "core_cmd_http_response"),
+              let csfu = dlsym(handle, "core_cmd_sfu_http_request"),
               let cgac = dlsym(handle, "core_cmd_group_auth_credentials"),
               let cgr = dlsym(handle, "core_cmd_group_roster"),
               let ccdn = dlsym(handle, "core_cmd_cdn_urls"),
@@ -2775,6 +2874,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             callHangup: unsafeBitCast(cah, to: (@convention(c) () -> Int32).self),
             callSetMuted: unsafeBitCast(csm, to: (@convention(c) (Int32) -> Int32).self),
             httpResponse: unsafeBitCast(chr, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
+            sfuHTTPRequest: unsafeBitCast(csfu, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>, UInt32, UnsafePointer<UnsafePointer<CChar>?>?, UnsafePointer<UnsafePointer<CChar>?>?, UnsafePointer<UInt8>?, Int) -> UnsafeMutablePointer<CChar>?).self),
             groupAuthCredentials: unsafeBitCast(cgac, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),
             groupRoster: unsafeBitCast(cgr, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             cdnUrls: unsafeBitCast(ccdn, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self),

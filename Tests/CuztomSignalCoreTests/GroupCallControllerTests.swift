@@ -668,6 +668,60 @@ struct GroupCallControllerTests {
         #expect(controller.current?.phase == .failed)
     }
 
+    /// A request that could not be *performed* must not be reported as the SFU
+    /// refusing.
+    ///
+    /// These are different facts and RingRTC treats them differently, so they
+    /// have to stay apart across the native boundary. The native path reports a
+    /// transport failure as a null status inside the JSON rather than as an error,
+    /// precisely so a TLS trust failure - the reason this moved native - is not
+    /// conflated with a refusal. This is the case the previous `URLSession`
+    /// version got wrong: it threw, and the throw reached `describe`, which had
+    /// no description for it and reported "the call could not be completed"
+    /// against a call waiting on a reachable server.
+    @Test func aRequestThatCouldNotBePerformedIsNotAnSFURefusal() throws {
+        // Transport failure: no status at all.
+        let unperformed = try RustCoreService.decodeSFUResponse(
+            #"{"status":null,"bodyB64":""}"#
+        )
+        #expect(unperformed.status == nil, "a request that never happened has no status")
+        #expect(unperformed.body.isEmpty)
+
+        // An actual refusal keeps its status, so the two remain distinct.
+        let refused = try RustCoreService.decodeSFUResponse(
+            #"{"status":401,"bodyB64":""}"#
+        )
+        #expect(refused.status == 401)
+        #expect(refused.status != unperformed.status, "a refusal is not a transport failure")
+
+        // A body that is not UTF-8 text survives, because it is base64 and the
+        // SFU's replies are protobuf.
+        let withBody = try RustCoreService.decodeSFUResponse(
+            #"{"status":200,"bodyB64":"3q2+7w=="}"#
+        )
+        #expect(withBody.body == [0xDE, 0xAD, 0xBE, 0xEF])
+
+        // A malformed reply is refused rather than read as an empty success.
+        #expect(throws: (any Error).self) {
+            try RustCoreService.decodeSFUResponse("not json")
+        }
+        #expect(throws: (any Error).self) {
+            try RustCoreService.decodeSFUResponse(#"{"status":200}"#)
+        }
+    }
+
+    /// A header value that cannot cross the C ABI is refused rather than truncated.
+    ///
+    /// A NUL inside a header value would end the C string early and turn one
+    /// header into two, with a value RingRTC never sent. That is a request the SFU
+    /// did not receive, so it is not sent at all.
+    @Test func anSFUHeaderContainingNULIsRefused() {
+        #expect(RustCoreService.headersCrossABI([("Content-Type", "application/x-protobuf")]))
+        #expect(RustCoreService.headersCrossABI([]))
+        #expect(!RustCoreService.headersCrossABI([("X-Test", "bad\u{0}value")]))
+        #expect(!RustCoreService.headersCrossABI([("bad\u{0}name", "value")]))
+    }
+
     // MARK: - Inbound
 
     @Test @MainActor func anInboundCallForAKnownGroupIsJoined() async throws {

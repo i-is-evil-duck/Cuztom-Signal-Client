@@ -1778,6 +1778,36 @@ fn decode_group_credential_token(body: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Perform one of the SFU's own HTTP requests.
+///
+/// RingRTC raises SFU requests to its host and stalls until they are answered,
+/// so the host is the only party that can perform them. It is done natively for
+/// the same reason the group token redemption is: the SFU serves a certificate
+/// from Signal's own authority rather than the system roots, so a host HTTP
+/// client rejects the connection at the TLS layer. That presents as an
+/// uninformative transport failure with no status, and it is why this is not
+/// left to the host's URL loading system.
+///
+/// Nothing about the request is logged. RingRTC puts the membership proof in the
+/// `Authorization` header and the request body carries identifiers, so a log
+/// line here would write a credential. Only the status and body length are
+/// reported, by the transport itself.
+///
+/// `Ok((None, _))` means the request could not be performed at all, which
+/// RingRTC distinguishes from an HTTP error status.
+pub async fn sfu_http_request(
+    manager: &mut StoredManager,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(Option<u16>, Vec<u8>), String> {
+    manager
+        .sfu_http_request(method, url, headers, body)
+        .await
+        .map_err(|e| format!("sfu request failed: {e}"))
+}
+
 /// Send a group call signal to every member of the group.
 async fn send_group_call_signal(
     manager: &mut StoredManager,

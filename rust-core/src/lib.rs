@@ -164,6 +164,20 @@ enum Command {
     GroupIdMap {
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Perform one of the SFU's own HTTP requests.
+    ///
+    /// Native because the SFU's certificate comes from Signal's own authority
+    /// rather than the system roots, so a host HTTP client rejects it at the TLS
+    /// layer - which surfaces as an uninformative transport failure with no
+    /// status at all. Handled here so it reaches the live manager, and
+    /// `cmd_sfu_http_request` bounces it through the sync loop from there.
+    SfuHttpRequest {
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     UpdateGroupTitle {
         master_key_hex: String,
         title: String,
@@ -447,6 +461,18 @@ enum LoopCtrl {
     },
     /// Every ZK group id this device belongs to, mapped to its master key.
     GroupIdMap {
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Perform one of the SFU's own HTTP requests.
+    ///
+    /// Routed through the loop, because that is where the live manager lives: the
+    /// SFU request is made on the same client the group token redemption uses, so
+    /// it has to come from the same place to be trusted the same way.
+    SfuHttpRequest {
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     UpdateGroupTitle {
@@ -852,6 +878,23 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::GroupIdMap { reply } => {
                             let result = cmd_group_id_map(&state).await;
+                            let _ = reply.send(result);
+                        }
+                        Command::SfuHttpRequest {
+                            method,
+                            url,
+                            headers,
+                            body,
+                            reply,
+                        } => {
+                            let result = cmd_sfu_http_request(
+                                &state,
+                                &method,
+                                &url,
+                                &headers,
+                                &body,
+                            )
+                            .await;
                             let _ = reply.send(result);
                         }
                         Command::UpdateGroupTitle { master_key_hex, title, reply } => {
@@ -1433,6 +1476,41 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(LoopCtrl::GroupIdMap { reply }) => {
                                     let r = groups::group_id_map(&mut manager).await;
+                                    let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::SfuHttpRequest {
+                                    method,
+                                    url,
+                                    headers,
+                                    body,
+                                    reply,
+                                }) => {
+                                    let r = match call::sfu_http_request(
+                                        &mut manager,
+                                        &method,
+                                        &url,
+                                        &headers,
+                                        &body,
+                                    )
+                                    .await
+                                    {
+                                        Ok((status, bytes)) => {
+                                            // Base64 so the body crosses the reply
+                                            // channel intact; it is arbitrary bytes.
+                                            // `status` is absent when the request
+                                            // could not be performed at all, which
+                                            // RingRTC treats differently from an
+                                            // HTTP error status.
+                                            serde_json::to_string(&serde_json::json!({
+                                                "status": status,
+                                                "bodyB64":
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .encode(&bytes),
+                                            }))
+                                            .map_err(|e| format!("sfu response json: {e}"))
+                                        }
+                                        Err(e) => Err(e),
+                                    };
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::UpdateGroupTitle { master_key_hex, title, reply }) => {
@@ -2139,6 +2217,53 @@ async fn cmd_group_call_redeem_proof(
     reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
 }
 
+/// Perform one of the SFU's own HTTP requests.
+///
+/// Routed through the loop, for the same reason as the redemption: the request
+/// has to be made on a client trusted with the service configuration's
+/// certificate authority, because the SFU does not serve a system-root
+/// certificate and that is the whole reason this is not done by the host.
+///
+/// A request that could not be performed at all is `Ok` with a null status, not
+/// an error: RingRTC distinguishes the two, and reporting a transport failure as
+/// a failure would tell it the SFU refused.
+async fn cmd_sfu_http_request(
+    state: &WorkerState,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<String, String> {
+    if method.is_empty() {
+        return Err("an SFU request needs a method".to_string());
+    }
+    if url.is_empty() {
+        return Err("an SFU request needs a url".to_string());
+    }
+    let sender = match state {
+        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
+            Some(sender) => sender,
+            None => return Err("sync loop is not running".to_string()),
+        },
+        _ => return Err("not linked".to_string()),
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    send_sync_ctrl_wait(
+        sender,
+        LoopCtrl::SfuHttpRequest {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: headers.to_vec(),
+            body: body.to_vec(),
+            reply: reply_tx,
+        },
+    )
+    .await?;
+    reply_rx
+        .await
+        .map_err(|_| "sync loop dropped the request".to_string())?
+}
+
 /// The CDN base URLs from the service configuration.
 ///
 /// Also routed through the loop, for the same reason as the roster: the
@@ -2813,7 +2938,7 @@ async fn cmd_fetch_attachment(
 /// 3 adds `core_cmd_http_response`, which lets the host perform the SFU
 /// requests RingRTC raises. Older dylibs lack that symbol, so the loader
 /// rejects them rather than stalling group calls on unanswered SFU requests.
-pub const CORE_ABI_VERSION: u32 = 4;
+pub const CORE_ABI_VERSION: u32 = 5;
 
 #[no_mangle]
 pub extern "C" fn core_abi_version() -> u32 {
@@ -3915,6 +4040,89 @@ pub extern "C" fn core_cmd_http_response(
     }
 }
 
+/// Perform one of the SFU's own HTTP requests, on RingRTC's behalf.
+///
+/// RingRTC raises SFU requests to its host and stalls until they are answered,
+/// so this is the only way they can be performed. Done natively because the SFU
+/// serves a certificate from Signal's own authority rather than the system
+/// roots, which a host HTTP client rejects.
+///
+/// * `method` - NUL-terminated UTF-8, e.g. `GET`, `PUT`, `POST`
+/// * `url` - NUL-terminated UTF-8; must be https
+/// * `header_count`/`header_names`/`header_values` - parallel arrays of
+///   NUL-terminated UTF-8, `header_count` entries
+/// * `body`/`body_len` - request body, which may be empty
+///
+/// Returns malloc'd JSON, `{"status":<int|null>,"bodyB64":"<base64>"}`, or NULL
+/// on error. `status` is null when the request could not be performed at all,
+/// which RingRTC distinguishes from an HTTP error status; a request that could
+/// not be performed is not an error, so it is reported in the JSON rather than
+/// through the return value. `bodyB64` is base64 because the body is arbitrary
+/// bytes.
+///
+/// Nothing about the request is logged: RingRTC puts the membership proof in the
+/// `Authorization` header.
+#[no_mangle]
+pub extern "C" fn core_cmd_sfu_http_request(
+    method: *const c_char,
+    url: *const c_char,
+    header_count: u32,
+    header_names: *const *const c_char,
+    header_values: *const *const c_char,
+    body: *const u8,
+    body_len: usize,
+) -> *mut c_char {
+    let method = match c_str_arg(method, "method") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            return std::ptr::null_mut();
+        }
+    };
+    let url = match c_str_arg(url, "url") {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(error);
+            return std::ptr::null_mut();
+        }
+    };
+    let count = header_count as usize;
+    if count > 0 && (header_names.is_null() || header_values.is_null()) {
+        set_last_error("sfu request declared headers but supplied none".to_string());
+        return std::ptr::null_mut();
+    }
+    let mut headers = Vec::with_capacity(count);
+    for index in 0..count {
+        let name = c_str_arg(unsafe { *header_names.add(index) }, "header name");
+        let value = c_str_arg(unsafe { *header_values.add(index) }, "header value");
+        match (name, value) {
+            (Ok(name), Ok(value)) => headers.push((name, value)),
+            (Err(error), _) | (_, Err(error)) => {
+                set_last_error(error);
+                return std::ptr::null_mut();
+            }
+        }
+    }
+    let body = if body.is_null() || body_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(body, body_len) }.to_vec()
+    };
+    match roundtrip(|reply| Command::SfuHttpRequest {
+        method,
+        url,
+        headers,
+        body,
+        reply,
+    }) {
+        Ok(Ok(json)) => ok_string(json),
+        Ok(Err(e)) | Err(e) => {
+            set_last_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Send a call offer (SDP). 0 ok, -1 error.
 #[no_mangle]
 pub extern "C" fn core_cmd_send_call_offer(
@@ -4223,7 +4431,15 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(core_abi_version(), 4);
+        // Bumping this is deliberate and must be a decision, not an accident: the
+        // header and the Swift loader are checked against it, and a host built
+        // against the wrong number would load a dylib whose symbols do not match.
+        //
+        // 3 - core_cmd_http_response, which the SFU bridge needs
+        // 4 - the group call proof and the two host derivations
+        // 5 - core_cmd_sfu_http_request, so the SFU's own requests are performed
+        //     on a client trusted with the service certificate authority
+        assert_eq!(core_abi_version(), 5);
         assert_eq!(core_abi_version(), CORE_ABI_VERSION);
     }
 
