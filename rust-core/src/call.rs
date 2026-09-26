@@ -653,6 +653,49 @@ impl GroupUpdateHandler for CuztomGroupHandler {
                     "target_demux_id": *mute_target,
                 })
             }
+            // Per-remote-device state: whether their media keys arrived (so we
+            // could decrypt them at all), what their heartbeat says about their
+            // own microphone, whether they have been heard speaking, and what
+            // video they are sending.
+            //
+            // This is the update that can answer "is anybody actually reaching
+            // us" in a build whose native layer reports no audio levels. It was
+            // unhandled, so all of it was discarded.
+            GroupUpdate::RemoteDeviceStatesChanged(client_id, devices) => {
+                let with_keys = devices.iter().filter(|d| d.media_keys_received).count();
+                let unmuted = devices
+                    .iter()
+                    .filter(|d| d.heartbeat_state.audio_muted == Some(false))
+                    .count();
+                let speaking = devices.iter().filter(|d| d.speaker_time.is_some()).count();
+                let forwarding_video = devices
+                    .iter()
+                    .filter(|d| d.forwarding_video == Some(true))
+                    .count();
+                // A speaker time is the only proof in this build that audio is
+                // genuinely being transmitted, and a media key is the only proof
+                // that we would be able to decrypt it. Either one being absent
+                // is a distinct fault from the SFU not sending.
+                eprintln!(
+                    "[core] group devices client={} n={} keys={} unmuted={} spoke={} video={}",
+                    client_id,
+                    devices.len(),
+                    with_keys,
+                    unmuted,
+                    speaking,
+                    forwarding_video
+                );
+                serde_json::json!({
+                    "type": "group_update",
+                    "update": "remote_devices",
+                    "client_id": *client_id,
+                    "device_count": devices.len(),
+                    "devices_with_media_keys": with_keys,
+                    "devices_unmuted": unmuted,
+                    "devices_that_spoke": speaking,
+                    "devices_forwarding_video": forwarding_video,
+                })
+            }
             // Incoming audio, per participant. This is the one update that can
             // answer "is anybody actually reaching us", and it was being dropped:
             // the client already asks for levels every
@@ -661,6 +704,12 @@ impl GroupUpdateHandler for CuztomGroupHandler {
             // with a non-zero level means audio is arriving; an empty one means
             // the SFU is not delivering any, which is a different fault from the
             // SFU refusing to send and worth telling apart.
+            //
+            // In this build it reports nothing: `captured` and `received` are
+            // filled in by the native WebRTC layer, which returns zero for both
+            // here. The remote device state above is what carries the evidence
+            // instead, so this stays as a corroborating signal rather than the
+            // only one.
             GroupUpdate::AudioLevels(client_id, captured, received) => {
                 // Only the loudest remote level is reported. Every participant's
                 // level is not useful here and would be noise; the question is

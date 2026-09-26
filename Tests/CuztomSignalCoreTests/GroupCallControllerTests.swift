@@ -1369,6 +1369,7 @@ struct GroupCallControllerTests {
     @Test @MainActor func muteAndCameraControlsReachTheCoreAndTheState() async throws {
         let bridge = FakeBridge()
         let controller = makeController(bridge: bridge)
+        controller.cameraPermissionOverride = { true }
         _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
         await settle(controller)
 
@@ -1403,6 +1404,7 @@ struct GroupCallControllerTests {
         let bridge = FakeBridge()
         bridge.failVideoMute = true
         let controller = makeController(bridge: bridge)
+        controller.cameraPermissionOverride = { true }
         _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
         await settle(controller)
 
@@ -1415,13 +1417,13 @@ struct GroupCallControllerTests {
     }
 
     /// "Can I hear them" has to be answerable, and it has to be honest about not
-    /// knowing yet.
+    /// knowing.
     ///
-    /// A joined call with no audio is otherwise indistinguishable from a working
-    /// one, because the peer connection, the keys and the heartbeat all look the
-    /// same whether or not a byte arrives. Nothing may be claimed before a level
-    /// has actually been reported.
-    @Test @MainActor func incomingAudioIsUnknownUntilItIsMeasured() async throws {
+    /// Driven from the per-device state rather than from audio levels, because
+    /// this build's native layer reports no levels at all: a zero level there is
+    /// indistinguishable from a missing measurement, and turning that into "no
+    /// incoming audio" would be a claim rather than an observation.
+    @Test @MainActor func incomingAudioIsOnlyClaimedWhenThereIsEvidence() async throws {
         let bridge = FakeBridge()
         let controller = makeController(bridge: bridge)
         _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
@@ -1429,27 +1431,145 @@ struct GroupCallControllerTests {
 
         #expect(
             controller.current?.isReceivingAudio == nil,
-            "no level has been reported, so nothing is claimed either way"
+            "nothing has been measured yet, so nothing is claimed"
         )
 
+        // Others are present and one of them is speaking: audio is arriving.
         bridge.onGroupCallUpdate?(
             RustCoreService.GroupCallUpdate(
-                kind: .audioLevels, clientId: bridge.nextClientId, loudestRemoteLevel: 0
+                kind: .remoteDevices,
+                clientId: bridge.nextClientId,
+                deviceCount: 1,
+                devicesWithMediaKeys: 1,
+                devicesThatSpoke: 1,
+                devicesUnmuted: 1
+            )
+        )
+        await settle(controller)
+        #expect(controller.current?.isReceivingAudio == true)
+
+        // Others are present, nobody has spoken, and their keys arrived. That is a
+        // quiet call, not a broken one, and must not be reported as a fault.
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .remoteDevices,
+                clientId: bridge.nextClientId,
+                deviceCount: 1,
+                devicesWithMediaKeys: 1,
+                devicesThatSpoke: 0,
+                devicesUnmuted: 1
+            )
+        )
+        await settle(controller)
+        #expect(
+            controller.current?.isReceivingAudio == nil,
+            "a call where everyone is quiet says nothing rather than claiming a fault"
+        )
+
+        // Others are present and not one has sent a media key, so nothing they say
+        // could be decrypted. That is a definite fault.
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .remoteDevices,
+                clientId: bridge.nextClientId,
+                deviceCount: 1,
+                devicesWithMediaKeys: 0,
+                devicesThatSpoke: 0,
+                devicesUnmuted: 1
             )
         )
         await settle(controller)
         #expect(
             controller.current?.isReceivingAudio == false,
-            "a level of zero is a measurement: frames are arriving and they are silent"
+            "no media keys means nothing they send could be turned back into sound"
         )
+    }
 
-        bridge.onGroupCallUpdate?(
-            RustCoreService.GroupCallUpdate(
-                kind: .audioLevels, clientId: bridge.nextClientId, loudestRemoteLevel: 900
-            )
-        )
+    /// Audio levels must never drive the shown state in this build.
+    ///
+    /// The native layer returns zero for both the captured and the received
+    /// levels, so honouring them would leave every call permanently reporting "No
+    /// incoming audio" — a confident false statement about a call that may be
+    /// working perfectly well.
+    @Test @MainActor func audioLevelsAloneDoNotClaimAnything() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
         await settle(controller)
-        #expect(controller.current?.isReceivingAudio == true)
+
+        for level in [0, 0, 0] {
+            bridge.onGroupCallUpdate?(
+                RustCoreService.GroupCallUpdate(
+                    kind: .audioLevels, clientId: bridge.nextClientId, loudestRemoteLevel: level
+                )
+            )
+            await settle(controller)
+            #expect(
+                controller.current?.isReceivingAudio == nil,
+                "a level this build cannot measure is not evidence either way"
+            )
+        }
+    }
+
+    /// The camera is asked for when it is turned on, and not before.
+    ///
+    /// A microphone is needed for a call to be a call, so asking up front is
+    /// unavoidable. A camera is not: asking on every call would train the user to
+    /// dismiss the prompt and would claim a use the call does not have.
+    @Test @MainActor func theCameraIsOnlyAskedForWhenItIsTurnedOn() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        let asked = Counter()
+        controller.cameraPermissionOverride = { asked.bump(); return true }
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        #expect(asked.value == 0, "placing a voice call does not open a camera")
+
+        await controller.setCameraOff(false)
+        #expect(asked.value == 1, "turning the camera on is what asks")
+        #expect(controller.current?.isCameraOff == false)
+    }
+
+    /// A refused camera leaves the camera off and does not take the call with it.
+    ///
+    /// A call that cannot use the camera is still a call. Ending it, or showing a
+    /// camera that is on when access was refused, would each be a lie.
+    @Test @MainActor func aRefusedCameraLeavesTheCallRunning() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        controller.cameraPermissionOverride = { false }
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+
+        await controller.setCameraOff(false)
+
+        #expect(controller.current?.isCameraOff == true, "the camera stays off")
+        #expect(
+            !bridge.steps.contains("setVideoMuted(false)"),
+            "the call is not told the camera is on when it is not"
+        )
+        #expect(
+            controller.current?.phase == .connecting || controller.current?.phase == .connected,
+            "the call itself is unaffected"
+        )
+    }
+
+    /// Turning the camera off must work for someone who never had access, and must
+    /// not depend on a permission it does not need.
+    @Test @MainActor func turningTheCameraOffNeverAsksForPermission() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        let asked = Counter()
+        controller.cameraPermissionOverride = { asked.bump(); return true }
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        await controller.setCameraOff(false)
+        #expect(controller.current?.isCameraOff == false)
+
+        await controller.setCameraOff(true)
+        #expect(asked.value == 1, "switching it off asks nothing")
+        #expect(bridge.steps.contains("setVideoMuted(true)"))
+        #expect(controller.current?.isCameraOff == true)
     }
 
     // MARK: - Inbound

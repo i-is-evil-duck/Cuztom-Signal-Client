@@ -58,3 +58,18 @@ re-listing features that are already implemented.
 
 See `IMPLEMENTATION_PLAN.md` for the detailed status matrix and
 `CALLS_PLAN.md` for the native call boundary.
+
+## Group call audio: measurement is missing, not media
+
+- [ ] The native WebRTC layer reports no audio levels and no RTC stats in this
+      build (`Rust_getAudioLevels` returns zero for both captured and received;
+      `RtcStatsReportComplete` never fires). Until that is resolved, "is audio
+      arriving" can only be inferred from `RemoteDeviceState`, which is indirect.
+      Worth raising upstream or vendoring the native side.
+- [ ] The peer dropped ~1.4 s after unmuting video. Unresolved: an unrelated drop,
+      or a video stream this client cannot produce properly. The camera work makes
+      it testable; it has not been tested yet.
+- [ ] `swift test` segfaults at process exit roughly 1 run in 4, *after* every
+      test has passed. Pre-existing — reproduced at `e2608cb` with this session's
+      changes stashed. Teardown, not a test failure, but it hides real failures
+      and should be found.

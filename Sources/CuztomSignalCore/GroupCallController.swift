@@ -648,9 +648,17 @@ public final class GroupCallController: ObservableObject {
             // Handled above the session guard, which a ring cannot pass.
             break
         case .audioLevels:
-            // Arrives about once a second for the whole call, so it is the only
-            // thing that can say whether anybody is actually reaching us.
-            noteIncomingAudio(loudestLevel: update.loudestRemoteLevel)
+            // Logged by the core and deliberately not allowed to drive the shown
+            // state. This build's native layer returns zero for both the captured
+            // and the received levels, so a level of zero cannot be told apart
+            // from no measurement at all — and reporting "no incoming audio" from
+            // it would be a claim rather than an observation.
+            Log.info("[group-call] audio levels loudest=\(update.loudestRemoteLevel.map(String.init) ?? "?")")
+        case .remoteDevices:
+            // Driven instead by the per-device evidence, which this build does
+            // populate: a speaker time means audio is genuinely being
+            // transmitted, and a media key means we would be able to decrypt it.
+            noteRemoteDevices(update)
         case .peekResult:
             // Handled above the session guard, which a client-less update cannot
             // pass.
@@ -727,8 +735,20 @@ public final class GroupCallController: ObservableObject {
     ///
     /// The camera is off until something asks for it, so this is the only way it
     /// ever starts: a call does not open a camera the user did not request.
+    ///
+    /// Turning it **on** asks for camera access first and leaves the camera off if
+    /// that is refused. Turning it off needs no permission and cannot fail for
+    /// want of one, so a user who never had access can always switch it off.
     public func setCameraOff(_ off: Bool) async {
         guard let bridge, let session, var call = current else { return }
+        if !off {
+            guard await ensureCameraPermission() else {
+                Log.error("[group-call] camera access denied; leaving the camera off")
+                call.isCameraOff = true
+                current = call
+                return
+            }
+        }
         do {
             try await bridge.groupCallSetVideoMuted(clientId: session.handle.clientId, muted: off)
             call.isCameraOff = off
@@ -740,15 +760,35 @@ public final class GroupCallController: ObservableObject {
 
     /// Note whether audio is arriving from anyone else.
     ///
-    /// This is the honest signal for "can I hear them". A call can be joined, ICE
-    /// connected, keys exchanged and a heartbeat sent while not one audio byte
-    /// arrives, and nothing else in the call reports that. Leaving it `nil` until
-    /// the first report matters too: not yet measured is not the same as measured
-    /// and found nothing, and showing the second before the first would be
-    /// claiming a result nobody has.
-    private func noteIncomingAudio(loudestLevel: Int?) {
-        guard var call = current, let loudestLevel else { return }
-        let receiving = loudestLevel > 0
+    /// Driven from the per-device state rather than from audio levels, because
+    /// this build's native layer reports no levels and a zero level there is
+    /// indistinguishable from a missing measurement. Saying "no incoming audio"
+    /// off that basis would be an invention.
+    ///
+    /// What can be claimed:
+    /// - somebody has been heard speaking, so audio is arriving: `true`
+    /// - there are other participants and not one has sent a media key, so
+    ///   nothing they send could be decrypted: `false`
+    /// - anything else: nothing is claimed at all
+    ///
+    /// A call where everyone is simply quiet is the third case, not the second.
+    private func noteRemoteDevices(_ update: RustCoreService.GroupCallUpdate) {
+        guard var call = current,
+              let deviceCount = update.deviceCount,
+              let withKeys = update.devicesWithMediaKeys,
+              let spoke = update.devicesThatSpoke
+        else { return }
+        let receiving: Bool?
+        if spoke > 0 {
+            receiving = true
+        } else if deviceCount > 0 && withKeys == 0 {
+            // Others are here and none of them has sent a key, so nothing they
+            // say could be turned back into sound. That is a definite fault, not
+            // an absence of one.
+            receiving = false
+        } else {
+            receiving = nil
+        }
         guard call.isReceivingAudio != receiving else { return }
         call.isReceivingAudio = receiving
         current = call
@@ -1041,6 +1081,41 @@ public final class GroupCallController: ObservableObject {
     /// Test seam: replaces the AVFoundation microphone prompt so the group call
     /// path can be exercised without a device or TCC approval.
     var microphonePermissionOverride: (@Sendable () async -> Bool)?
+
+    /// Test seam: the same for the camera.
+    var cameraPermissionOverride: (@Sendable () async -> Bool)?
+
+    /// Ask for the camera, and only ever at the moment the user turns it on.
+    ///
+    /// Deliberately not requested alongside the microphone when a call starts.
+    /// The microphone is needed for the call to be a call at all, so asking up
+    /// front is the only place the prompt cannot be avoided. A camera is not: a
+    /// voice call does not need one, and asking for it on every call would train
+    /// the user to dismiss the prompt, and would claim a use for the camera that
+    /// the call does not have.
+    ///
+    /// A denial does not end the call. It leaves the camera off and says so, which
+    /// is honest: a call that cannot use the camera is still a call, unlike one
+    /// that cannot use the microphone.
+    private func ensureCameraPermission() async -> Bool {
+        if let override = cameraPermissionOverride {
+            return await override()
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            return true
+        case .notDetermined:
+            return await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .video) { value in
+                    continuation.resume(returning: value)
+                }
+            }
+        case .denied, .restricted:
+            return false
+        @unknown default:
+            return false
+        }
+    }
 
     /// Say whether this device's microphone is muted, and report the default.
     ///

@@ -1608,13 +1608,14 @@ struct GroupCallBanner: View {
     ///
     /// Shown because a joined call with no audio is otherwise indistinguishable
     /// from a joined call with audio, and "can I hear them" is the first question
-    /// anyone asks. Nothing is claimed until a level has actually been reported.
+    /// anyone asks. Nothing is claimed unless there is evidence for it: a call
+    /// where everyone is quiet says nothing rather than claiming a fault.
     private var audioText: String? {
         guard isLive else { return nil }
         switch call.isReceivingAudio {
         case .some(true): return "Hearing audio"
         case .some(false): return "No incoming audio"
-        case .none: return "Waiting for audio…"
+        case .none: return "Connected"
         }
     }
 

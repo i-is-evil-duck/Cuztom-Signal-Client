@@ -80,6 +80,12 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Cuztom Signal needs microphone access to place and answer voice calls.</string>
+    <!-- Without this the app cannot ask for the camera at all: the request fails
+         outright rather than prompting, so a group call's camera control could
+         never work. Declared here so the prompt is possible; it is only ever
+         requested when the user turns the camera on, never in advance. -->
+    <key>NSCameraUsageDescription</key>
+    <string>Cuztom Signal needs camera access when you turn your camera on in a call.</string>
     <key>CuztomSignalCoreSHA256</key>
     <string>$dylib_sha</string>
 </dict>

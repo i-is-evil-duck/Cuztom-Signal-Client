@@ -496,6 +496,105 @@ the problem and the media path is disabled for some other reason.
   killing a live call 12 s in.
 - Named participants are not implemented; the roster is a count.
 
+## What the first instrumented run actually showed
+
+The instrumentation paid for itself. `sfu peek joined=2 identified=2` — **both
+participants present, both identifiable.** The member map works, and a count of 2
+means `compute_send_rates(1, _)` rather than the all-alone branch, so the send-rate
+disabling is *not* the current cause of the silence. That ruled out the theory this
+file was written under.
+
+And a participant got heard, briefly, before the call collapsed. So audio does flow
+— it is not fundamentally broken in either direction.
+
+The remaining evidence says the measurement itself is missing:
+
+```
+group audio levels client=2 captured=0 remote=0 loudest=None     (× 118)
+rtc stats                                                            (never)
+```
+
+`get_audio_levels` is a real FFI call into the native WebRTC layer
+(`Rust_getAudioLevels`), and that layer returns zero for both the captured and the
+received levels here. So `captured=0 remote=0` is the native library declining to
+report, not this client failing to ask — and a zero level cannot be told apart from
+no measurement. `RtcStatsReportComplete` never fired at all, for the same reason.
+
+**Consequence for the UI:** the banner must not be driven by audio levels in this
+build. Doing so left every call permanently reading "No incoming audio", which is a
+confident false statement about a call that may be working. Levels are logged and
+otherwise ignored.
+
+### What the shown state is allowed to claim
+
+Now driven by `GroupUpdate::RemoteDeviceStatesChanged`, which this build *does*
+populate, and which was also being discarded:
+
+- somebody has a `speaker_time`, so audio is genuinely being transmitted → `true`
+- others are present and **not one** has sent a media key, so nothing they say
+  could be decrypted → `false`
+- anything else, **including a call where everyone is quiet** → nothing claimed
+
+A quiet call is the third case. Reporting it as a fault would be the same kind of
+invention as the levels were.
+
+Logged per device as
+`group devices client=2 n=1 keys=1 unmuted=1 spoke=1 video=0`, which is the first
+place the four things that have to be true are visible together: their key arrived,
+their heartbeat says they are unmuted, they have actually been heard speaking, and
+they are forwarding video.
+
+### The one-second window, and what it points at
+
+The call ran 15:24:19 → 15:24:28 with two participants, then:
+
+```
+15:24:25.802  group call audio muted=false client=2
+15:24:26.871  group call video muted=false client=2
+15:24:28.317  sfu peek joined=1 identified=1 demux=[254417952]
+```
+
+Turning the camera on is 1.4 s before the other participant left, and the phone
+reported "can't receive audio or video" as it went. The audio controls plainly
+worked — the mute and unmute lines are there on the button, and the participant
+count proves both sides were present. Two readings remain open and neither is yet
+evidenced: the peer dropped for an unrelated reason, or unmuting video published a
+stream this client cannot produce properly. The camera work below is what makes
+that second reading testable.
+
+## Video: what is real and what is not
+
+Honesty first, because most of the video surface in this app is a lie today.
+
+- **1:1 "Start Video" is a local flag with no media behind it.**
+  `CallController.setLocalVideoEnabled` only assigns to `ActiveCall`; it never
+  reaches the core. There is no camera code in `CallController` at all.
+- **The app had no `NSCameraUsageDescription`.** Only the microphone was declared,
+  so the camera could not be requested even in principle — the request fails
+  outright rather than prompting. Now declared, so the prompt is *possible*; it is
+  only ever requested when the user turns the camera on.
+- **Incoming video renders nowhere.** `NativeCallContext` is given a
+  `NullVideoSink`, so decoded remote frames are discarded. Rendering them needs a
+  real sink and native interop, and that is not done.
+- **A camera exists on this machine** (FaceTime HD Camera), so the hardware is not
+  the limit.
+
+What is now real: `NSCameraUsageDescription` in the bundle, a camera permission
+request made **only** when the camera is turned on, and the core's
+`set_outgoing_video_muted` behind the banner control.
+
+The camera is deliberately **not** requested alongside the microphone when a call
+starts. The microphone is needed for a call to be a call, so the prompt is
+unavoidable there; a camera is not, and asking on every call would train the user to
+dismiss it while claiming a use the call does not have. A refusal leaves the camera
+off, says so, and does not end the call — a call that cannot use the camera is
+still a call, unlike one that cannot use the microphone. Switching the camera *off*
+never asks, so someone who never had access can always turn it off.
+
+Still missing before video can be called working: a real incoming `VideoSink` and a
+local preview, and the outgoing video source actually bound to the camera rather
+than created and left alone.
+
 ## Seeing whether audio is actually arriving
 
 "Nothing is audible" and "nothing is arriving" are different faults, and until

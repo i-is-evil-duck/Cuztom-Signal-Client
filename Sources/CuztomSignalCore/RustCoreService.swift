@@ -1331,6 +1331,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let loudestLevel: Int?
         let joined: Int?
         let identified: Int?
+        let deviceCount: Int?
+        let devicesWithMediaKeys: Int?
+        let devicesThatSpoke: Int?
+        let devicesUnmuted: Int?
 
         enum CodingKeys: String, CodingKey {
             case update, state, reason
@@ -1341,6 +1345,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             case ringUpdate = "ring_update"
             case loudestLevel = "loudest_level"
             case joined, identified
+            case deviceCount = "device_count"
+            case devicesWithMediaKeys = "devices_with_media_keys"
+            case devicesThatSpoke = "devices_that_spoke"
+            case devicesUnmuted = "devices_unmuted"
         }
 
         /// An unknown update is dropped rather than guessed at, so a newer core
@@ -1358,7 +1366,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 ringUpdate: ringUpdate,
                 loudestRemoteLevel: loudestLevel,
                 joinedCount: joined,
-                identifiedCount: identified
+                identifiedCount: identified,
+                deviceCount: deviceCount,
+                devicesWithMediaKeys: devicesWithMediaKeys,
+                devicesThatSpoke: devicesThatSpoke,
+                devicesUnmuted: devicesUnmuted
             )
         }
     }
@@ -1477,6 +1489,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             /// RingRTC's own view of who is in the call — the count it derives its
             /// send rates from.
             case peekResult = "peek_result"
+            /// Per-remote-device state: media keys, their own mute state, whether
+            /// they have been heard speaking, and what video they are sending.
+            case remoteDevices = "remote_devices"
         }
 
         public let kind: Kind
@@ -1500,6 +1515,13 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         /// it can put a name to. A count of one is why audio is off.
         public let joinedCount: Int?
         public let identifiedCount: Int?
+        /// For `remoteDevices`. `devicesWithMediaKeys` is how many of them we
+        /// could actually decrypt; `devicesThatSpoke` is the only proof in this
+        /// build that audio is genuinely being transmitted.
+        public let deviceCount: Int?
+        public let devicesWithMediaKeys: Int?
+        public let devicesThatSpoke: Int?
+        public let devicesUnmuted: Int?
 
         public init(
             kind: Kind,
@@ -1512,7 +1534,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             ringUpdate: String? = nil,
             loudestRemoteLevel: Int? = nil,
             joinedCount: Int? = nil,
-            identifiedCount: Int? = nil
+            identifiedCount: Int? = nil,
+            deviceCount: Int? = nil,
+            devicesWithMediaKeys: Int? = nil,
+            devicesThatSpoke: Int? = nil,
+            devicesUnmuted: Int? = nil
         ) {
             self.kind = kind
             self.clientId = clientId
@@ -1525,6 +1551,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             self.loudestRemoteLevel = loudestRemoteLevel
             self.joinedCount = joinedCount
             self.identifiedCount = identifiedCount
+            self.deviceCount = deviceCount
+            self.devicesWithMediaKeys = devicesWithMediaKeys
+            self.devicesThatSpoke = devicesThatSpoke
+            self.devicesUnmuted = devicesUnmuted
         }
     }
 
