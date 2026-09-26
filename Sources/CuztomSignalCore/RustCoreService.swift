@@ -1618,6 +1618,38 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         !headers.contains { $0.0.utf8.contains(0) || $0.1.utf8.contains(0) }
     }
 
+    /// C strings that outlive the closure that would otherwise scope them.
+    ///
+    /// `withCString` only guarantees its pointer for the duration of its own
+    /// closure. Storing those pointers in an array and calling later reads freed
+    /// memory, which is what produced `header name: not valid UTF-8` on the first
+    /// SFU request: the pointers dangled before the FFI call. These are allocated
+    /// copies, so they stay valid until the caller frees them, which makes them
+    /// safe to hand to a call that happens later.
+    final class COwnedStrings {
+        private(set) var pointers: [UnsafePointer<CChar>?] = []
+        private var owned: [UnsafeMutablePointer<CChar>?] = []
+
+        init(_ strings: [String]) {
+            pointers.reserveCapacity(strings.count)
+            owned.reserveCapacity(strings.count)
+            for string in strings {
+                guard let copy = strdup(string) else {
+                    // Out of memory. Everything allocated so far is freed by
+                    // `deinit`, so this is a clean failure rather than a leak.
+                    pointers.removeAll()
+                    return
+                }
+                owned.append(copy)
+                pointers.append(UnsafePointer(copy))
+            }
+        }
+
+        deinit {
+            for pointer in owned { free(pointer) }
+        }
+    }
+
     public func performSFUHTTPRequest(
         method: String,
         url: String,
@@ -1626,22 +1658,21 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     ) async throws -> SFUHTTPResult {
         let token = try sessionEpoch.capture()
         return try await withCore(token: token) { sym in
-            // The FFI takes NUL-terminated C strings in parallel arrays, so each
-            // name and value gets its own `withCString` rather than passing Swift
-            // string pointers across.
             guard Self.headersCrossABI(headers) else {
                 throw SignalError.network("SFU request header contained a NUL byte")
             }
-            var nameStrings: [UnsafePointer<CChar>?] = []
-            var valueStrings: [UnsafePointer<CChar>?] = []
-            nameStrings.reserveCapacity(headers.count)
-            valueStrings.reserveCapacity(headers.count)
-            for (name, value) in headers {
-                nameStrings.append(name.withCString { UnsafePointer($0) })
-                valueStrings.append(value.withCString { UnsafePointer($0) })
+            // Held for the whole call, not for a closure. The method and url below
+            // do use `withCString` correctly, because the FFI call is inside
+            // those closures.
+            let names = COwnedStrings(headers.map { $0.0 })
+            let values = COwnedStrings(headers.map { $0.1 })
+            guard names.pointers.count == headers.count,
+                  values.pointers.count == headers.count
+            else {
+                throw SignalError.network("could not allocate the SFU request headers")
             }
-            let result = nameStrings.withUnsafeBufferPointer { nameBuffer in
-                valueStrings.withUnsafeBufferPointer { valueBuffer in
+            let result = names.pointers.withUnsafeBufferPointer { nameBuffer in
+                values.pointers.withUnsafeBufferPointer { valueBuffer in
                     body.withUnsafeBufferPointer { bodyBuffer in
                         method.withCString { methodCString in
                             url.withCString { urlCString in

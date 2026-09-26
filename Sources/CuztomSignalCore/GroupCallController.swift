@@ -223,7 +223,9 @@ public final class GroupCallController: ObservableObject {
     private var bridge: (any GroupCallNativeControlling)?
     private let proofService: GroupCallProofService
     private let redeemer: any ProofRedeeming
-    private let http: any HTTPPerforming
+    /// Replaced in `configure` when the caller did not inject one, so the SFU path
+    /// lands on the live core rather than a second one.
+    private var http: any HTTPPerforming
     private let sfuURL: String?
     /// Resolves a group's title and membership. Injected so the controller does
     /// not need the whole app model.
@@ -234,17 +236,32 @@ public final class GroupCallController: ObservableObject {
     /// Invalidates callbacks and in-flight work across configure/reset so a late
     /// callback from a retired bridge cannot mutate a new call's state.
     private var lifecycleGeneration = 0
+    /// Set when the caller supplied an `HTTPPerforming` directly, so `configure`
+    /// does not replace it. A test fake must survive `configure`.
+    private let httpIsInjected: Bool
 
     public init(
         proofService: GroupCallProofService = GroupCallProofService(),
         sfuURL: String? = nil,
         roster: any GroupRosterProviding = EmptyGroupRoster(),
         redeemer: (any ProofRedeeming)? = nil,
-        service: RustCoreService = RustCoreService()
+        service: RustCoreService? = nil
     ) {
         self.proofService = proofService
         self.redeemer = redeemer ?? proofService
-        self.http = NativeHTTP(service: service)
+        // A service given here wins. Otherwise the bridge supplies one in
+        // `configure`, because using a default-constructed `RustCoreService`
+        // instead would stand up a *second* native core against the same
+        // database and the same global sync-control slot. That is visible as an
+        // extra Keychain passphrase read at the moment the first SFU request is
+        // made, and it is a hazard rather than a waste.
+        if let service {
+            self.http = NativeHTTP(service: service)
+            self.httpIsInjected = true
+        } else {
+            self.http = NativeHTTP(service: RustCoreService())
+            self.httpIsInjected = false
+        }
         self.sfuURL = sfuURL
         self.roster = roster
     }
@@ -261,6 +278,7 @@ public final class GroupCallController: ObservableObject {
         self.proofService = proofService
         self.redeemer = redeemer
         self.http = http
+        self.httpIsInjected = true
         self.sfuURL = sfuURL
         self.roster = roster
     }
@@ -273,6 +291,13 @@ public final class GroupCallController: ObservableObject {
         self.bridge?.onGroupCallUpdate = nil
         self.bridge?.onHTTPRequest = nil
         self.bridge = bridge
+        // The SFU path must run on the same core as the rest of the call. Without
+        // this, a controller built by the public init would perform SFU requests
+        // on a default-constructed service, standing up a second native core
+        // against the same database and the same global sync-control slot.
+        if !httpIsInjected, let service = bridge as? RustCoreService {
+            self.http = NativeHTTP(service: service)
+        }
         let generation = lifecycleGeneration
 
         bridge.onGroupCallUpdate = { [weak self] update in
@@ -680,6 +705,17 @@ public final class GroupCallController: ObservableObject {
             )
             fail("Call service request failed: \(Self.describe(error))")
         }
+    }
+
+    /// Identity of the service the SFU performer will use, for tests.
+    ///
+    /// Exists so the wiring can be asserted rather than inferred. The failure
+    /// being guarded against - a second native core standing up against the same
+    /// database - has no other symptom at the point it happens, so there has to
+    /// be something to check.
+    var sfuServiceIdentifier: ObjectIdentifier? {
+        guard let native = http as? NativeHTTP else { return nil }
+        return ObjectIdentifier(native.service)
     }
 
     // MARK: - State

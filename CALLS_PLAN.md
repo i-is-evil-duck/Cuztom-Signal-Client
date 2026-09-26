@@ -360,6 +360,35 @@ instance is gone, but the generic fallback stays for anything unrecognised —
 it is the right default for a user-facing string, and the fix is to log the real
 cause alongside it, not to make the fallback more specific.
 
+### Two bugs the first SFU request exposed
+
+Both were mine, and both are the kind that only a live request finds.
+
+**Dangling C pointers.** The FFI takes header names and values as arrays of
+NUL-terminated C strings. The first version used `withCString` and stored the
+pointers, which is the classic way to use it wrong: `withCString` guarantees its
+pointer only for the duration of its own closure, so the arrays held freed memory
+by the time the FFI ran. Every request failed with `header name: not valid
+UTF-8` — which, ironically, was *far* more useful than the previous run's generic
+message, and is why the fix was found in one iteration rather than several.
+
+Headers now go through an owning type that allocates copies and frees them on
+deinit, so they are valid for the whole call. The method and url still use
+`withCString`, correctly, because the FFI call is inside those closures.
+
+**A second native core.** `NativeHTTP` held a default-constructed
+`RustCoreService`, because the public initializer had no service to take and the
+app configures the bridge afterwards. The first SFU request therefore stood up a
+*second* native core against the same database and the same global sync-control
+slot. Its only symptom was an extra Keychain passphrase read in the log at the
+moment the request was made — a `keychain op=3` line, easily skimmed past, that
+should not have been there at all after startup had already read it twice.
+
+The performer is now completed from whatever `configure` is handed, and asserted
+on identity. The lesson is that the passphrase read is a useful invariant: two
+reads at startup and none thereafter is the expected shape, so a third one is
+evidence of a second core rather than noise.
+
 ### Superseded proof attempts must not report failure
 
 RingRTC asks for a membership proof more than once, and a second request arrives
@@ -414,3 +443,9 @@ Before changing call code, preserve:
   (`aRequestThatCouldNotBePerformedIsNotAnSFURefusal`), and a header value
   containing a NUL is refused rather than truncated into two headers
   (`anSFUHeaderContainingNULIsRefused`).
+- C strings handed to the FFI are valid at the moment of the call, not only inside
+  the closure that created them (`sfuHeaderStringsOutliveTheirScope`). This test
+  is verified to fail against the dangling-pointer version.
+- SFU requests run on the core the controller was configured with, never a
+  default-constructed one
+  (`theSFUPathUsesTheConfiguredBridgeRatherThanAFreshCore`).

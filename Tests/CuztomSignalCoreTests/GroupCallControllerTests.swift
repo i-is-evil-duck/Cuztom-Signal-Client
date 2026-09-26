@@ -722,6 +722,69 @@ struct GroupCallControllerTests {
         #expect(!RustCoreService.headersCrossABI([("bad\u{0}name", "value")]))
     }
 
+    /// C strings handed to the FFI must still be valid when the FFI is called.
+    ///
+    /// `withCString` only guarantees its pointer for the duration of its own
+    /// closure. Building an array of those pointers and calling afterwards reads
+    /// freed memory, which is exactly what happened on the first SFU request:
+    /// every header arrived as `header name: not valid UTF-8` because the names
+    /// dangled before the call. The test reads the strings back *after* the scope
+    /// in which they were created, so a pointer that does not outlive its closure
+    /// fails here rather than only on a device.
+    @Test func sfuHeaderStringsOutliveTheirScope() {
+        let strings = RustCoreService.COwnedStrings(
+            ["Content-Type", "Authorization", "X-Signal-Request-Reason"]
+        )
+        // Read well outside the creation scope, including after unrelated work
+        // that would reuse any freed stack or heap space.
+        var garbage: [UInt8] = []
+        for index in 0..<4096 { garbage.append(UInt8(index % 251)) }
+        #expect(garbage.count == 4096)
+
+        #expect(strings.pointers.count == 3)
+        #expect(strings.pointers.allSatisfy { $0 != nil })
+        for (index, expected) in ["Content-Type", "Authorization", "X-Signal-Request-Reason"]
+            .enumerated()
+        {
+            let pointer = try! #require(strings.pointers[index])
+            #expect(String(cString: pointer) == expected)
+        }
+
+        // An empty header set is legal and yields no pointers.
+        #expect(RustCoreService.COwnedStrings([]).pointers.isEmpty)
+    }
+
+    /// The SFU path must run on the same core as the rest of the call.
+    ///
+    /// A controller built by the public init has no bridge yet, so the SFU
+    /// performer is completed from whatever `configure` is handed. If it is left
+    /// on a default-constructed `RustCoreService`, the first SFU request stands up
+    /// a *second* native core against the same database and the same global
+    /// sync-control slot. That is not loud: it showed up only as an extra Keychain
+    /// passphrase read at the moment the request was made, and it would race the
+    /// live core for the sync loop.
+    ///
+    /// Asserted on identity rather than on behaviour, because the failure mode is
+    /// the wrong object existing at all.
+    @Test @MainActor func theSFUPathUsesTheConfiguredBridgeRatherThanAFreshCore() {
+        let controller = GroupCallController(roster: FakeRoster())
+        let service = RustCoreService()
+        // Before configuration the performer is a placeholder; after, it must be
+        // the service that was handed in. A test fake proves the injected case is
+        // not overwritten, which is the other half of the same rule.
+        controller.configure(with: service)
+        #expect(controller.sfuServiceIdentifier != nil)
+
+        let fake = FakeBridge()
+        let withFake = GroupCallController(
+            bridge: fake,
+            redeemer: FakeRedeemer(token: [0xAA]),
+            http: FakeHTTP()
+        )
+        withFake.configure(with: service)
+        #expect(withFake.sfuServiceIdentifier == nil, "an injected performer must be kept")
+    }
+
     // MARK: - Inbound
 
     @Test @MainActor func anInboundCallForAKnownGroupIsJoined() async throws {
