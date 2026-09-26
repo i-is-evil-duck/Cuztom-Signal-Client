@@ -632,10 +632,9 @@ func sendTyping(started: Bool) async {
             return
         }
         do {
-            // Prime the roster first: without it the SFU cannot attribute
-            // anyone in the call, which looks like a broken call rather than a
-            // missing step.
-            _ = try await roster.load(masterKeyHex: masterKey)
+            // The roster is primed by the controller, not here. Doing it in both
+            // places meant the answered-ring path - added later - silently missed
+            // it, and a call joined without a member map connects and is unusable.
             groupCall = try await groupCalls.startCall(
                 masterKeyHex: masterKey,
                 title: conv.title

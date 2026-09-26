@@ -74,6 +74,15 @@ public final class NativeGroupRoster: GroupRosterProviding, @unchecked Sendable 
         return roster
     }
 
+    /// `GroupRosterProviding.load`, so a group call can prime its own roster.
+    ///
+    /// The concrete `load` above returns the richer `GroupRoster`; this is the
+    /// protocol-shaped view of it. The SFU needs the member ACIs, and a call
+    /// joined against a cache that was never filled hands it none.
+    public func load(masterKeyHex: String) async throws -> [String] {
+        try await load(masterKeyHex: masterKeyHex).memberAciUUIDs
+    }
+
     /// Load the id-to-key map used to decide which inbound calls are receivable.
     @discardableResult
     public func loadGroupIdMap() async throws -> [String: String] {

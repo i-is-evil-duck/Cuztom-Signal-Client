@@ -390,17 +390,7 @@ public final class GroupCallController: ObservableObject {
         }
         let groupIdHex = try await bridge.groupCallGroupId(masterKeyHex: key)
         Log.info("[group-call] step=group-id-derived group=\(groupIdHex.prefix(8))…")
-        let members = roster.members(masterKeyHex: key)
-        if members.isEmpty {
-            // A group of one is legal, so this is not refused outright. But an
-            // empty roster on a group that has members means the roster was
-            // never read, and the SFU cannot attribute anyone in a call like
-            // that: it connects and then nobody can be identified. Saying so
-            // beats a call that looks alive and is useless.
-            Log.error(
-                "[group-call] roster for this group is empty; the call will connect with nobody identifiable"
-            )
-        }
+        let members = await primeRoster(masterKeyHex: key)
         let resolvedTitle = title ?? roster.title(masterKeyHex: key)
         let handle = try await bridge.startGroupCall(groupIdHex: groupIdHex, sfuURL: sfuURL)
         Log.info("[group-call] step=client-created client=\(handle.clientId)")
@@ -827,6 +817,34 @@ public final class GroupCallController: ObservableObject {
         }
     }
 
+    /// Load a group's roster, and say what came back.
+    ///
+    /// The roster is the member map the SFU needs in order to attribute this
+    /// client and to encrypt media towards anyone. A call joined without one
+    /// connects and is unusable, so the count is logged and a genuinely empty
+    /// roster is reported: the SFU cannot attribute *anybody* in a call like that,
+    /// and peers describe such a client as malfunctioning.
+    ///
+    /// A failure to load is not fatal. The call can still connect, and refusing
+    /// would turn a degraded call into no call at all — but it is stated, because
+    /// the difference between "one member" and "not read" is invisible otherwise.
+    @discardableResult
+    private func primeRoster(masterKeyHex: String) async -> [String] {
+        do {
+            let members = try await roster.load(masterKeyHex: masterKeyHex)
+            Log.info("[group-call] roster loaded members=\(members.count)")
+            if members.isEmpty {
+                Log.error(
+                    "[group-call] roster for this group is empty; the call will connect with nobody identifiable"
+                )
+            }
+            return members
+        } catch {
+            Log.error("[group-call] roster could not be loaded: \(Self.describe(error))")
+            return roster.members(masterKeyHex: masterKeyHex)
+        }
+    }
+
     /// The master key for a group named by identifier.
     ///
     /// A ring names a group by its ZK identifier, which is not what a thread is
@@ -858,6 +876,12 @@ public final class GroupCallController: ObservableObject {
             return nil
         }
         incoming = nil
+        // Primed here for the same reason the outgoing path primes it: without a
+        // loaded roster the SFU is given no member map, so it cannot attribute
+        // this client or encrypt anything towards it. That is not a cosmetic
+        // gap - a call joined with an empty roster connects and is useless, and
+        // peers report the client as malfunctioning.
+        await primeRoster(masterKeyHex: masterKeyHex)
         Log.info("[group-call] answering ring for \(Self.short(ring.groupIdHex))")
         do {
             let handle = try await bridge.startGroupCall(
@@ -1117,6 +1141,25 @@ public protocol GroupRosterProviding: Sendable {
     /// point, so an eager read always fails and inbound calls then stay
     /// unresolvable for the life of the process.
     func masterKeyHex(forGroupIdHex groupIdHex: String) async -> String?
+
+    /// Load the roster for a group, returning the member ACIs.
+    ///
+    /// Separate from `members` because the two can disagree, and the
+    /// disagreement is the whole problem: `members` reads a cache that is empty
+    /// until something has loaded it, and a call joined on a cache that was never
+    /// filled hands the SFU no member map. It then cannot attribute this client
+    /// or encrypt media towards anyone, so the call connects and is unusable, and
+    /// peers report the client as malfunctioning.
+    ///
+    /// Defaults to the cached read, so a roster with nothing to load — a test, or
+    /// a host that loads elsewhere — still works and still reports what it has.
+    func load(masterKeyHex: String) async throws -> [String]
+}
+
+extension GroupRosterProviding {
+    public func load(masterKeyHex: String) async throws -> [String] {
+        members(masterKeyHex: masterKeyHex)
+    }
 }
 
 /// A roster that knows nothing, so the controller is usable before the host

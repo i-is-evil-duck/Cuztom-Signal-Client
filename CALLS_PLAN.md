@@ -274,6 +274,16 @@ re-apply it after an upstream update.
   before anyone has joined — and then runs the ordinary join. Declining is local:
   a cancellation has to echo the ringer's `ring_id` back in a message this client
   does not send, so declining does not pretend to cancel anything.
+- **Every call path primes its own roster.** The roster is the member map the SFU
+  needs in order to attribute this client and to encrypt media towards anyone.
+  It used to be primed by the host before calling in, which meant the
+  answered-ring path — added later — silently missed it. A call joined against a
+  cache that was never filled hands the SFU no member map: it connects, nobody
+  can be attributed, and **peers report this client as malfunctioning**. Observed
+  as `members-built count=0` on two of three calls, where the third had
+  `count=2`. The requirement is now on `GroupRosterProviding` itself, with a
+  default that reads the cache, so a path cannot forget it.
+  (`everyCallPathPrimesTheRosterItself`)
 - **The sync loop does not reconnect.** When the message stream ends, the loop
   `break`s, `set_sync_ctrl(None)` runs, and the loop is gone for good until the
   account is relinked. Everything routed through it then fails with "sync loop is

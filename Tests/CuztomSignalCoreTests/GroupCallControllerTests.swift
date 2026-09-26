@@ -270,7 +270,7 @@ struct GroupCallControllerTests {
         bridge: FakeBridge,
         redeemer: (any GroupCallController.ProofRedeeming)? = nil,
         http: FakeHTTP = FakeHTTP(),
-        roster: FakeRoster = FakeRoster()
+        roster: any GroupRosterProviding = FakeRoster()
     ) -> GroupCallController {
         let controller = GroupCallController(
             bridge: bridge,
@@ -1068,6 +1068,67 @@ struct GroupCallControllerTests {
 
         #expect(controller.incoming == nil)
         #expect(!bridge.steps.contains("start"), "declining is not joining")
+    }
+
+    /// A call must prime its own roster, on every path in.
+    ///
+    /// The roster is the member map the SFU needs in order to attribute this
+    /// client and encrypt media towards anyone. It used to be primed by the host
+    /// before calling in, which meant the answered-ring path — added later —
+    /// silently missed it: a call joined against a cache that was never filled
+    /// hands the SFU nothing, and the result is a call that connects and is
+    /// useless, with peers reporting this client as malfunctioning. That is
+    /// exactly what was observed.
+    @Test @MainActor func everyCallPathPrimesTheRosterItself() async throws {
+        // A roster that only has members once something has asked for them, the
+        // way the real one behaves.
+        final class LazyRoster: GroupRosterProviding, @unchecked Sendable {
+            private(set) var loads = 0
+            var loaded: Set<String> = []
+            var memberACIs: [String] = ["11111111-1111-1111-1111-111111111111"]
+            var groupTitle = "Test Group"
+            var knownGroupIdHex: String?
+
+            func members(masterKeyHex: String) -> [String] {
+                loaded.contains(masterKeyHex) ? memberACIs : []
+            }
+
+            func title(masterKeyHex: String) -> String { groupTitle }
+
+            func masterKeyHex(forGroupIdHex groupIdHex: String) async -> String? {
+                knownGroupIdHex == groupIdHex ? Self.masterKeyHex : nil
+            }
+
+            func load(masterKeyHex: String) async throws -> [String] {
+                loads += 1
+                loaded.insert(masterKeyHex)
+                return memberACIs
+            }
+
+            static let masterKeyHex = String(repeating: "cd", count: 32)
+        }
+
+        // Outgoing.
+        let outgoing = LazyRoster()
+        let outgoingController = makeController(bridge: FakeBridge(), roster: outgoing)
+        _ = try await outgoingController.startCall(masterKeyHex: LazyRoster.masterKeyHex)
+        #expect(outgoing.loads == 1, "an outgoing call primes its own roster")
+        #expect(outgoing.members(masterKeyHex: LazyRoster.masterKeyHex).count == 1)
+
+        // Answered.
+        let answered = LazyRoster()
+        answered.knownGroupIdHex = Self.groupIdHex
+        let answeredController = makeController(bridge: FakeBridge(), roster: answered)
+        let state = await answeredController.answer(
+            GroupCallController.GroupCallRing(
+                groupIdHex: Self.groupIdHex,
+                ringId: 1,
+                senderIdHex: nil,
+                title: nil
+            )
+        )
+        #expect(state != nil)
+        #expect(answered.loads == 1, "answering a ring primes the roster too")
     }
 
     // MARK: - Inbound
