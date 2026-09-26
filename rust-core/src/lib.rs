@@ -2290,9 +2290,78 @@ async fn cmd_sfu_http_request(
         },
     )
     .await?;
-    reply_rx
+    let reply = reply_rx
         .await
-        .map_err(|_| "sync loop dropped the request".to_string())?
+        .map_err(|_| "sync loop dropped the request".to_string())?;
+    // Only a completed request carries a peek worth reading; a refused or
+    // undeliverable one has no body and reports nothing.
+    if let Ok(body) = &reply {
+        if let Some(description) = describe_sfu_peek(method, url, body) {
+            eprintln!("[core] sfu peek {description}");
+        }
+    }
+    reply
+}
+
+/// Report who the SFU thinks is in the call.
+///
+/// This is the one response that decides whether audio exists at all. RingRTC
+/// counts the *other* participants in the peek and, when it finds none, turns
+/// off audio recording, outgoing media, **and** audio playout at once
+/// (`set_send_rates_inner`, `group_call.rs:2420`). The result is silence in both
+/// directions with no error anywhere — the call looks perfectly healthy, joins
+/// fine, and exchanges media keys, and then nobody can hear anybody.
+///
+/// RingRTC logs that decision through its own logger, which this build does not
+/// surface, so the count that causes it was invisible. It is read here instead.
+///
+/// The participant user IDs arrive obfuscated (`opaqueUserId`) and are resolved
+/// against the member map given at join time, so whether they are present at all
+/// is worth seeing: a missing or mistimed member map is what leaves a
+/// participant the SFU cannot name, which is what a peer sees as a
+/// `DerivedState(value=<Not calculated>)` label rather than a name.
+///
+/// Nothing identifying is logged: demux ids and counts only. The opaque IDs are
+/// deliberately not printed — they are per-call material.
+fn describe_sfu_peek(method: &str, url: &str, reply: &str) -> Option<String> {
+    use base64::Engine as _;
+    if !method.eq_ignore_ascii_case("GET") || !url.ends_with("/v2/conference/participants") {
+        return None;
+    }
+    let envelope = serde_json::from_str::<serde_json::Value>(reply).ok()?;
+    if envelope.get("status").and_then(serde_json::Value::as_u64) != Some(200) {
+        return None;
+    }
+    let encoded = envelope.get("bodyB64").and_then(serde_json::Value::as_str)?;
+    let body = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let peek = serde_json::from_slice::<serde_json::Value>(&body).ok()?;
+    let mut parts: Vec<String> = Vec::new();
+    for (label, key) in [("joined", "participants"), ("pending", "pendingClients")] {
+        let Some(entries) = peek.get(key).and_then(serde_json::Value::as_array) else {
+            parts.push(format!("{label}=absent"));
+            continue;
+        };
+        let named = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .get("opaqueUserId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+            })
+            .count();
+        let demux: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.get("demuxId").and_then(serde_json::Value::as_u64))
+            .map(|id| id.to_string())
+            .collect();
+        parts.push(format!(
+            "{label}={} identified={named} demux=[{}]",
+            entries.len(),
+            demux.join(",")
+        ));
+    }
+    Some(parts.join(" "))
 }
 
 /// The CDN base URLs from the service configuration.
@@ -4476,6 +4545,63 @@ mod tests {
         let (reply, _ack) = oneshot::channel();
         let error = send_sync_ctrl(&sender, LoopCtrl::Shutdown { reply }).unwrap_err();
         assert!(error.contains("full"));
+    }
+
+    /// The peek response is the only place the participant count is visible, and
+    /// that count decides whether audio exists at all.
+    ///
+    /// RingRTC turns off audio recording, outgoing media *and* audio playout
+    /// together when the peek shows no other participant, so a client that thinks
+    /// it is alone in the call is silent in both directions while looking
+    /// perfectly healthy. That decision is logged only through RingRTC's own
+    /// logger, which this build does not surface, so it had to be read here.
+    ///
+    /// The test pins the two things worth seeing: how many participants the SFU
+    /// reports, and how many of them arrived with a user ID it could resolve. A
+    /// participant with no ID is one the SFU cannot name, which is what a peer
+    /// sees as `DerivedState(value=<Not calculated>)`.
+    #[test]
+    fn sfu_peek_reports_participants_and_which_are_identified() {
+        use base64::Engine as _;
+        let peek = serde_json::json!({
+            "participants": [
+                { "demuxId": 111, "opaqueUserId": "opaque-a" },
+                { "demuxId": 222, "opaqueUserId": "" },
+            ],
+            "pendingClients": [],
+        });
+        let body = base64::engine::general_purpose::STANDARD.encode(peek.to_string());
+        let reply = serde_json::json!({ "status": 200, "bodyB64": body }).to_string();
+
+        let described = describe_sfu_peek(
+            "GET",
+            "https://sfu.voip.signal.org/v2/conference/participants",
+            &reply,
+        )
+        .expect("a 200 peek is described");
+
+        assert!(described.contains("joined=2"), "{described}");
+        assert!(described.contains("identified=1"), "{described}");
+        assert!(described.contains("demux=[111,222]"), "{described}");
+        assert!(described.contains("pending=0"), "{described}");
+    }
+
+    /// A count of other participants is the difference between a call and
+    /// silence, so a peek that cannot be read must not be reported as an empty
+    /// call.
+    ///
+    /// A non-200, a non-peek request, and an unparsable body are all "no
+    /// information" rather than "nobody is there", and collapsing them would
+    /// make a broken response look like an empty call.
+    #[test]
+    fn sfu_peek_says_nothing_when_there_is_nothing_to_say() {
+        assert!(describe_sfu_peek("PUT", "https://sfu.example.test/v2/conference/participants", "{}").is_none());
+        assert!(describe_sfu_peek("GET", "https://sfu.example.test/v2/other", "{}").is_none());
+        // Refused, and the documented "could not be performed" null status.
+        assert!(describe_sfu_peek("GET", "https://x.test/v2/conference/participants", r#"{"status":403}"#).is_none());
+        assert!(describe_sfu_peek("GET", "https://x.test/v2/conference/participants", r#"{"status":null}"#).is_none());
+        // A 200 with a body that is not a peek.
+        assert!(describe_sfu_peek("GET", "https://x.test/v2/conference/participants", r#"{"status":200,"bodyB64":"bm90IGpzb24="}"#).is_none());
     }
 
     #[test]

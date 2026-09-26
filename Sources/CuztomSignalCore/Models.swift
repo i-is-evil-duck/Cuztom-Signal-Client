@@ -178,6 +178,40 @@ public struct ChatMessage: Identifiable, Sendable, Codable {
         self.reactions = reactions
         self.readBy = readBy
         self.deliveredTo = deliveredTo
+        enforceReceiptPrecedence()
+    }
+
+    /// Record that a member has seen this message.
+    ///
+    /// Seeing a message implies receiving it, so this also drops them from
+    /// `deliveredTo`. Leaving them in both is not a cosmetic duplication: a
+    /// reader list that also contains people who have only had it delivered is
+    /// reporting a state that cannot exist, and every consumer of these two
+    /// lists has to special-case it.
+    public mutating func recordRead(by participantID: String) {
+        if !readBy.contains(participantID) { readBy.append(participantID) }
+        deliveredTo.removeAll { $0 == participantID }
+    }
+
+    /// Record that a member's devices confirmed delivery.
+    ///
+    /// A member who has already seen the message stays in `readBy` and is not
+    /// added here: having read it is the stronger statement, and a later
+    /// delivery receipt for the same member must not move them backwards.
+    public mutating func recordDelivered(to participantID: String) {
+        guard !readBy.contains(participantID) else { return }
+        if !deliveredTo.contains(participantID) { deliveredTo.append(participantID) }
+    }
+
+    /// Drop from `deliveredTo` anyone who appears in `readBy`.
+    ///
+    /// Applied on init and whenever receipts are merged, so rows written before
+    /// this rule existed are corrected the next time they are read rather than
+    /// needing a migration.
+    public mutating func enforceReceiptPrecedence() {
+        let readers = Set(readBy)
+        guard !readers.isEmpty else { return }
+        deliveredTo.removeAll { readers.contains($0) }
     }
 }
 

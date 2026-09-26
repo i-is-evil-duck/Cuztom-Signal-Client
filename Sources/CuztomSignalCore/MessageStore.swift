@@ -129,6 +129,10 @@ public actor InMemoryMessageStore: MessageStoring {
         merged.reactions = orderedUnion(existing.reactions, incoming.reactions)
         merged.readBy = orderedUnion(existing.readBy, incoming.readBy)
         merged.deliveredTo = orderedUnion(existing.deliveredTo, incoming.deliveredTo)
+        // A merge can reunite a reader with a delivery receipt recorded earlier,
+        // so the precedence rule has to be re-applied after merging, not only
+        // when each side was first recorded.
+        merged.enforceReceiptPrecedence()
         if incoming.status == .queued, existing.status != .queued {
             merged.status = existing.status
         } else if existing.status == .failed, incoming.status == .sent {

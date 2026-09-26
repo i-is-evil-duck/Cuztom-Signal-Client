@@ -279,9 +279,9 @@ public final class ChatController: @unchecked Sendable {
                 if timestamps.contains(ms) || (m.storeTs.map { timestamps.contains($0) } ?? false) {
                     await store.updateMessage(id: m.id) { msg in
                         if kind == "read" {
-                            if !msg.readBy.contains(participantID) { msg.readBy.append(participantID) }
+                            msg.recordRead(by: participantID)
                         } else {
-                            if !msg.deliveredTo.contains(participantID) { msg.deliveredTo.append(participantID) }
+                            msg.recordDelivered(to: participantID)
                         }
                     }
                     touched = thread

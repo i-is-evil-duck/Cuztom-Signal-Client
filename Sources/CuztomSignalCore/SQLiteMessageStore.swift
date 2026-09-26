@@ -579,6 +579,10 @@ public actor SQLiteMessageStore: MessageStoring {
         merged.reactions = orderedUnion(existing.reactions, incoming.reactions)
         merged.readBy = orderedUnion(existing.readBy, incoming.readBy)
         merged.deliveredTo = orderedUnion(existing.deliveredTo, incoming.deliveredTo)
+        // A merge can reunite a reader with a delivery receipt recorded earlier,
+        // so the precedence rule has to be re-applied after merging, not only
+        // when each side was first recorded.
+        merged.enforceReceiptPrecedence()
         if incoming.status == .queued, existing.status != .queued {
             merged.status = existing.status
         } else if existing.status == .failed, incoming.status == .sent {
@@ -718,5 +722,9 @@ extension ChatMessage: FetchableRecord {
         readBy = (try? JSONDecoder().decode([String].self, from: Data(readByJSON.utf8))) ?? []
         let deliveredToJSON: String = row["deliveredTo_json"]
         deliveredTo = (try? JSONDecoder().decode([String].self, from: Data(deliveredToJSON.utf8))) ?? []
+        // Rows written before the precedence rule existed can hold a reader in
+        // both lists. Corrected on read rather than migrated, so the fix reaches
+        // messages already on disk.
+        enforceReceiptPrecedence()
     }
 }

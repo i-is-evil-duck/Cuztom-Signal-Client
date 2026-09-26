@@ -432,6 +432,87 @@ is logged so a mismatch names itself.
   the user and been told yes.
   (`everyGroupCallSaysItsMicrophoneIsLive`)
 
+## Why two-party audio is silent, and why nothing said so
+
+The join chain is verified end to end and audio is still silent in **both**
+directions, with no error anywhere. The reason is that RingRTC treats "I am the
+only participant" as a reason to turn the whole media path off, and it decides
+that from a number we never had visibility into.
+
+`group_call.rs:3470` computes the send rates from the count of **other**
+participants in the SFU peek:
+
+```rust
+if local_device_is_participant {
+    let send_rates = Self::compute_send_rates(new_demux_ids.len(), …);
+    Self::set_send_rates_inner(state, send_rates);
+}
+```
+
+and `compute_send_rates(0, _)` returns `ALL_ALONE_MAX_SEND_RATE` (1 kbps), which
+`set_send_rates_inner` turns into all of the following **at once**
+(`group_call.rs:2420`):
+
+```rust
+state.peer_connection.set_audio_recording_enabled(false);
+state.peer_connection.set_outgoing_media_enabled(false);
+state.peer_connection.set_audio_playout_enabled(false);
+```
+
+Recording *and* playout. So a client that believes it is alone in the call cannot
+send and cannot hear, while every outward signal looks healthy: the ZK proof is
+redeemed, the SFU returns 200, `join: Joined`, `state: Connected` — that
+`Connected` is the ICE state, and ICE genuinely does connect. Media keys go out.
+The unmute goes out. And it is still silence, because the audio device was turned
+off from both ends by a count nobody was reading.
+
+RingRTC logs that decision (`"Disable audio and outgoing media because there are
+no other devices."`), but only through its own logger, which this build does not
+surface. The count is now read directly from the peek response and logged
+(`describe_sfu_peek`, `sfu peek joined=N identified=M demux=[…]`). The peek is
+JSON, not protobuf, and its participant user IDs arrive as `opaqueUserId`,
+resolved against the member map supplied at join time — so `identified` below the
+participant count is what tells us whether the SFU can put a name to a
+participant at all, which is the same question as the `DerivedState(value=<Not
+calculated>)` label a peer reported.
+
+Nothing identifying is logged: demux ids and counts only. The opaque IDs are
+per-call material and are deliberately not printed.
+
+The next run answers one question outright: if `joined=1`, RingRTC genuinely
+thinks nobody else is there, and the fault is upstream of the media path — in
+whether the other participant is publishing itself to the SFU, or in the member
+map arriving too late to be applied at join. If `joined=2`, the count was never
+the problem and the media path is disabled for some other reason.
+
+### Still open
+
+- **No group call window.** The incoming banner and the in-call banner are the
+  whole group call UI today; 1:1 has a call screen and groups do not. Not a bug —
+  a feature that was never built.
+- Declining a ring sends no cancellation (the ringer's `ring_id` is not echoed).
+- The sync loop does not reconnect: when the message stream ends it breaks and
+  every later request, SFU included, fails with "sync loop is gone". Observed
+  killing a live call 12 s in.
+- Named participants are not implemented; the roster is a count.
+
+## Read receipts: a reader is not also a delivery
+
+A member appeared under both "Seen by" and "Delivered to" in the same message
+info popover. Seeing a message implies receiving it, so the two lists reported a
+state that cannot exist, and every consumer of them would have had to
+special-case it.
+
+The rule now lives on the model rather than in the view, because it is a property
+of the data and not of this popover:
+
+- `recordRead(by:)` drops the member from `deliveredTo`.
+- `recordDelivered(to:)` refuses to add someone already in `readBy`, so a late
+  delivery receipt cannot move a member backwards.
+- `enforceReceiptPrecedence()` is applied on init, after every merge, and when a
+  row is read from SQLite — so messages already on disk are corrected on the next
+  read instead of needing a migration.
+
 ## Where the group-call join actually stands
 **A group call connects.** Verified 2026-09-25 against the real SFU,
 `sfu.voip.signal.org`:
