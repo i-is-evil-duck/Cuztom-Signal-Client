@@ -39,3 +39,10 @@ prost = "0.14"
 # Match the SQLCipher-enabled SQLx used by presage-store-sqlite for safe
 # plaintext-to-encrypted migration and verification.
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
+[dev-dependencies]
+# Already in the graph through presage/libsignal-service, and pinned to the same
+# resolved version so the test cannot compile against a different one than the
+# request path uses. Needed to assert header behavior that only a real
+# `RequestBuilder` can exhibit; see `an_authorization_header_appends_rather_than_replaces`.
+reqwest = "0.13"

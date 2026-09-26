@@ -1808,4 +1808,44 @@ fn a_group_credential_token_decodes_only_from_a_well_formed_body() {
     // Garbage is not partially read into a token.
     assert_eq!(decode_group_credential_token(&[0xff, 0xff, 0xff]), None);
 }
+
+/// Pins the HTTP-level reason `group_call_token` must not send the account's
+/// credentials alongside the membership proof.
+///
+/// `RequestBuilder::header` appends. So when the service builder has already
+/// called `basic_auth` (which `HttpAuthOverride::NoOverride` does, because the
+/// manager is an *identified* one), adding the proof header yields a request
+/// with two `Authorization` fields. nginx answers that with a bare `400 Bad
+/// Request` and an HTML body of its own, generated before the request reaches
+/// the application — so the status is indistinguishable from bad parameters
+/// and the body is indistinguishable from anything the service said. Verified
+/// against `storage.signal.org/v2/groups/token`: a single `Authorization`
+/// header of any length gets `401`, two get `400`, at every total size tried
+/// from 100 to 3000 bytes.
+///
+/// The fix is in the vendored method, which selects `HttpAuthOverride::
+/// Unidentified`. This test cannot reach that call without a registered manager,
+/// so it pins the assumption the fix rests on instead: if reqwest ever makes
+/// `header` replace, the override is no longer load-bearing and this fails to
+/// say so, rather than the bug returning silently.
+#[test]
+fn an_authorization_header_appends_rather_than_replaces() {
+    let request = reqwest::Client::new()
+        .get("https://example.invalid/v2/groups/token")
+        .basic_auth("pni", Some("account-auth-token"))
+        .header(reqwest::header::AUTHORIZATION, "Basic <membership-proof>")
+        .build()
+        .expect("a request builds without being sent");
+    let values = request
+        .headers()
+        .get_all(reqwest::header::AUTHORIZATION)
+        .iter()
+        .count();
+    assert_eq!(
+        values, 2,
+        "reqwest now replaces an existing Authorization header, so \
+         HttpAuthOverride::Unidentified in group_call_token is no longer \
+         load-bearing; re-check the duplicate-header 400 before removing it"
+    );
+}
 }

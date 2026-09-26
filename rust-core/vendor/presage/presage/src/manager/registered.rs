@@ -425,6 +425,19 @@ impl<S: Store> Manager<S, Registered> {
     ///
     /// `authorization` is the complete `Authorization` header value, which for
     /// this endpoint carries the membership proof. It is never logged.
+    ///
+    /// The account's own credentials are deliberately **not** sent here. Under
+    /// `HttpAuthOverride::NoOverride` the service adds an `Authorization` header
+    /// built from the account's ACI/PNI and auth token, and `RequestBuilder::
+    /// header` *appends* rather than replaces, so adding the proof would put two
+    /// `Authorization` fields on one request. That is a protocol violation
+    /// (RFC 9110 s11.4.1: a client must not generate multiple `Authorization`
+    /// fields) and nginx enforces it: two such headers are answered with a bare
+    /// `400 Bad Request` and an HTML body, from nginx itself rather than from
+    /// the application, which is why this presented as a parameter problem.
+    /// `Unidentified` leaves the builder untouched so the proof is the only
+    /// credential on the request, matching Signal Desktop, where this call is
+    /// issued with `basicAuth` replacing the account credentials.
     pub async fn group_call_token(
         &self,
         authorization: &str,
@@ -442,7 +455,7 @@ impl<S: Store> Manager<S, Registered> {
                 // Resolved through the service configuration, so the host is read
                 // rather than written here.
                 Endpoint::storage(TOKEN_PATH),
-                HttpAuthOverride::NoOverride,
+                HttpAuthOverride::Unidentified,
             )
             .map_err(|e| Error::IoError(std::io::Error::other(e)))?
             .header(reqwest::header::AUTHORIZATION, authorization)
@@ -585,6 +598,11 @@ impl<S: Store> Manager<S, Registered> {
                     .and_then(|c| c.as_array())
                     .map(|c| c.len())
                     .unwrap_or(0);
+                // `redemptionTime` is in seconds, so the day index divides by
+                // 86_400. This used to divide by 86_400_000, which reported day
+                // 20 for every credential ever issued: a plausible-looking
+                // number that was wrong by a factor of a thousand, and that
+                // read as a real signal rather than as the unit bug it was.
                 let days: Vec<i64> = value
                     .get("credentials")
                     .and_then(|c| c.as_array())
@@ -592,7 +610,7 @@ impl<S: Store> Manager<S, Registered> {
                         entries
                             .iter()
                             .filter_map(|e| e.get("redemptionTime").and_then(|v| v.as_i64()))
-                            .map(|ms| ms / 86_400_000)
+                            .map(|seconds| seconds / 86_400)
                             .collect()
                     })
                     .unwrap_or_default();

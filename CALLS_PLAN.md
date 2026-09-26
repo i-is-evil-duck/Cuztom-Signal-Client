@@ -260,6 +260,34 @@ re-apply it after an upstream update.
 - APNs/PushKit, launch-at-login, and killed-app call delivery require a
   separate signed provider/APNs path and are not implemented.
 
+## Serving-side rejections and how to read them
+
+A group-call join is refused by something other than this client more often
+than it is refused by a bug here, and the two look alike from outside. What was
+actually happening, and what identifies it next time:
+
+| Symptom | Means | Check |
+| --- | --- | --- |
+| `403` from a CDN for the group token | wrong host — the token is a **storage**-service route (`v2/groups/token`), not a CDN one | endpoint host in the request |
+| `400` with an **nginx HTML body**, no JSON | nginx rejected the request before the app. Duplicate `Authorization` headers are the known cause: `RequestBuilder::header` appends, so a proof added on top of the account's own `Authorization` yields two, and nginx 400s regardless of total size | `HttpAuthOverride::Unidentified` in `group_call_token` |
+| `401 Credentials are required…` (plain text) | reached the app; the credential was not accepted. This is the *normal* response to a placeholder or malformed proof, and the control every other observation is compared against | — |
+| `400` with a JSON body | the app parsed the request and rejected a parameter | the body, which is logged for non-2xx |
+
+The distinction that cost the most time: a bare nginx `400` HTML page is not the
+application saying the parameters are wrong. It says the request never got
+there. `group_auth_credentials_raw` worked at the same moment `group_call_token`
+did not, from the same client, on the same day — the difference was that only the
+latter added a second `Authorization` header.
+
+Measurement used to establish this, against
+`storage.signal.org/v2/groups/token` directly:
+
+- no `Authorization` → 401
+- one `Authorization`, 100–3000 bytes → 401
+- one short plus one long → 401
+- two long `Authorization` headers → **400**, nginx HTML, at every total size
+  tried from 100 to 3000 bytes
+
 ## Call-related regression checks
 
 Before changing call code, preserve:
@@ -275,3 +303,7 @@ Before changing call code, preserve:
   answered even when it could not be performed.
 - Incoming calls are deduplicated and notification state is cancelled when the
   call is answered, declined, or ended.
+- The group-token request carries exactly one `Authorization` header. Asserted
+  by `call::tests::an_authorization_header_appends_rather_than_replaces`, which
+  pins the reqwest append behavior the `Unidentified` override works around, so
+  the fix cannot be silently reverted by a dependency bump.
