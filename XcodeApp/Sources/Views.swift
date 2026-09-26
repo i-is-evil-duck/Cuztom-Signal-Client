@@ -214,9 +214,12 @@ struct MessageListView: View {
                     // separate window so a call that failed says so next to the
                     // conversation instead of disappearing.
                     if let call = vm.groupCall {
-                        GroupCallBanner(call: call) {
-                            Task { await vm.endGroupCall() }
-                        }
+                        GroupCallBanner(
+                            call: call,
+                            onEnd: { Task { await vm.endGroupCall() } },
+                            onSetMuted: { muted in Task { await vm.setGroupCallMuted(muted) } },
+                            onSetCameraOff: { off in Task { await vm.setGroupCallCameraOff(off) } }
+                        )
                     }
                 }
                 // An incoming group call, shown only while no call is in progress.
@@ -1591,12 +1594,36 @@ struct IncomingGroupCallBanner: View {
 struct GroupCallBanner: View {
     let call: GroupCallState
     let onEnd: () -> Void
+    var onSetMuted: (Bool) -> Void = { _ in }
+    var onSetCameraOff: (Bool) -> Void = { _ in }
+
+    /// Whether the media controls are offered.
+    ///
+    /// Only once the SFU has admitted the client. Before that there is no call to
+    /// be muted within, and a control that accepts a tap and silently does
+    /// nothing is worse than no control at all.
+    private var isLive: Bool { call.phase == .connected }
+
+    /// What the call is doing with incoming audio.
+    ///
+    /// Shown because a joined call with no audio is otherwise indistinguishable
+    /// from a joined call with audio, and "can I hear them" is the first question
+    /// anyone asks. Nothing is claimed until a level has actually been reported.
+    private var audioText: String? {
+        guard isLive else { return nil }
+        switch call.isReceivingAudio {
+        case .some(true): return "Hearing audio"
+        case .some(false): return "No incoming audio"
+        case .none: return "Waiting for audio…"
+        }
+    }
+
     private var statusText: String {
         switch call.phase {
         case .connecting:
             return call.isOutgoing ? "Connecting to the call…" : "Joining the call…"
         case .connected:
-            return "Connected"
+            return audioText ?? "Connected"
         case .ended:
             return call.failure.map { "Call ended: \($0)" } ?? "Call ended"
         case .failed:
@@ -1614,10 +1641,37 @@ struct GroupCallBanner: View {
                     .font(.callout.weight(.medium))
                 Text(statusText)
                     .font(.caption)
-                    .foregroundStyle(call.phase == .failed ? Color.red : Color.secondary)
+                    .foregroundStyle(statusColor)
                     .lineLimit(2)
             }
             Spacer()
+            if isLive {
+                // The icons read as state rather than as an action, and the help
+                // says which, because a slashed microphone on a call where the
+                // microphone is live is a contradiction the user has to be able
+                // to resolve.
+                Button {
+                    onSetMuted(!call.isMuted)
+                } label: {
+                    Image(systemName: call.isMuted ? "mic.slash.fill" : "mic.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(call.isMuted ? Color.red : Color.primary)
+                .help(call.isMuted ? "Unmute microphone" : "Mute microphone")
+                .accessibilityLabel(call.isMuted ? "Unmute microphone" : "Mute microphone")
+                .accessibilityIdentifier("group-call-mic")
+
+                Button {
+                    onSetCameraOff(!call.isCameraOff)
+                } label: {
+                    Image(systemName: call.isCameraOff ? "video.slash.fill" : "video.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(call.isCameraOff ? Color.secondary : Color.primary)
+                .help(call.isCameraOff ? "Turn camera on" : "Turn camera off")
+                .accessibilityLabel(call.isCameraOff ? "Turn camera on" : "Turn camera off")
+                .accessibilityIdentifier("group-call-camera")
+            }
             if call.phase == .connected || call.phase == .failed {
                 Button("End", action: onEnd)
                     .buttonStyle(.plain)
@@ -1635,5 +1689,13 @@ struct GroupCallBanner: View {
         .padding(.vertical, 6)
         .background(Color.gray.opacity(0.12))
         .accessibilityIdentifier("group-call-banner")
+    }
+
+    private var statusColor: Color {
+        if call.phase == .failed { return .red }
+        // A live call that is receiving nothing is worth drawing attention to,
+        // because otherwise it looks exactly like a working one.
+        if isLive, call.isReceivingAudio == false { return .orange }
+        return .secondary
     }
 }

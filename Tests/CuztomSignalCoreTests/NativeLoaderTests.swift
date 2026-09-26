@@ -15,8 +15,9 @@ import Testing
     // core_cmd_sfu_http_request, so the SFU's own requests are performed on a
     // client trusted with the service certificate authority. ABI 6 added
     // core_cmd_group_call_set_audio_muted, because RingRTC reads an unset
-    // audio-muted heartbeat as muted. A dylib older than
+    // audio-muted heartbeat as muted, and ABI 7 added the matching video flag.
+    // A dylib older than
     // those must fail to load rather than load with missing symbols and fail later
     // with a misleading error.
-    #expect(RustCoreService.expectedNativeABI == 6)
+    #expect(RustCoreService.expectedNativeABI == 7)
 }

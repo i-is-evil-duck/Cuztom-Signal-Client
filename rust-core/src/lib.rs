@@ -339,6 +339,15 @@ enum Command {
         muted: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Say whether this device's camera is off in a group call.
+    ///
+    /// Separate from the audio mute rather than a combined media flag, because a
+    /// host toggling one must not have to know or restate the other.
+    GroupCallSetVideoMuted {
+        client_id: u32,
+        muted: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Supply the member identities the SFU needs to attribute call traffic.
     /// Encrypted ids are variable length, so an explicit length per entry is
     /// sent rather than a fixed stride.
@@ -1028,6 +1037,10 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                         }
                         Command::GroupCallSetAudioMuted { client_id, muted, reply } => {
                             let result = call::set_group_call_audio_muted(client_id, muted);
+                            let _ = reply.send(result);
+                        }
+                        Command::GroupCallSetVideoMuted { client_id, muted, reply } => {
+                            let result = call::set_group_call_video_muted(client_id, muted);
                             let _ = reply.send(result);
                         }
                         Command::GroupCallStart { group_id, sfu_url, reply } => {
@@ -3038,7 +3051,7 @@ async fn cmd_fetch_attachment(
 /// 3 adds `core_cmd_http_response`, which lets the host perform the SFU
 /// requests RingRTC raises. Older dylibs lack that symbol, so the loader
 /// rejects them rather than stalling group calls on unanswered SFU requests.
-pub const CORE_ABI_VERSION: u32 = 6;
+pub const CORE_ABI_VERSION: u32 = 7;
 
 #[no_mangle]
 pub extern "C" fn core_abi_version() -> u32 {
@@ -3939,6 +3952,24 @@ pub extern "C" fn core_cmd_group_call_set_membership_proof(
 /// reads that as muted, so this has to be called or the rest of the call is told
 /// this client has its microphone off. `muted` is 0 or 1. Returns 0 on success,
 /// -1 on error.
+/// Say whether this device's camera is off in a group call.
+///
+/// RingRTC carries `video_muted` in the same heartbeat as the audio flag and
+/// reads an unset one as muted, so a camera that is never said to be off is a
+/// camera the rest of the call believes is off. `muted` is 0 or 1. Returns 0 on
+/// success, -1 on error.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_set_video_muted(client_id: u32, muted: u32) -> i32 {
+    match roundtrip(|reply| Command::GroupCallSetVideoMuted {
+        client_id,
+        muted: muted != 0,
+        reply,
+    }) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) | Err(e) => { set_last_error(e); -1 }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn core_cmd_group_call_set_audio_muted(client_id: u32, muted: u32) -> i32 {
     match roundtrip(|reply| Command::GroupCallSetAudioMuted {
@@ -4616,7 +4647,9 @@ mod tests {
         //     on a client trusted with the service certificate authority
         // 6 - core_cmd_group_call_set_audio_muted, because RingRTC reads an unset
         //     audio-muted heartbeat as muted and the host has to say otherwise
-        assert_eq!(core_abi_version(), 6);
+        // 7 - core_cmd_group_call_set_video_muted, for the same reason and because
+        //     a host toggling one must not have to restate the other
+        assert_eq!(core_abi_version(), 7);
         assert_eq!(core_abi_version(), CORE_ABI_VERSION);
     }
 

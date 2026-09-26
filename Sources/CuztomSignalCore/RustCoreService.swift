@@ -162,7 +162,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// ABI 6 added `core_cmd_group_call_set_audio_muted`: RingRTC reads an unset
     /// audio-muted heartbeat as muted, so a group call has to say otherwise or
     /// the rest of the call believes it is silent.
-    public static let expectedNativeABI: UInt32 = 6
+    /// ABI 7 added `core_cmd_group_call_set_video_muted`, for the same reason and
+    /// separately, so toggling one never has to restate the other.
+    public static let expectedNativeABI: UInt32 = 7
     /// The production Signal SFU. Group calls use it unless a staging build
     /// explicitly overrides it, and it is never inferred from the environment.
     public static let defaultSFUURL = "https://sfu.voip.signal.org"
@@ -1326,6 +1328,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let ringId: Int64?
         let senderId: String?
         let ringUpdate: String?
+        let loudestLevel: Int?
+        let joined: Int?
+        let identified: Int?
 
         enum CodingKeys: String, CodingKey {
             case update, state, reason
@@ -1334,6 +1339,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             case ringId = "ring_id"
             case senderId = "sender_id"
             case ringUpdate = "ring_update"
+            case loudestLevel = "loudest_level"
+            case joined, identified
         }
 
         /// An unknown update is dropped rather than guessed at, so a newer core
@@ -1348,7 +1355,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 groupIdHex: groupId,
                 ringId: ringId,
                 senderIdHex: senderId,
-                ringUpdate: ringUpdate
+                ringUpdate: ringUpdate,
+                loudestRemoteLevel: loudestLevel,
+                joinedCount: joined,
+                identifiedCount: identified
             )
         }
     }
@@ -1461,6 +1471,12 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             /// arrives before anybody has joined the SFU, which is the only way a
             /// device can be made to ring at all.
             case groupCallRing = "group_call_ring"
+            /// Per-participant audio levels. The only update that can say whether
+            /// audio is actually arriving from anybody.
+            case audioLevels = "audio_levels"
+            /// RingRTC's own view of who is in the call — the count it derives its
+            /// send rates from.
+            case peekResult = "peek_result"
         }
 
         public let kind: Kind
@@ -1477,6 +1493,13 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         /// For `groupCallRing`: RingRTC's verdict. Only `Requested` means somebody
         /// is actually calling; the rest are outcomes.
         public let ringUpdate: String?
+        /// For `audioLevels`: how loud the loudest other participant is. `0`
+        /// means the SFU delivered the frame and it was silence.
+        public let loudestRemoteLevel: Int?
+        /// For `peekResult`: participants the SFU reports, and how many of those
+        /// it can put a name to. A count of one is why audio is off.
+        public let joinedCount: Int?
+        public let identifiedCount: Int?
 
         public init(
             kind: Kind,
@@ -1486,7 +1509,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             groupIdHex: String? = nil,
             ringId: Int64? = nil,
             senderIdHex: String? = nil,
-            ringUpdate: String? = nil
+            ringUpdate: String? = nil,
+            loudestRemoteLevel: Int? = nil,
+            joinedCount: Int? = nil,
+            identifiedCount: Int? = nil
         ) {
             self.kind = kind
             self.clientId = clientId
@@ -1496,6 +1522,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             self.ringId = ringId
             self.senderIdHex = senderIdHex
             self.ringUpdate = ringUpdate
+            self.loudestRemoteLevel = loudestRemoteLevel
+            self.joinedCount = joinedCount
+            self.identifiedCount = identifiedCount
         }
     }
 
@@ -1515,6 +1544,21 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// audio-muted heartbeat field unset and reads that as muted, so without this
     /// the rest of the call is told this client has its microphone off — and its
     /// own speaking detection treats it as silent.
+    /// Say whether this device's camera is off in a group call.
+    ///
+    /// Separate from the audio flag on purpose: the two are independent controls
+    /// and combining them would force a host changing one to also restate the
+    /// other correctly.
+    public func groupCallSetVideoMuted(clientId: UInt32, muted: Bool) async throws {
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = sym.groupCallSetVideoMuted(clientId, muted ? 1 : 0)
+            guard rc == 0 else {
+                throw SignalError.network("could not set group call video: \(Self.lastError(sym))")
+            }
+        }
+    }
+
     public func groupCallSetAudioMuted(clientId: UInt32, muted: Bool) async throws {
         let token = try sessionEpoch.capture()
         try await withCore(token: token) { sym in
@@ -2251,6 +2295,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let groupCallGroupId: @convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let groupCallMemberIdentities: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let groupCallSetAudioMuted: @convention(c) (UInt32, UInt32) -> Int32
+        let groupCallSetVideoMuted: @convention(c) (UInt32, UInt32) -> Int32
         let groupCallSetMembershipProof: @convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupCallSetGroupMembers: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32
         let groupCallStart: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64
@@ -2914,6 +2959,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cgcid = dlsym(handle, "core_cmd_group_call_group_id"),
               let cgcmi = dlsym(handle, "core_cmd_group_call_member_identities"),
               let cgcas = dlsym(handle, "core_cmd_group_call_set_audio_muted"),
+              let cgcvsm = dlsym(handle, "core_cmd_group_call_set_video_muted"),
               let cgcsm = dlsym(handle, "core_cmd_group_call_set_membership_proof"),
               let cgcs = dlsym(handle, "core_cmd_group_call_set_group_members"),
               let cgcs2 = dlsym(handle, "core_cmd_group_call_start"),
@@ -2973,6 +3019,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             groupCallGroupId: unsafeBitCast(cgcid, to: (@convention(c) (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             groupCallMemberIdentities: unsafeBitCast(cgcmi, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             groupCallSetAudioMuted: unsafeBitCast(cgcas, to: (@convention(c) (UInt32, UInt32) -> Int32).self),
+            groupCallSetVideoMuted: unsafeBitCast(cgcvsm, to: (@convention(c) (UInt32, UInt32) -> Int32).self),
             groupCallSetMembershipProof: unsafeBitCast(cgcsm, to: (@convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupCallSetGroupMembers: unsafeBitCast(cgcs, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32).self),
             groupCallStart: unsafeBitCast(cgcs2, to: (@convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64).self),

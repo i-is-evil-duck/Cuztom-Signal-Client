@@ -496,6 +496,65 @@ the problem and the media path is disabled for some other reason.
   killing a live call 12 s in.
 - Named participants are not implemented; the roster is a count.
 
+## Seeing whether audio is actually arriving
+
+"Nothing is audible" and "nothing is arriving" are different faults, and until
+now this build could not tell them apart. Three signals close that gap, all of
+which RingRTC was already producing and this client was discarding.
+
+**`GroupUpdate::AudioLevels`** — per-participant audio levels, requested once a
+second for the whole call via `GROUP_AUDIO_LEVELS_INTERVAL_SECS` and dropped on
+the floor by the catch-all arm. A non-empty list with a non-zero level means audio
+is arriving; an empty one means the SFU is delivering nothing, which is a
+different problem from the SFU refusing to send. Surfaced as
+`group audio levels … remote=N loudest=Some((demux, level))` and, in the UI, as
+the banner's status line.
+
+**`GroupUpdate::PeekResult`** — RingRTC's own participant count, which is the
+exact input to `compute_send_rates` and therefore the exact reason audio is on or
+off. Reported as `sfu peek ringrtc joined=N identified=M` so it can be compared
+against the raw HTTP peek read in `describe_sfu_peek`. The two should agree; if
+they do not, the disagreement is the bug.
+
+Unlike a ring, this update carries a *request id* and no client id, so it cannot
+pass the session guard that discards updates for clients this controller does not
+own. It is handled ahead of that guard, for the same reason a ring is.
+
+**`GroupUpdate::RtcStatsReportComplete`** — WebRTC's transport counters, logged as
+`rtc stats bytes_in=… bytes_out=…`. Bytes arriving is the only evidence that
+distinguishes "the SFU is not sending" from "it is sending and we are not
+decoding it"; nothing else in a call looks different. A report with no counters is
+reported as no measurement rather than as zero, because those are different
+statements.
+
+The banner distinguishes three states, not two: `Waiting for audio…` before any
+level has been reported, `No incoming audio` when a level has been reported and it
+was zero, and `Hearing audio` otherwise. The middle state is drawn in orange,
+because a connected call with no audio otherwise looks exactly like a working
+one.
+
+### Microphone and camera in the banner
+
+Both are in `GroupCallBanner` now, and both flip their state only after the core
+confirms the change — a control that optimistically flips its own icon is the
+specific failure worth preventing, because it shows a microphone as live while
+the rest of the call was told the opposite. A refused change leaves the shown
+state alone and logs why.
+
+`GroupCallState` starts unmuted and camera-off, because that is what the call path
+actually establishes: the join unmutes before the SFU join, and nothing opens a
+camera the user did not ask for. Defaulting either the other way would have the
+banner contradict the call on its first frame.
+
+The controls only appear once the SFU has admitted the client. Before that there
+is no call to be muted within, and a control that accepts a tap and does nothing
+is worse than no control.
+
+`set_outgoing_video_muted` needed no new RingRTC surface; the manager method
+already existed, as `set_outgoing_audio_muted` did. What was missing was a host
+that called either. ABI 7 adds the video flag, separate from the audio one rather
+than a combined media flag, so toggling one never requires restating the other.
+
 ## Read receipts: a reader is not also a delivery
 
 A member appeared under both "Seen by" and "Delivered to" in the same message

@@ -653,9 +653,89 @@ impl GroupUpdateHandler for CuztomGroupHandler {
                     "target_demux_id": *mute_target,
                 })
             }
-            // Ringing, stats, audio levels, bandwidth hints and network routes
-            // are not represented in the UI yet. They are dropped here rather
-            // than guessed at.
+            // Incoming audio, per participant. This is the one update that can
+            // answer "is anybody actually reaching us", and it was being dropped:
+            // the client already asks for levels every
+            // `GROUP_AUDIO_LEVELS_INTERVAL_SECS`, so RingRTC was computing and
+            // discarding them once a second for the whole call. A non-empty list
+            // with a non-zero level means audio is arriving; an empty one means
+            // the SFU is not delivering any, which is a different fault from the
+            // SFU refusing to send and worth telling apart.
+            GroupUpdate::AudioLevels(client_id, captured, received) => {
+                // Only the loudest remote level is reported. Every participant's
+                // level is not useful here and would be noise; the question is
+                // whether anything at all is arriving.
+                let loudest = received
+                    .iter()
+                    .max_by_key(|entry| entry.level)
+                    .map(|entry| (entry.demux_id, entry.level));
+                eprintln!(
+                    "[core] group audio levels client={} captured={} remote={} loudest={:?}",
+                    client_id,
+                    captured,
+                    received.len(),
+                    loudest
+                );
+                serde_json::json!({
+                    "type": "group_update",
+                    "update": "audio_levels",
+                    "client_id": *client_id,
+                    "captured": *captured,
+                    "remote_count": received.len(),
+                    "loudest_demux_id": loudest.map(|(demux_id, _)| demux_id),
+                    "loudest_level": loudest.map(|(_, level)| level),
+                })
+            }
+            // RingRTC's own view of who is in the call. This is the exact input
+            // to `compute_send_rates`, so it is the number that decides whether
+            // audio is enabled at all — a client that sees only itself has had
+            // recording, outgoing media and playout switched off together.
+            // Reported alongside the raw HTTP peek so the two can be compared.
+            GroupUpdate::PeekResult {
+                request_id,
+                peek_result,
+            } => {
+                let (joined, identified, pending) = match peek_result {
+                    Ok(info) => {
+                        let named = info
+                            .devices
+                            .iter()
+                            .filter(|device| device.user_id.is_some())
+                            .count();
+                        (info.devices.len(), named, info.pending_devices.len())
+                    }
+                    Err(status) => {
+                        eprintln!("[core] sfu peek refused status={status:?} request={request_id}");
+                        return Ok(());
+                    }
+                };
+                eprintln!(
+                    "[core] sfu peek ringrtc joined={joined} identified={identified} pending={pending} request={request_id}"
+                );
+                serde_json::json!({
+                    "type": "group_update",
+                    "update": "peek_result",
+                    "client_id": 0u32,
+                    "joined": joined,
+                    "identified": identified,
+                    "pending": pending,
+                })
+            }
+            // WebRTC's own statistics. Carries the byte and packet counters that
+            // distinguish "the SFU is not sending us anything" from "it is sending
+            // and we are not decoding it", which no other update can tell apart.
+            // The report is passed through whole: it is our own transport's
+            // numbers, not a secret.
+            GroupUpdate::RtcStatsReportComplete { report_json } => {
+                if let Some((inbound, outbound)) = summarize_rtc_stats(report_json) {
+                    eprintln!(
+                        "[core] rtc stats bytes_in={inbound} bytes_out={outbound}"
+                    );
+                }
+                return Ok(());
+            }
+            // Bandwidth hints and network routes are not represented in the UI
+            // yet. They are dropped here rather than guessed at.
             _ => return Ok(()),
         };
         if let Some(tx) = event_tx() {
@@ -696,6 +776,57 @@ impl http::Delegate for CuztomHttpDelegate {
             );
         }
     }
+}
+
+/// Total bytes received and sent across a WebRTC statistics report.
+///
+/// WebRTC's report is a tree whose exact shape varies by version, so this sums
+/// the transport counters wherever they appear rather than binding to one
+/// schema. It answers a question nothing else can: whether bytes are arriving at
+/// all. Every other signal in a group call can look healthy while media is
+/// flowing in neither direction, because "no audio" and "no participants" and
+/// "keys not exchanged" all present as silence.
+///
+/// Returns `None` when the report carries no counters, which is a different
+/// statement from carrying zero.
+fn summarize_rtc_stats(report_json: &str) -> Option<(u64, u64)> {
+    // `seen` is tracked separately from the totals so that a report whose
+    // counters are present and zero is not confused with a report that carried
+    // no counters at all. Those are different measurements: the first says
+    // nothing has arrived, the second says nothing was measured.
+    fn walk(value: &serde_json::Value, received: &mut u64, sent: &mut u64, seen: &mut bool) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    match (key.as_str(), child) {
+                        ("bytesReceived", serde_json::Value::Number(n)) => {
+                            if let Some(v) = n.as_u64() {
+                                *received += v;
+                                *seen = true;
+                            }
+                        }
+                        ("bytesSent", serde_json::Value::Number(n)) => {
+                            if let Some(v) = n.as_u64() {
+                                *sent += v;
+                                *seen = true;
+                            }
+                        }
+                        _ => walk(child, received, sent, seen),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, received, sent, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+    let report: serde_json::Value = serde_json::from_str(report_json).ok()?;
+    let (mut received, mut sent, mut seen) = (0u64, 0u64, false);
+    walk(&report, &mut received, &mut sent, &mut seen);
+    seen.then_some((received, sent))
 }
 
 // ---------------------------------------------------------------------------
@@ -1949,6 +2080,18 @@ pub fn set_group_call_audio_muted(client_id: u32, muted: bool) -> Result<(), Str
     Ok(())
 }
 
+/// Say whether this device's camera is off in a group call.
+///
+/// Mirrors the audio mute: RingRTC carries an explicit `video_muted` in the same
+/// heartbeat, and the same unset-means-muted reading applies, so a camera that is
+/// never said to be off is a camera the rest of the call believes is off.
+pub fn set_group_call_video_muted(client_id: u32, muted: bool) -> Result<(), String> {
+    require_tracked(client_id)?;
+    with_manager(|m| m.set_outgoing_video_muted(client_id, muted))?;
+    eprintln!("[core] group call video muted={muted} client={client_id}");
+    Ok(())
+}
+
 /// Ring a group, as the creator of the call.
 ///
 /// RingRTC owns the ring. It derives the `ring_id` from the SFU's `era_id`, asks
@@ -2009,6 +2152,40 @@ async fn send_group_call_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes arriving is the one thing in a group call that settles whether
+    /// media is moving at all.
+    ///
+    /// Everything else can look healthy while nothing flows: a joined client, a
+    /// connected ICE state, an exchanged media key and a heartbeat all read the
+    /// same whether or not a single audio byte came back. These counters are the
+    /// only evidence that distinguishes "the SFU is not sending" from "it is
+    /// sending and we are not decoding it".
+    #[test]
+    fn rtc_stats_add_up_the_transport_counters() {
+        let report = r#"{
+            "reports": [
+                { "type": "inbound-rtp", "kind": "audio", "bytesReceived": 48000 },
+                { "type": "inbound-rtp", "kind": "video", "bytesReceived": 2000 }
+            ],
+            "transport": [{ "bytesSent": 1200 }]
+        }"#;
+        assert_eq!(summarize_rtc_stats(report), Some((50000, 1200)));
+    }
+
+    /// A report with no counters is not a report of zero.
+    ///
+    /// Collapsing the two would report "nothing is arriving" for a report that
+    /// simply had nothing to say, which is the wrong conclusion to draw from a
+    /// missing measurement.
+    #[test]
+    fn rtc_stats_say_nothing_when_they_carry_no_counters() {
+        assert_eq!(summarize_rtc_stats("not json"), None);
+        assert_eq!(summarize_rtc_stats("{}"), None);
+        assert_eq!(summarize_rtc_stats(r#"{"reports":[]}"#), None);
+        // Present but all zero: that is a real measurement, and it is reported.
+        assert_eq!(summarize_rtc_stats(r#"{"bytesReceived":0,"bytesSent":0}"#), Some((0, 0)));
+    }
 
 #[test]
 fn a_group_credential_token_decodes_only_from_a_well_formed_body() {

@@ -30,6 +30,23 @@ public struct GroupCallState: Sendable, Equatable, Identifiable {
     public var failure: String?
     /// `true` when this device placed the call rather than receiving it.
     public let isOutgoing: Bool
+    /// Whether this device's microphone is currently muted in the call.
+    ///
+    /// Defaults to unmuted because the call path unmutes as soon as a client
+    /// exists, before the join. Presenting the control any other way would show
+    /// a microphone as off that the call has already been told is on.
+    public var isMuted: Bool
+    /// Whether this device's camera is currently off.
+    ///
+    /// Off by default: the camera is never started for a call that did not ask
+    /// for video, and a control implying otherwise would be claiming a capability
+    /// the call is not using.
+    public var isCameraOff: Bool
+    /// Whether audio from another participant is arriving.
+    ///
+    /// `nil` until the first audio level report arrives, which is different from
+    /// `false`: not yet measured is not the same as measured and nothing came.
+    public var isReceivingAudio: Bool?
 
     public init(
         id: UUID,
@@ -38,7 +55,10 @@ public struct GroupCallState: Sendable, Equatable, Identifiable {
         title: String,
         phase: Phase,
         failure: String? = nil,
-        isOutgoing: Bool
+        isOutgoing: Bool,
+        isMuted: Bool = false,
+        isCameraOff: Bool = true,
+        isReceivingAudio: Bool? = nil
     ) {
         self.id = id
         self.groupIdHex = groupIdHex
@@ -47,6 +67,9 @@ public struct GroupCallState: Sendable, Equatable, Identifiable {
         self.phase = phase
         self.failure = failure
         self.isOutgoing = isOutgoing
+        self.isMuted = isMuted
+        self.isCameraOff = isCameraOff
+        self.isReceivingAudio = isReceivingAudio
     }
 }
 
@@ -121,6 +144,10 @@ public protocol GroupCallNativeControlling: AnyObject, Sendable {
     /// otherwise is a participant the rest of the call believes has no
     /// microphone.
     func groupCallSetAudioMuted(clientId: UInt32, muted: Bool) async throws
+
+    /// Say whether this device's camera is off. Separate from the audio flag so
+    /// toggling one never has to restate the other.
+    func groupCallSetVideoMuted(clientId: UInt32, muted: Bool) async throws
     func groupCallSetGroupMembers(
         clientId: UInt32,
         members: [(userId: [UInt8], memberId: [UInt8])]
@@ -597,6 +624,20 @@ public final class GroupCallController: ObservableObject {
             handleRing(update)
             return
         }
+        // The SFU participant count is likewise reported against a request id
+        // rather than a client, so it cannot pass the session guard below either.
+        if update.kind == .peekResult {
+            // RingRTC's own participant count, and the exact input to the
+            // send-rate decision that switches audio off when it reads one. A
+            // count of one is the reason a call is silent, and it is reported
+            // rather than acted on so the silence is explained instead of
+            // merely observed.
+            Log.info(
+                "[group-call] sfu reports joined=\(update.joinedCount.map(String.init) ?? "?")"
+                    + " identified=\(update.identifiedCount.map(String.init) ?? "?")"
+            )
+            return
+        }
         guard var session, session.handle.clientId == update.clientId else {
             // A client this controller does not own. Retiring one leaves the
             // native side to tear it down, so this is not an error.
@@ -605,6 +646,14 @@ public final class GroupCallController: ObservableObject {
         switch update.kind {
         case .groupCallRing:
             // Handled above the session guard, which a ring cannot pass.
+            break
+        case .audioLevels:
+            // Arrives about once a second for the whole call, so it is the only
+            // thing that can say whether anybody is actually reaching us.
+            noteIncomingAudio(loudestLevel: update.loudestRemoteLevel)
+        case .peekResult:
+            // Handled above the session guard, which a client-less update cannot
+            // pass.
             break
         case .requestMembershipProof:
             if session.proofPresented {
@@ -653,6 +702,56 @@ public final class GroupCallController: ObservableObject {
         @unknown default:
             break
         }
+    }
+
+    // MARK: - Local media
+
+    /// Turn this device's microphone on or off in the live call.
+    ///
+    /// The flag is only flipped once the core has confirmed it, so the control
+    /// never claims a state the call has not been told about. A failure leaves
+    /// the previous state in place and says so, because a button that silently
+    /// does nothing is worse than one that reports it could not.
+    public func setMuted(_ muted: Bool) async {
+        guard let bridge, let session, var call = current else { return }
+        do {
+            try await bridge.groupCallSetAudioMuted(clientId: session.handle.clientId, muted: muted)
+            call.isMuted = muted
+            current = call
+        } catch {
+            Log.error("[group-call] could not \(muted ? "mute" : "unmute"): \(Self.describe(error))")
+        }
+    }
+
+    /// Turn this device's camera on or off in the live call.
+    ///
+    /// The camera is off until something asks for it, so this is the only way it
+    /// ever starts: a call does not open a camera the user did not request.
+    public func setCameraOff(_ off: Bool) async {
+        guard let bridge, let session, var call = current else { return }
+        do {
+            try await bridge.groupCallSetVideoMuted(clientId: session.handle.clientId, muted: off)
+            call.isCameraOff = off
+            current = call
+        } catch {
+            Log.error("[group-call] could not turn the camera \(off ? "off" : "on"): \(Self.describe(error))")
+        }
+    }
+
+    /// Note whether audio is arriving from anyone else.
+    ///
+    /// This is the honest signal for "can I hear them". A call can be joined, ICE
+    /// connected, keys exchanged and a heartbeat sent while not one audio byte
+    /// arrives, and nothing else in the call reports that. Leaving it `nil` until
+    /// the first report matters too: not yet measured is not the same as measured
+    /// and found nothing, and showing the second before the first would be
+    /// claiming a result nobody has.
+    private func noteIncomingAudio(loudestLevel: Int?) {
+        guard var call = current, let loudestLevel else { return }
+        let receiving = loudestLevel > 0
+        guard call.isReceivingAudio != receiving else { return }
+        call.isReceivingAudio = receiving
+        current = call
     }
 
     /// Present a membership proof.

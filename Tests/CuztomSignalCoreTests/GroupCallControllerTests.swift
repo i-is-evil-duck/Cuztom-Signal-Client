@@ -103,8 +103,20 @@ struct GroupCallControllerTests {
             steps.append("presentProof(\(token.count) bytes)")
         }
 
+        static let videoMuteRefused = NSError(
+            domain: "FakeBridge", code: 7, userInfo: [NSLocalizedDescriptionKey: "no camera"]
+        )
+        /// Makes the camera change fail, to check the shown state does not
+        /// follow a change that did not happen.
+        var failVideoMute = false
+
         func groupCallSetAudioMuted(clientId: UInt32, muted: Bool) async throws {
             steps.append("setAudioMuted(\(muted))")
+        }
+
+        func groupCallSetVideoMuted(clientId: UInt32, muted: Bool) async throws {
+            steps.append("setVideoMuted(\(muted))")
+            if failVideoMute { throw FakeBridge.videoMuteRefused }
         }
 
         func groupCallSetGroupMembers(
@@ -1346,6 +1358,98 @@ struct GroupCallControllerTests {
             answerBridge.steps.contains("setAudioMuted(false)"),
             "answering a ring unmutes too"
         )
+    }
+
+    /// The microphone and camera controls have to reach the call, and the banner
+    /// has to show the state the call was actually told.
+    ///
+    /// A control that flips its own icon without the core accepting the change is
+    /// the specific failure worth preventing: it would show a microphone as muted
+    /// or live while the rest of the call was told the opposite.
+    @Test @MainActor func muteAndCameraControlsReachTheCoreAndTheState() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+
+        #expect(
+            controller.current?.isMuted == false,
+            "a call is live with its microphone on: the join path unmutes, and the banner must not claim otherwise"
+        )
+        #expect(
+            controller.current?.isCameraOff == true,
+            "the camera stays off until it is asked for"
+        )
+
+        await controller.setMuted(true)
+        #expect(bridge.steps.contains("setAudioMuted(true)"))
+        #expect(controller.current?.isMuted == true, "the state follows the confirmed change")
+
+        await controller.setCameraOff(false)
+        #expect(bridge.steps.contains("setVideoMuted(false)"))
+        #expect(controller.current?.isCameraOff == false)
+
+        await controller.setMuted(false)
+        #expect(
+            controller.current?.isMuted == false,
+            "unmuting is the same control in the other direction"
+        )
+    }
+
+    /// A control that silently fails is worse than one that reports it, so a
+    /// rejected change must leave the shown state alone rather than optimistically
+    /// flipping.
+    @Test @MainActor func aRefusedMuteLeavesTheShownStateAlone() async throws {
+        let bridge = FakeBridge()
+        bridge.failVideoMute = true
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+
+        await controller.setCameraOff(false)
+
+        #expect(
+            controller.current?.isCameraOff == true,
+            "the camera is still off because turning it on did not happen"
+        )
+    }
+
+    /// "Can I hear them" has to be answerable, and it has to be honest about not
+    /// knowing yet.
+    ///
+    /// A joined call with no audio is otherwise indistinguishable from a working
+    /// one, because the peer connection, the keys and the heartbeat all look the
+    /// same whether or not a byte arrives. Nothing may be claimed before a level
+    /// has actually been reported.
+    @Test @MainActor func incomingAudioIsUnknownUntilItIsMeasured() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+
+        #expect(
+            controller.current?.isReceivingAudio == nil,
+            "no level has been reported, so nothing is claimed either way"
+        )
+
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .audioLevels, clientId: bridge.nextClientId, loudestRemoteLevel: 0
+            )
+        )
+        await settle(controller)
+        #expect(
+            controller.current?.isReceivingAudio == false,
+            "a level of zero is a measurement: frames are arriving and they are silent"
+        )
+
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .audioLevels, clientId: bridge.nextClientId, loudestRemoteLevel: 900
+            )
+        )
+        await settle(controller)
+        #expect(controller.current?.isReceivingAudio == true)
     }
 
     // MARK: - Inbound

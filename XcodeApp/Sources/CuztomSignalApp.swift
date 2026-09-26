@@ -663,6 +663,24 @@ func sendTyping(started: Bool) async {
         sync()
     }
 
+    /// Mute or unmute this device's microphone in the live group call.
+    ///
+    /// Routed through the controller rather than tracked here, because the
+    /// controller is what knows whether the core confirmed the change. The banner
+    /// must not claim a microphone state the call has not been told about.
+    func setGroupCallMuted(_ muted: Bool) async {
+        await groupCallController?.setMuted(muted)
+        groupCall = groupCallController?.current
+        sync()
+    }
+
+    /// Turn this device's camera on or off in the live group call.
+    func setGroupCallCameraOff(_ off: Bool) async {
+        await groupCallController?.setCameraOff(off)
+        groupCall = groupCallController?.current
+        sync()
+    }
+
     /// The group call somebody is ringing us for, if any.
     ///
     /// Mirrored here rather than read through the controller, because the
