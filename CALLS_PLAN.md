@@ -250,7 +250,11 @@ re-apply it after an upstream update.
 
 - ICE currently uses public STUN servers. Signal's authenticated TURN relay
   list is not fetched yet, which is a real limit on 1:1 connectivity between
-  restrictive networks.
+  restrictive networks. **This does not apply to group calls** — RingRTC's group
+  path hardcodes an empty ICE server list and takes its configuration from the
+  SFU's own join response, so a group call's media path is the SFU's choice, not
+  ours. Verified from RingRTC `group_call.rs:1374` and from Signal Desktop's log,
+  where `v2/calling/relays` appears under a 1:1 call.
 - The current sender does not expose Signal's urgent-message flag, so a call to
   a fully offline phone may not produce a push notification.
 - Ringtone/ringback audio and full system audio-route selection are not
@@ -298,18 +302,67 @@ is logged so a mismatch names itself.
 
 ## Where the group-call join actually stands
 
-The ZK chain is verified against the real service:
+**A group call connects.** Verified 2026-09-25 against the real SFU,
+`sfu.voip.signal.org`:
+
+```
+group token responded HTTP 200 OK, 168 bytes, content-type=application/x-protobuf, first-bytes=[0a a5 01 32]
+group credential decoded as protobuf, token field 1
+group call token redeemed: 165 bytes
+step=proof-accepted client=1
+sfu responded HTTP 200 OK, 709 bytes          ← PUT   the join
+sfu responded HTTP 200 OK, 270 bytes          ← GET   the roster
+state: Joined(1087663680)                     ← the SFU's room id
+state: Connected                              ← WebRTC up
+… then a participants poll every ~10s, each 200 …
+sfu responded HTTP 404 Not Found, 0 bytes      ← the conference is gone (hangup)
+```
+
+Held the connection for 33 seconds across four successful polls. The whole chain
+is real: credential, presentation, token, SFU admission, media.
 
 | Step | Evidence |
 | --- | --- |
 | credential fetched | `group credential response: 4666 bytes, credentials=4, days=[20721..20724]` |
 | presentation built | `presented 1461 hex chars` (97-byte public params + 633-byte presentation, matching a local probe exactly) |
-| token redeemed | `group token responded HTTP 200 OK, 170 bytes` |
-| token decoded | `step=proof-present … tokenBytes=165` |
+| token redeemed | `group token responded HTTP 200 OK, 168 bytes, content-type=application/x-protobuf` |
+| token decoded | `decoded as protobuf, token field 1` → 165 bytes |
 | delivered to RingRTC | `step=proof-accepted` |
+| **SFU admitted the client** | `sfu responded HTTP 200 OK, 709 bytes` on `PUT /v2/conference/participants` |
+| **media connected** | `state: Connected`, held 33s |
+| ended cleanly | `404` on the next poll — a conference that no longer exists, which is what a hangup looks like from the other end |
 
-Unverified: everything after that. RingRTC's own SFU join request and the
-WebRTC connection.
+Still unverified: **two-party audio.** One client was on this machine; nobody
+else was in the room. `Connected` means WebRTC came up, which is a strong
+signal and not a substitute for hearing another person.
+
+### How it got there, and what each fix was
+
+Six failures in sequence, each looking like the last and none of them where the
+log pointed:
+
+1. `403` from a CDN — the token is a **storage**-service route, not a CDN one.
+2. `400` from the storage service with an **nginx HTML body** — the request never
+   reached the app. Two `Authorization` headers, because
+   `RequestBuilder::header` appends and the service had already set one from the
+   account credentials. RFC 9110 §11.4.1 forbids this and nginx enforces it.
+3. `200` that would not decode — the body was being round-tripped through
+   `String`, i.e. `from_utf8_lossy`, which rewrites every non-UTF-8 byte.
+4. "the call could not be completed" on every SFU request, with no status — the
+   SFU is a **third** Signal host serving Signal's own CA, and `URLSession`
+   cannot reach any of them.
+5. `header name: not valid UTF-8` — my own `withCString` misuse; the pointers
+   dangled before the FFI ran.
+6. A third Keychain passphrase read at the first SFU request — a **second native
+   core**, standing up against the same database and the same global sync-control
+   slot.
+
+The recurring lesson, recorded because it cost the most: **three separate hosts
+failed the same way, and twice the symptom was swallowed by a generic error
+message.** A `2xx` is not evidence of a correct body, a transport failure is not
+evidence the server refused, and "the call could not be completed" is not a
+diagnosis. Every fix that took one run instead of several came from making the
+failure say what it was.
 
 **Two things that are not what they were assumed to be**, both corrected against
 Signal Desktop 8.28.0 and its log:
@@ -449,3 +502,9 @@ Before changing call code, preserve:
 - SFU requests run on the core the controller was configured with, never a
   default-constructed one
   (`theSFUPathUsesTheConfiguredBridgeRatherThanAFreshCore`).
+- A `404` from the SFU participants poll is a call that ended, not a failed call
+  (`aNotFoundPollMeansTheConferenceIsGoneNotThatTheCallFailed`).
+- A join state is never mapped to a connection phase
+  (`aJoinStateIsNotMappableToAConnectionPhase`). `Joined(1087663680)` carries the
+  SFU's room id and is not a thing the user is shown; only a `Connected`
+  connection state may show a call as connected.

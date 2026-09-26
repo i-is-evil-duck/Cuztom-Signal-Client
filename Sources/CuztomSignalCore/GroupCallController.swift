@@ -542,9 +542,16 @@ public final class GroupCallController: ObservableObject {
             track("members-\(update.clientId)") { [weak self] in
                 await self?.presentGroupMembers(clientId: update.clientId)
             }
-        case .connectionStateChanged, .joinStateChanged:
+        case .connectionStateChanged:
             self.session = session
             applyState(update.state ?? update.reason ?? "")
+        case .joinStateChanged:
+            // Logged under its own name, not as `state:`. These are two different
+            // machines and reading them as one is how `Joined(…)` ends up looking
+            // like a connection phase it is not. Only a connection state may change
+            // what the user is shown.
+            self.session = session
+            Log.info("[group-call] join: \(update.state ?? update.reason ?? "unspecified")")
         case .ended:
             self.session = session
             Log.info("[group-call] native end: \(Self.endReasonPhrase(update.reason))")
@@ -695,7 +702,10 @@ public final class GroupCallController: ObservableObject {
                 status: result.status,
                 body: result.body
             )
-            Log.info("[group-call] step=sfu-answered id=\(request.requestId) status=\(result.status)")
+            let answered = Self.isConferenceGone(result.status)
+                ? " status=\(result.status) (conference gone)"
+                : " status=\(result.status)"
+            Log.info("[group-call] step=sfu-answered id=\(request.requestId)\(answered)")
         } catch {
             Log.error("[group-call] sfu request \(request.requestId) failed: \(Self.describe(error))")
             try? await bridge.deliverHTTPResponse(
@@ -705,6 +715,18 @@ public final class GroupCallController: ObservableObject {
             )
             fail("Call service request failed: \(Self.describe(error))")
         }
+    }
+
+    /// A 404 from the SFU's participants poll means the conference is gone, which
+    /// is what a hangup looks like from the other end.
+    ///
+    /// Named rather than logged inline because it is a fact about the SFU worth
+    /// stating. The poll is a heartbeat, and the SFU answers 404 for a conference
+    /// that no longer exists — not for a request it could not understand. It
+    /// arrives after a hangup, so reading it as a failure would put a spurious
+    /// error on a call that ended the way it should.
+    static func isConferenceGone(_ status: Int) -> Bool {
+        status == 404
     }
 
     /// Identity of the service the SFU performer will use, for tests.

@@ -785,6 +785,34 @@ struct GroupCallControllerTests {
         #expect(withFake.sfuServiceIdentifier == nil, "an injected performer must be kept")
     }
 
+    /// A 404 from the participants poll is a call that ended, not a failed call.
+    ///
+    /// The poll is a heartbeat, and the SFU answers 404 for a conference that no
+    /// longer exists. It arrives after a hangup — on this side or the other — so
+    /// treating it as a failure would put a spurious error on a call that ended
+    /// correctly.
+    @Test @MainActor func aNotFoundPollMeansTheConferenceIsGoneNotThatTheCallFailed() {
+        #expect(GroupCallController.isConferenceGone(404))
+        #expect(!GroupCallController.isConferenceGone(200))
+        #expect(!GroupCallController.isConferenceGone(401))
+        #expect(!GroupCallController.isConferenceGone(500))
+    }
+
+    /// A join state is not a connection state and must not be shown as one.
+    ///
+    /// RingRTC runs two machines. `Joined(1087663680)` is a join state carrying the
+    /// SFU's room id; the only thing that may show a call as connected is a
+    /// `Connected` connection state. Logging both as `state:` is what makes
+    /// `Joined(…)` read like a phase it is not.
+    @Test @MainActor func aJoinStateIsNotMappableToAConnectionPhase() {
+        #expect(GroupCallController.phase(forNativeState: "Connected") == .connected)
+        #expect(GroupCallController.phase(forNativeState: "NotConnected") == .connecting)
+        #expect(GroupCallController.phase(forNativeState: "Reconnecting") == .connecting)
+        // A join state, and anything this build does not know, maps to nothing.
+        #expect(GroupCallController.phase(forNativeState: "Joined(1087663680)") == nil)
+        #expect(GroupCallController.phase(forNativeState: "something-new") == nil)
+    }
+
     // MARK: - Inbound
 
     @Test @MainActor func anInboundCallForAKnownGroupIsJoined() async throws {
