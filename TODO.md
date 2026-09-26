@@ -73,3 +73,10 @@ See `IMPLEMENTATION_PLAN.md` for the detailed status matrix and
       test has passed. Pre-existing — reproduced at `e2608cb` with this session's
       changes stashed. Teardown, not a test failure, but it hides real failures
       and should be found.
+- [ ] **Group call audio: the member map does not resolve.** `remote_devices` is
+      empty because the SFU's `opaqueUserId` values do not match
+      `hex(sha256(member_id))` for the roster we supply, and an empty device list
+      switches audio recording, outgoing media and playout off together. Next
+      step is the new `resolved=N` figure in the peek log: 0 means the encrypted
+      member ids differ from what the SFU hashed, `untried` means no roster
+      reached RingRTC. This is the confirmed root cause of the silence.

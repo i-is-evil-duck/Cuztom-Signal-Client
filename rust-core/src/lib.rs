@@ -2354,6 +2354,7 @@ fn describe_sfu_peek(method: &str, url: &str, reply: &str) -> Option<String> {
             parts.push(format!("{label}=absent"));
             continue;
         };
+        // How many of these the SFU gave an id for at all.
         let named = entries
             .iter()
             .filter(|entry| {
@@ -2363,13 +2364,33 @@ fn describe_sfu_peek(method: &str, url: &str, reply: &str) -> Option<String> {
                     .is_some_and(|id| !id.is_empty())
             })
             .count();
+        // And, of those, how many this client can turn back into a person. An
+        // unresolvable participant is dropped from RingRTC's device list
+        // silently, which empties it, which makes RingRTC treat the call as
+        // having nobody in it and switch the audio off in both directions. So
+        // this number is the difference between a working call and a silent one,
+        // and it is the only place the match is visible.
+        //
+        // `resolved` is absent rather than zero when no member list has been
+        // supplied, since "not tried" and "tried and matched nothing" are
+        // different faults.
+        let observed: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.get("opaqueUserId").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect();
+        let resolved = match call::matched_opaque_ids(&observed) {
+            Some(count) => format!(" resolved={count}"),
+            None => " resolved=untried".to_string(),
+        };
         let demux: Vec<String> = entries
             .iter()
             .filter_map(|entry| entry.get("demuxId").and_then(serde_json::Value::as_u64))
             .map(|id| id.to_string())
             .collect();
         parts.push(format!(
-            "{label}={} identified={named} demux=[{}]",
+            "{label}={} identified={named}{resolved} demux=[{}]",
             entries.len(),
             demux.join(",")
         ));

@@ -1136,6 +1136,29 @@ pub fn set_group_membership_proof(client_id: u32, token: Vec<u8>) -> Result<(), 
 ///
 /// Every length is validated here rather than trusted, so a malformed buffer is
 /// rejected instead of being read out of bounds.
+/// The opaque user ids the current member list implies.
+///
+/// Read by the peek reader to report how many of the SFU's participants this
+/// client can actually name. Never logged: these are derived from group secret
+/// material and are per-call.
+static EXPECTED_OPAQUE_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn expected_opaque_ids() -> &'static std::sync::Mutex<Vec<String>> {
+    &EXPECTED_OPAQUE_IDS
+}
+
+/// How many of the SFU's reported participants this client can identify.
+///
+/// Returns `None` when no member list has been supplied, which is a different
+/// statement from "supplied one and matched none".
+pub fn matched_opaque_ids(observed: &[String]) -> Option<usize> {
+    let expected = expected_opaque_ids().lock().ok()?;
+    if expected.is_empty() {
+        return None;
+    }
+    Some(observed.iter().filter(|id| expected.contains(id)).count())
+}
+
 pub fn set_group_members(
     client_id: u32,
     count: u32,
@@ -1186,6 +1209,34 @@ pub fn set_group_members(
             member_id: member_ids[cursor..cursor + len].to_vec(),
         });
         cursor += len;
+    }
+
+    // The opaque ids this member list implies, kept so the next peek can be
+    // checked against what the SFU actually returned.
+    //
+    // RingRTC resolves a participant by matching the SFU's `opaqueUserId` against
+    // `hex(sha256(member_id))` for each member it was given
+    // (`OpaqueUserIdMapping::from`). A participant whose id does not match is
+    // dropped from the device list *silently* — `set_peek_result` filters on
+    // `device.user_id.as_ref()` and skips the rest — and an empty device list
+    // makes RingRTC compute send rates for "all alone", which switches off audio
+    // recording, outgoing media and playout together. A call then joins
+    // perfectly, exchanges keys, sends heartbeats, and is silent in both
+    // directions with nothing to report.
+    //
+    // So the match is worth measuring directly rather than inferring from a
+    // participant count. The ids themselves are per-call group material and are
+    // never printed; only the tally is.
+    {
+        let mut expected = expected_opaque_ids()
+            .lock()
+            .map_err(|_| "opaque id set poisoned".to_string())?;
+        expected.clear();
+        expected.extend(
+            members
+                .iter()
+                .map(|member| ringrtc::lite::sfu::sha256_as_hexstring(&member.member_id)),
+        );
     }
 
     let manager = manager().ok_or_else(|| "call stack not initialized".to_string())?;
@@ -2227,6 +2278,56 @@ mod tests {
     /// Collapsing the two would report "nothing is arriving" for a report that
     /// simply had nothing to say, which is the wrong conclusion to draw from a
     /// missing measurement.
+    /// A participant this client cannot name is dropped from RingRTC's device
+    /// list without a word, and an empty device list switches the audio off in
+    /// both directions while the call looks perfectly healthy. So whether the
+    /// SFU's opaque ids match ours is the difference between a call and silence,
+    /// and it is measured here rather than inferred from a participant count.
+    ///
+    /// The ids are derived from group secret material and per-call, so only the
+    /// tally is ever reported — never the ids themselves.
+    #[test]
+    fn opaque_ids_report_how_many_participants_can_be_named() {
+        // The set is populated by set_group_members, so drive it the same way the
+        // real path does and check the tally against it.
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let other = "0000000000000000000000000000000000000000000000000000000000000000";
+        {
+            let mut set = expected_opaque_ids().lock().expect("unpoisoned");
+            set.clear();
+            set.push(expected.to_string());
+        }
+        // Both observed ids are ones we hold.
+        assert_eq!(matched_opaque_ids(&[expected.into(), expected.into()]), Some(2));
+        // One we hold and one we do not: the participant we cannot name is the
+        // one that gets dropped.
+        assert_eq!(matched_opaque_ids(&[expected.into(), other.into()]), Some(1));
+        // None we hold.
+        assert_eq!(matched_opaque_ids(&[other.into()]), Some(0));
+        // An empty member list is "not tried", not "matched nothing" — the two
+        // are different faults and collapsing them would hide a missing roster.
+        {
+            let mut set = expected_opaque_ids().lock().expect("unpoisoned");
+            set.clear();
+        }
+        assert_eq!(matched_opaque_ids(&[expected.into()]), None);
+    }
+
+    /// The opaque id RingRTC derives is a hash of the encrypted member id, so
+    /// this is the exact mapping the SFU and this client have to agree on.
+    #[test]
+    fn the_opaque_id_is_the_hash_of_the_encrypted_member_id() {
+        use ringrtc::lite::sfu::sha256_as_hexstring;
+        // sha256("abc") from the upstream doc comment for this function.
+        assert_eq!(
+            sha256_as_hexstring(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // A different member id must not collide with it, or one member could be
+        // attributed to another.
+        assert_ne!(sha256_as_hexstring(b"abd"), sha256_as_hexstring(b"abc"));
+    }
+
     #[test]
     fn rtc_stats_say_nothing_when_they_carry_no_counters() {
         assert_eq!(summarize_rtc_stats("not json"), None);

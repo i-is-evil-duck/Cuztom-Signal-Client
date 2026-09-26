@@ -562,6 +562,80 @@ evidenced: the peer dropped for an unrelated reason, or unmuting video published
 stream this client cannot produce properly. The camera work below is what makes
 that second reading testable.
 
+## The silence, explained end to end
+
+`group devices client=3 n=0 keys=0 unmuted=0 spoke=0 video=0` — RingRTC's own
+remote device list is **empty**, in the same second the peek reports
+`joined=2 identified=2`. Those two numbers are the whole story, and they are not in
+conflict: `identified` counts the SFU having *sent* an `opaqueUserId`; RingRTC's
+device list contains only the ones it can turn back into a person.
+
+`group_call.rs:3295`:
+
+```rust
+state.remote_devices = peek_info.devices.iter()
+    .filter_map(|device| {
+        if device.demux_id == local_demux_id { … return None; }
+        device.user_id.as_ref().map(|user_id| { … })   // <-- None drops it
+    })
+    .collect();
+```
+
+A participant whose `user_id` is `None` is dropped **silently**. So:
+
+1. The SFU returns participants with obfuscated ids — `hex(sha256(GroupMemberId))`,
+   where `GroupMemberId` is the member's *encrypted UID within the group*.
+2. RingRTC resolves each against `hex(sha256(member_id))` for every member it was
+   given by the host.
+3. **No match, so `user_id` is `None`, so the participant is dropped.**
+4. `remote_devices` is empty, so `new_demux_ids.len()` is `0`, so
+   `compute_send_rates(0, _)` returns `ALL_ALONE_MAX_SEND_RATE`, so
+   `set_audio_recording_enabled(false)`, `set_outgoing_media_enabled(false)` and
+   `set_audio_playout_enabled(false)` all fire together.
+5. Silence in both directions. The call joins, redeems a real ZK proof, returns
+   SFU 200, connects ICE, exchanges media keys and sends heartbeats throughout.
+
+So the original theory was right after all — the participant count *is* what
+disables the audio — but the count that matters is RingRTC's **resolvable** one, not
+the SFU's. The peek's `identified=2` was never evidence that anyone could be named;
+it only ever meant the SFU had sent two blobs.
+
+The same thing seen from the other side is the `DerivedState(value=<Not
+calculated>)@…` label a peer reported: the SFU attributing a participant it cannot
+resolve.
+
+### The one measurement that settles which half is wrong
+
+`set_group_members` now records the opaque ids its member list implies
+(`hex(sha256(member_id))` per member) and the peek reader counts how many of the
+SFU's ids are among them:
+
+```
+sfu peek joined=2 identified=2 resolved=1 demux=[…]
+```
+
+- `resolved=0` — our encrypted member ids are not the ones the SFU hashed. Either
+  the roster is wrong, or the member list we send is not the one the SFU derives
+  from the credential, and the difference has to be found in the bytes.
+- `resolved=untried` — no member list reached RingRTC at all, which is a different
+  fault from matching none.
+
+Only the tally is logged. The ids are derived from group secret material and are
+per-call, so they are never printed.
+
+### Two things ruled out along the way
+
+**The encryption is deterministic**, so re-encrypting a member's UID cannot be the
+problem. `zkcredential`'s `encrypt` is `E_A1 = a1·M1; E_A2 = a2·E_A1 + M2` with no
+nonce and no randomness, so the same key pair and the same attribute always produce
+identical bytes.
+
+**`GroupUpdate::PeekResult` never fires** — zero occurrences in the log. It is
+emitted only from the `sfu::Delegate` path, while the peeks being issued come from
+the group call's own `sfu_client.peek(...)` at `group_call.rs:1828`. So that arm
+was correct but unreachable, and `RemoteDeviceStatesChanged` is the update that
+actually reflects what RingRTC resolved.
+
 ## Video: what is real and what is not
 
 Honesty first, because most of the video surface in this app is a lie today.
