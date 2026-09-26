@@ -813,6 +813,93 @@ struct GroupCallControllerTests {
         #expect(GroupCallController.phase(forNativeState: "something-new") == nil)
     }
 
+    /// Signaling for the call already in progress must not restart it.
+    ///
+    /// The native side hands every inbound group call payload to the live
+    /// RingRTC client before the host event exists, so by the time this arrives it
+    /// has already been delivered. Treating it as a new call tore the live call
+    /// down and rebuilt it — once per signal, and for an established call
+    /// inbound signaling is routine, so a connected call never stopped resetting
+    /// itself. It presented as a client id climbing through a dozen values, each
+    /// re-running the join, and eventually `Client already exists for call` as one
+    /// rebuild raced its predecessor.
+    @Test @MainActor func signalingForTheLiveCallDoesNotRestartIt() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        #expect(bridge.steps.contains("presentProof(2 bytes)"))
+        let handle = try #require(controller.current)
+
+        // Signaling for the same group, repeatedly, as an established call gets.
+        for _ in 0..<3 {
+            await controller.receive(event: Self.signalEvent(groupIdHex: Self.groupIdHex))
+            await settle(controller)
+        }
+
+        #expect(controller.current?.id == handle.id, "the live call must be the same call")
+        #expect(
+            !bridge.steps.contains("end"),
+            "signaling for the live call must not release the native client"
+        )
+        #expect(controller.current?.phase != .failed)
+        // Exactly one client, so one join.
+        #expect(bridge.steps.filter { $0 == "start" }.count == 1, "only one client is created")
+    }
+
+    /// Signaling for a *different* group does replace the live call.
+    ///
+    /// The other half of the same rule. A user who joins another call means the
+    /// first is over, and leaving a native client running would leak an SFU
+    /// session — so this must still end the old one rather than be ignored as
+    /// "a signal" would now be for the same group.
+    @Test @MainActor func signalingForADifferentGroupReplacesTheLiveCall() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        let first = try #require(controller.current)
+
+        await controller.receive(
+            event: Self.signalEvent(groupIdHex: String(repeating: "ef", count: 32))
+        )
+        await settle(controller)
+
+        #expect(bridge.steps.contains("end"), "the previous call's client must be released")
+        #expect(controller.current?.id != first.id, "this is a different call")
+    }
+
+    /// A payload with no group id is not a failure while a call is live.
+    ///
+    /// RingRTC routes by group id on its own, and several of its messages carry
+    /// none — so a group-id-less payload arriving during a call is routine. It was
+    /// logged as an error and read as a call that could not be received, when the
+    /// call was fine.
+    @Test @MainActor func aPayloadWithNoGroupIDIsNotAFailureWhileACallIsLive() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        let live = try #require(controller.current)
+
+        await controller.receive(event: Self.signalEvent(groupIdHex: nil))
+        await settle(controller)
+
+        #expect(controller.current?.id == live.id, "the call is untouched")
+        #expect(controller.current?.phase != .failed)
+    }
+
+    /// A minimal inbound group call signal.
+    private static func signalEvent(groupIdHex: String?) -> GroupCallSignalEvent {
+        GroupCallSignalEvent(
+            sender: "11111111-1111-1111-1111-111111111111",
+            senderDeviceId: 1,
+            groupIdHex: groupIdHex,
+            immediate: true,
+            timestamp: 1
+        )
+    }
+
     // MARK: - Inbound
 
     @Test @MainActor func anInboundCallForAKnownGroupIsJoined() async throws {

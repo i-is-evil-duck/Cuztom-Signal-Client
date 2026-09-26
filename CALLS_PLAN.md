@@ -255,6 +255,18 @@ re-apply it after an upstream update.
   SFU's own join response, so a group call's media path is the SFU's choice, not
   ours. Verified from RingRTC `group_call.rs:1374` and from Signal Desktop's log,
   where `v2/calling/relays` appears under a 1:1 call.
+- **Inbound group call signaling is delivered once, natively.** The native side
+  hands every inbound payload to the live RingRTC client *before* the host event
+  exists. The host used to treat that event as a new call to join, so every
+  payload tore the live call down and rebuilt it — and for an established call
+  inbound signaling is routine, so a connected call never stopped resetting
+  itself. It presented as a client id climbing through a dozen values, each
+  re-running the whole join, and finally `Client already exists for call` as one
+  rebuild raced its predecessor. **A payload for the group already in progress is
+  now ignored; only a different group replaces the live call.**
+  Covered by `signalingForTheLiveCallDoesNotRestartIt` (verified to fail against
+  the old behaviour), `signalingForADifferentGroupReplacesTheLiveCall`, and
+  `aPayloadWithNoGroupIDIsNotAFailureWhileACallIsLive`.
 - The current sender does not expose Signal's urgent-message flag, so a call to
   a fully offline phone may not produce a push notification.
 - Ringtone/ringback audio and full system audio-route selection are not
@@ -335,6 +347,12 @@ is real: credential, presentation, token, SFU admission, media.
 Still unverified: **two-party audio.** One client was on this machine; nobody
 else was in the room. `Connected` means WebRTC came up, which is a strong
 signal and not a substitute for hearing another person.
+
+**And connecting is not the same as usable.** A later run connected repeatedly and
+still did not work, for a reason entirely on the host side: every inbound signal
+was restarting the call. The SFU join was never the problem by that point — see
+the signaling note above. A `Connected` line in a log is evidence about one
+attempt, not about a call that survives contact with other participants.
 
 ### How it got there, and what each fix was
 

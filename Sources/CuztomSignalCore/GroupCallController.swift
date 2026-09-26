@@ -424,17 +424,41 @@ public final class GroupCallController: ObservableObject {
     /// to exist before the call can be received. The group id comes from the
     /// inbound payload; without one nothing is joined, because guessing would
     /// create a client for a room that cannot exist.
+    ///
+    /// **A signal for the call already in progress is not a new call.** The native
+    /// side has already handed the payload to the live RingRTC client before this
+    /// event exists, so everything arriving here has been delivered once. Starting
+    /// a client for it as well tore the live call down and rebuilt it - once per
+    /// inbound signal, which for an established call is routine traffic, so a
+    /// connected call never stopped resetting itself. It showed as a client id
+    /// climbing through 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, each one
+    /// re-running the whole join, and as `Client already exists for call` from the
+    /// rebuild racing its own predecessor.
+    ///
+    /// So the only thing that ends a live call here is signaling for a *different*
+    /// group, which is what a user joining another call actually looks like.
     public func receive(event: GroupCallSignalEvent) async {
         guard let groupIdHex = event.groupIdHex, !groupIdHex.isEmpty else {
-            // Not identifiable, so not receivable. Reported rather than dropped
-            // so the user is not left with a ringing group that never appears.
-            Log.error("[group-call] inbound signal had no group id; nothing to join")
+            // Not identifiable, so a client cannot be created for it. With a call
+            // live that is expected: RingRTC routes the payload by group id on
+            // its own, and several of its messages carry none. Reported, because
+            // a signal with no group id and no live call is a real gap.
+            if session != nil {
+                Log.info("[group-call] inbound signal carried no group id; the live call already has it")
+            } else {
+                Log.error("[group-call] inbound signal had no group id; nothing to join")
+            }
             return
         }
-        if session != nil {
-            // A second group call while one is live: end this one and take the
-            // newer. The user calling another group means the first is over, and
-            // leaving a native client running would leak an SFU session.
+        if let live = session {
+            if live.handle.groupIdHex.caseInsensitiveCompare(groupIdHex) == .orderedSame {
+                // Already delivered natively. Starting anything here would replace
+                // a working call with an identical one.
+                Log.info("[group-call] inbound signal is for the live call; already delivered natively")
+                return
+            }
+            // A different group: the user has moved to another call, so the first
+            // is over. Leaving a native client running would leak an SFU session.
             await leaveActiveCall()
         }
         guard let bridge else { return }
