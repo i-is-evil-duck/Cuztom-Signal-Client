@@ -79,3 +79,9 @@ See `IMPLEMENTATION_PLAN.md` for the detailed status matrix and
       Signal's own client passes the whole serialization. Pinned by
       `a_member_id_keeps_the_reserved_byte_the_sfu_hashes`. Still needs one live
       call to confirm `resolved=` goes above 0 and audio appears.
+- [ ] **System microphone mute is not observed.** Signal subscribes to
+      `muteStateChange` and calls `setOutgoingAudioMuted` on every live call when
+      the OS reports the mic muted. Nothing here watches the system state, so a
+      hardware/keyboard mic mute would present as a call that is mysteriously
+      muted with no user action taken. Worth adding before chasing any further
+      "the mic is muted" report.

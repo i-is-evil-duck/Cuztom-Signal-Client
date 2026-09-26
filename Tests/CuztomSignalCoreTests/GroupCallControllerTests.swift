@@ -1339,6 +1339,13 @@ struct GroupCallControllerTests {
             bridge.steps.contains("setAudioMuted(false)"),
             "an outgoing group call unmutes itself"
         )
+        // The camera is stated even though unset happens to read as off. Leaving
+        // it unset relies on the same default that made the microphone wrong, and
+        // a path that forgot it would look fine until the first heartbeat.
+        #expect(
+            bridge.steps.contains("setVideoMuted(true)"),
+            "an outgoing call states the camera is off rather than leaving it unset"
+        )
 
         // Answered.
         var roster = FakeRoster()
@@ -1357,6 +1364,10 @@ struct GroupCallControllerTests {
         #expect(
             answerBridge.steps.contains("setAudioMuted(false)"),
             "answering a ring unmutes too"
+        )
+        #expect(
+            answerBridge.steps.contains("setVideoMuted(true)"),
+            "answering states the camera is off rather than leaving it unset"
         )
     }
 

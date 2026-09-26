@@ -662,6 +662,48 @@ sfu peek joined=2 identified=2 resolved=1 demux=[…]
 Only the tally is logged. The ids are derived from group secret material and are
 per-call, so they are never printed.
 
+### Cross-checked against Signal's own source
+
+The asar on disk is the shipped, minified client, so it settles behaviour but not
+intent. `signalapp/Signal-Desktop` confirms the same thing readably, on the actual
+group-call path (`ts/services/calling.preload.ts`, `ts/util/zkgroup.node.ts`):
+
+```ts
+export function encryptServiceId(clientZkGroupCipher, serviceIdPlaintext) {
+  const uuidCiphertext = clientZkGroupCipher.encryptServiceId(toServiceIdObject(serviceIdPlaintext));
+  return uuidCiphertext.serialize();          // whole thing, reserved byte included
+}
+
+#getGroupCallMembers(conversationId) {
+  return getMembershipList(conversationId).map(
+    member => new GroupMemberInfo(uuidToBytes(member.aci), member.uuidCiphertext)
+  );
+}
+```
+
+Three things that came out of reading it, two of which correct earlier assumptions
+here:
+
+- **The camera is stated before the join too.** Signal calls
+  `setOutgoingAudioMuted(!hasLocalAudio)` *and* `setOutgoingVideoMuted(!hasLocalVideo)`
+  immediately after connect and before join. The video call was missing here. It
+  happens to be the safe direction — unset reads as muted — but relying on that
+  default is precisely the assumption that made the microphone wrong, so both
+  flags are now stated explicitly on both paths.
+- **The `setGroupMembers` ordering flagged earlier as suspicious is what Signal
+  does.** It is called from exactly two places: the `requestGroupMembers` callback
+  and a `groupMembersChanged` membership hook. So answering a call and supplying
+  members afterwards is correct, and RingRTC re-requests once members change. That
+  earlier suspicion was wrong.
+- **The audio placement was right.** Both flags go in after connect and before
+  join, which is what this client already did for audio.
+
+One thing Signal has that this client does not, and that is worth knowing rather
+than guessing about: it subscribes to `muteStateChange` and mirrors the *system*
+microphone mute into every live call. A hardware or keyboard-level mic mute would
+therefore show up as a muted call with no user action here, because nothing
+observes the system state. Not yet implemented; listed below.
+
 ### Two things ruled out along the way
 
 **The encryption is deterministic**, so re-encrypting a member's UID cannot be the

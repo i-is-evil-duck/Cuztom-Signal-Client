@@ -483,6 +483,11 @@ public final class GroupCallController: ObservableObject {
         // microphone is live. RingRTC's default is muted and nothing else in this
         // path would ever correct it.
         await setAudioMuted(false, clientId: handle.clientId)
+        // The camera is stated too, even though leaving it unset happens to read
+        // as off. Relying on an unset-means-muted default is the same assumption
+        // that made the microphone wrong, and Signal's own client sets both flags
+        // here for the same reason.
+        await setVideoMuted(true, clientId: handle.clientId)
         try await bridge.joinGroupCall(handle)
         Log.info("[group-call] step=join-requested client=\(handle.clientId)")
         return current ?? GroupCallState(
@@ -1136,8 +1141,24 @@ public final class GroupCallController: ObservableObject {
         }
     }
 
-    /// A client created for an inbound call that has not been answered.
+    /// State this device's camera as off, before the join.
     ///
+    /// A helper rather than an inline call because the point is that it happens
+    /// on *every* path: the camera being off is the safe default anyway, so a
+    /// path that forgot this would look fine right up until the first heartbeat,
+    /// and then be indistinguishable from a client that never opened a camera.
+    private func setVideoMuted(_ muted: Bool, clientId: UInt32) async -> Bool {
+        guard let bridge else { return false }
+        do {
+            try await bridge.groupCallSetVideoMuted(clientId: clientId, muted: muted)
+            return true
+        } catch {
+            Log.error("[group-call] could not set video muted=\(muted): \(Self.describe(error))")
+            return false
+        }
+    }
+
+    /// A client created for an inbound call that has not been answered.    ///
     /// RingRTC drops signaling for a group it has no client for, so one has to
     /// exist before the call can be received. It is kept rather than joined:
     /// joining is the user's decision, and creating a second client for the same
@@ -1237,6 +1258,11 @@ public final class GroupCallController: ObservableObject {
         // microphone is live. RingRTC's default is muted and nothing else in this
         // path would ever correct it.
         await setAudioMuted(false, clientId: handle.clientId)
+        // The camera is stated too, even though leaving it unset happens to read
+        // as off. Relying on an unset-means-muted default is the same assumption
+        // that made the microphone wrong, and Signal's own client sets both flags
+        // here for the same reason.
+        await setVideoMuted(true, clientId: handle.clientId)
         try await bridge.joinGroupCall(handle)
             Log.info("[group-call] step=join-requested client=\(handle.clientId) (answered)")
             return current
