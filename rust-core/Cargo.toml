@@ -19,7 +19,13 @@ presage-store-sqlite = { path = "vendor/presage/presage-store-sqlite" }
 # libsignal-service for groups_v2 (zkgroup)
 libsignal-service = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "9e6c08b8e6d413391831dc49065e5b05490d6c82", features = ["phonenumber"] }
 # WebRTC for voice/video calls (Signal's ringrtc)
-ringrtc = { git = "https://github.com/signalapp/ringrtc", rev = "a1d2ffed1de6ac5b22458a3dced8374513cc44f8", features = ["native", "prebuilt_webrtc"] }
+# Upstream: https://github.com/signalapp/ringrtc @ a1d2ffed1de6ac5b22458a3dced8374513cc44f8
+# Vendored under vendor/ringrtc so `CallManager::ring_group` can be added; see
+# vendor/ringrtc/CHANGELOG-VENDOR.md. Without it there is no way to ring a group:
+# the client map is private, so `Client::ring` is unreachable and the only
+# alternative is composing the ring_intention by hand, which gets the ring id
+# wrong and leaves RingRTC's outgoing ring state inconsistent.
+ringrtc = { path = "vendor/ringrtc/src/rust", features = ["native", "prebuilt_webrtc"] }
 rand = "0.8"
 # current_thread runtime + LocalSet worker (presage uses spawn_local, so its
 # futures are !Send and must run on one dedicated thread).

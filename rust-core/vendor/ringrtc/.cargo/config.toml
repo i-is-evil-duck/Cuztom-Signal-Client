@@ -1,0 +1,4 @@
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+# Force a cubeb build failure if libpulse is not found
+LIBCUBEB_SYS_REQUIRE_PULSE = "1"

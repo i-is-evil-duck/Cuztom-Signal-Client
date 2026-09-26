@@ -1823,75 +1823,22 @@ pub async fn sfu_http_request(
         .map_err(|e| format!("sfu request failed: {e}"))
 }
 
-/// A fresh ring identifier.
+/// Ring a group, as the creator of the call.
 ///
-/// Signed 64-bit, because the receiving side stores it in an integer column, and
-/// random, because a ring that collides with a concurrent one would let a
-/// cancellation for one call silence another. `OsRng` panicking on a failure to
-/// get entropy is the correct outcome: a predictable ring id would let a stale
-/// ring cancel a live one.
-pub fn new_ring_id() -> i64 {
-    use rand::RngCore as _;
-    let mut bytes = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    i64::from_le_bytes(bytes)
-}
-
-/// Ring a group, so other members' devices actually ring.
+/// RingRTC owns the ring. It derives the `ring_id` from the SFU's `era_id`, asks
+/// the SFU whether this client created the call, and sends only if the answer is
+/// yes. None of that is visible to a host that composes the message itself, which
+/// is why the earlier hand-built `ring_intention` got the id wrong and left
+/// `outgoing_ring_state` claiming someone else had started the call - which
+/// Signal's own log reported as "ringing is not permitted".
 ///
-/// **The ring is a `ring_intention`, not a `group_call_message`.** RingRTC's
-/// `start_group_ring` is private and `CallManager` exposes no way to send one,
-/// so the host sends it. It has to go out *before* the SFU join: the only
-/// group-bound message RingRTC produces on its own is the media key, and it
-/// cannot build that until it has joined and learned the other members' demux
-/// ids — so a call that waits for RingRTC to announce itself announces nothing,
-/// because the conference is empty. That is the whole reason a call could reach
-/// the SFU and ring nobody.
-///
-/// `ring_id` is echoed in the response and in any cancellation, so the same value
-/// has to accompany one ring throughout. The announcement is sent alongside the
-/// ring because they are different signals: the ring is what a device acts on,
-/// and the announcement is what a client that is already in the call routes.
-///
-/// Sent to the whole group: the group is the addressing, and the member roster is
-/// not the roster of devices that should ring.
-pub async fn ring_group(
-    manager: &mut StoredManager,
-    group_id: &[u8],
-    ring_id: i64,
-) -> Result<(), String> {
-    let master_key = crate::sync::group_master_key_for_id(manager, group_id)
-        .await
+/// The request is recorded and sent once the SFU join completes, because that is
+/// when the era id becomes known. Calling this before the client exists is a
+/// no-op; calling it after the join is too late to be a "wants to ring".
+pub fn ring_group(client_id: u32) -> Result<(), String> {
+    with_manager(|m| m.ring_group(client_id))
         .map_err(|e| format!("ring: {e}"))?;
-    if master_key.len() != 32 {
-        return Err(format!(
-            "ring: group master key was {} bytes, expected 32",
-            master_key.len()
-        ));
-    }
-    let mut sent = Vec::new();
-    for (what, bytes) in [
-        ("ring", crate::group_calls::wrap_group_ring(group_id, ring_id)),
-        (
-            "announce",
-            crate::group_calls::wrap_group_call_announce(group_id),
-        ),
-    ] {
-        let bytes = bytes.map_err(|e| format!("ring: {what}: {e}"))?;
-        let message: presage::libsignal_service::proto::CallMessage =
-            prost::Message::decode(bytes.as_slice())
-                .map_err(|e| format!("ring: {what}: protobuf: {e}"))?;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        manager
-            .send_message_to_group(&master_key, ContentBody::CallMessage(message), timestamp)
-            .await
-            .map_err(|e| format!("ring: {what}: {e}"))?;
-        sent.push(what);
-    }
-    eprintln!("[core] group ring sent: {sent:?} ring_id={ring_id}");
+    eprintln!("[core] group ring requested for client={client_id}");
     Ok(())
 }
 

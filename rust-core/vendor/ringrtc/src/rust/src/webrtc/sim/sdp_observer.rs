@@ -1,0 +1,218 @@
+//
+// Copyright 2019-2021 Signal Messenger, LLC
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+
+//! WebRTC Simulation Create/Set SessionDescription
+
+use std::{ffi::CString, os::raw::c_char, ptr::addr_of};
+
+use libc::{size_t, strdup};
+
+use crate::{
+    webrtc,
+    webrtc::sdp_observer::{
+        CreateSessionDescriptionObserver, CreateSessionDescriptionObserverCallbacks,
+        RffiConnectionParametersV4, RffiSrtpKey, SetSessionDescriptionObserver,
+        SetSessionDescriptionObserverCallbacks, SrtpCryptoSuite,
+    },
+};
+
+/// Simulation type for SessionDescription.
+pub type RffiSessionDescription = &'static str;
+
+static mut FAKE_SDP: &str = "FAKE SDP";
+static mut FAKE_SDP_OFFER: &str = "FAKE SDP OFFER";
+static mut FAKE_SDP_ANSWER: &str = "FAKE SDP ANSWER";
+
+/// Simulation type for webrtc::rffi::CreateSessionDescriptionObserverRffi
+pub type RffiCreateSessionDescriptionObserver = u32;
+
+static FAKE_CSD_OBSERVER: u32 = 13;
+
+/// Simulation type for webrtc::rffi::SetSessionDescriptionObserverRffi
+pub type RffiSetSessionDescriptionObserver = u32;
+
+static FAKE_SSD_OBSERVER: u32 = 15;
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_createSetSessionDescriptionObserver(
+    ssd_observer: webrtc::ptr::Borrowed<std::ffi::c_void>,
+    callbacks: webrtc::ptr::Borrowed<std::ffi::c_void>,
+) -> webrtc::ptr::OwnedRc<RffiSetSessionDescriptionObserver> {
+    info!("Rust_createSetSessionDescriptionObserver():");
+
+    // Hit the onSuccess() callback
+    let callbacks = callbacks.as_ptr() as *const SetSessionDescriptionObserverCallbacks;
+    unsafe {
+        ((*callbacks).onSuccess)(webrtc::ptr::Borrowed::from_ptr(
+            ssd_observer.as_ptr() as *mut SetSessionDescriptionObserver
+        ));
+
+        webrtc::ptr::OwnedRc::from_ptr(&FAKE_SSD_OBSERVER)
+    }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_createCreateSessionDescriptionObserver(
+    csd_observer: webrtc::ptr::Borrowed<std::ffi::c_void>,
+    callbacks: webrtc::ptr::Borrowed<std::ffi::c_void>,
+) -> webrtc::ptr::OwnedRc<RffiCreateSessionDescriptionObserver> {
+    info!("Rust_createCreateSessionDescriptionObserver():");
+
+    // Hit the onSuccess() callback
+    let callbacks = callbacks.as_ptr() as *const CreateSessionDescriptionObserverCallbacks;
+    unsafe {
+        ((*callbacks).onSuccess)(
+            webrtc::ptr::Borrowed::from_ptr(
+                csd_observer.as_ptr() as *mut CreateSessionDescriptionObserver
+            ),
+            webrtc::ptr::Owned::from_ptr(addr_of!(FAKE_SDP)),
+        );
+
+        webrtc::ptr::OwnedRc::from_ptr(&FAKE_CSD_OBSERVER)
+    }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_toSdp(
+    rffi: webrtc::ptr::Borrowed<RffiSessionDescription>,
+) -> webrtc::ptr::Owned<c_char> {
+    info!("Rust_toSdp(): ");
+    match unsafe { CString::new(*rffi.as_ptr()) } {
+        Ok(cstr) => unsafe { webrtc::ptr::Owned::from_ptr(strdup(cstr.as_ptr())) },
+        Err(_) => webrtc::ptr::Owned::null(),
+    }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_disableDtlsAndSetSrtpKey(
+    _session_description: webrtc::ptr::Borrowed<RffiSessionDescription>,
+    _crypto_suite: SrtpCryptoSuite,
+    _key_data: webrtc::ptr::Borrowed<u8>,
+    _key_len: size_t,
+    _salt_data: webrtc::ptr::Borrowed<u8>,
+    _salt_len: size_t,
+) -> bool {
+    info!("Rust_disableDtlsAndSetSrtpKey(): ");
+    true
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_sessionDescriptionToV4Legacy(
+    _session_description: webrtc::ptr::Borrowed<RffiSessionDescription>,
+    _enable_vp9: bool,
+) -> webrtc::ptr::Owned<RffiConnectionParametersV4> {
+    info!("Rust_sessionDescriptionToV4(): ");
+    unsafe {
+        webrtc::ptr::Owned::from_ptr(Box::leak(Box::new(RffiConnectionParametersV4 {
+            ice_ufrag: webrtc::ptr::Borrowed::null(),
+            ice_pwd: webrtc::ptr::Borrowed::null(),
+            bidirectional_video_codecs: webrtc::ptr::Borrowed::null(),
+            bidirectional_video_codecs_size: 0,
+            encode_only_video_codecs: webrtc::ptr::Borrowed::null(),
+            encode_only_video_codecs_size: 0,
+            decode_only_video_codecs: webrtc::ptr::Borrowed::null(),
+            decode_only_video_codecs_size: 0,
+        })))
+    }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_sessionDescriptionToV4(
+    _session_description: webrtc::ptr::Borrowed<RffiSessionDescription>,
+    _enable_vp9_encode: bool,
+    _enable_vp9_decode: bool,
+) -> webrtc::ptr::Owned<RffiConnectionParametersV4> {
+    info!("Rust_sessionDescriptionToV4(): ");
+    unsafe {
+        webrtc::ptr::Owned::from_ptr(Box::leak(Box::new(RffiConnectionParametersV4 {
+            ice_ufrag: webrtc::ptr::Borrowed::null(),
+            ice_pwd: webrtc::ptr::Borrowed::null(),
+            bidirectional_video_codecs: webrtc::ptr::Borrowed::null(),
+            bidirectional_video_codecs_size: 0,
+            encode_only_video_codecs: webrtc::ptr::Borrowed::null(),
+            encode_only_video_codecs_size: 0,
+            decode_only_video_codecs: webrtc::ptr::Borrowed::null(),
+            decode_only_video_codecs_size: 0,
+        })))
+    }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_deleteV4(_v4: webrtc::ptr::Owned<RffiConnectionParametersV4>) {
+    info!("Rust_deleteV4(): ");
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_sessionDescriptionFromV4Legacy(
+    offer: bool,
+    _v4: webrtc::ptr::Borrowed<RffiConnectionParametersV4>,
+    _enable_tcc_audio: bool,
+    _enable_vp9: bool,
+) -> webrtc::ptr::Owned<RffiSessionDescription> {
+    info!("Rust_sessionDescriptionFromV4(): ");
+    unsafe {
+        if offer {
+            webrtc::ptr::Owned::from_ptr(addr_of!(FAKE_SDP_OFFER))
+        } else {
+            webrtc::ptr::Owned::from_ptr(addr_of!(FAKE_SDP_ANSWER))
+        }
+    }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_sessionDescriptionFromV4(
+    offer: bool,
+    _v4: webrtc::ptr::Borrowed<RffiConnectionParametersV4>,
+    _enable_tcc_audio: bool,
+    _enable_vp9_encode: bool,
+    _enable_vp9_decode: bool,
+    _is_v4_local: bool,
+) -> webrtc::ptr::Owned<RffiSessionDescription> {
+    info!("Rust_sessionDescriptionFromV4(): ");
+    unsafe {
+        if offer {
+            webrtc::ptr::Owned::from_ptr(addr_of!(FAKE_SDP_OFFER))
+        } else {
+            webrtc::ptr::Owned::from_ptr(addr_of!(FAKE_SDP_ANSWER))
+        }
+    }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn Rust_localDescriptionForGroupCall(
+    _ice_ufrag: webrtc::ptr::Borrowed<c_char>,
+    _ice_pwd: webrtc::ptr::Borrowed<c_char>,
+    _client_srtp_key: RffiSrtpKey,
+    _local_demux_id: u32,
+    _remote_demux_ids_data: webrtc::ptr::Borrowed<u32>,
+    _remote_demux_ids_len: size_t,
+    _remote_demux_ids_require_svc: webrtc::ptr::Borrowed<u32>,
+    _remote_demux_ids_require_svc_len: size_t,
+    _enable_svc: bool,
+) -> webrtc::ptr::Owned<RffiSessionDescription> {
+    info!("Rust_localDescriptionForGroupCall(): ");
+    unsafe { webrtc::ptr::Owned::from_ptr(addr_of!(FAKE_SDP_OFFER)) }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn Rust_remoteDescriptionForGroupCall(
+    _ice_ufrag: webrtc::ptr::Borrowed<c_char>,
+    _ice_pwd: webrtc::ptr::Borrowed<c_char>,
+    _server_srtp_key: RffiSrtpKey,
+    _local_demux_id: u32,
+    _remote_demux_ids_data: webrtc::ptr::Borrowed<u32>,
+    _remote_demux_ids_len: size_t,
+    _remote_demux_ids_require_svc: webrtc::ptr::Borrowed<u32>,
+    _remote_demux_ids_require_svc_len: size_t,
+    _enable_svc: bool,
+) -> webrtc::ptr::Owned<RffiSessionDescription> {
+    info!("Rust_remoteDescriptionForGroupCall(): ");
+    unsafe { webrtc::ptr::Owned::from_ptr(addr_of!(FAKE_SDP_ANSWER)) }
+}
+
+#[allow(non_snake_case, clippy::missing_safety_doc)]
+pub unsafe fn Rust_deleteSessionDescription(_sdi: webrtc::ptr::Owned<RffiSessionDescription>) {
+    info!("Rust_deleteSessionDescription(): ");
+}

@@ -1,0 +1,2227 @@
+# Changelog
+
+## v2.72.0
+
+- Update webrtc version to 7871k
+  - Support setting min capture rate in CameraEnumerationAndroid
+  - Add video source frame count and resolution to stats
+  - Fix rffi translation of quality limitation reason kNone
+  - Avoid including webrtc-specific headers in api/
+  - Move non-FFI classes and methods out of api/
+  - Add logs when the audio recording route changes
+  - Return whether a response actually belongs to given TurnPort
+  - Update opus build to match upstream
+  - Remove unused declarations from peer_connection_factory.h
+  - Require non-static functions to have a prototype
+  - Initialize audio callback ptr ptr in Create
+  - Update audio callbacks to avoid global
+
+- Ensure calls terminate completely in corner cases
+
+- Add SvcConfig validation and auto-correction
+
+- Implement call link root key redaction
+
+- Add source fps & resolution stats, update call summary
+
+- Call Sim: Cleanup baseline configuration for dred
+
+- Add handlers for the Java ADM logging callbacks
+
+- Reapply "Fix direct test program"
+
+- Bump to cubeb 0.38
+
+## v2.71.0
+
+- Add SVC Support for group calls
+
+- Start callee audio recording before playout
+
+- Use server provided Vec<SocketAddr> from Join
+
+- Improve redaction utilities
+
+- Make device_id required for ADM operations
+
+- Improve build scripts and CI
+
+- Update dependencies
+  - Update rust dependencies
+  - Update to Rust 1.97.1
+  - Update cubeb to 0.37
+  - Update npm tar package
+
+- Remove lazy_static usage
+
+## v2.70.2
+
+- Trim string before checking LiteralPrefix redaction
+
+## v2.70.1
+
+- Build / test: Remove unused methods for call simulator
+
+- Build / test: Fix webrtc unit test execution
+
+- Fix VP9 flag handling in Android
+
+- Update stats reporter to log correct remote_fraction_lost
+
+- Update call sim logging format and send call sim cli logs to stdout
+
+- Desktop: Improve cubeb log redaction
+
+## v2.70.0
+
+- Add asymmetric video codec support for 1:1 calls
+
+- Android: Add VideoConfig to CallManager::proceed
+
+- Trigger an ICE regather when reconnecting during 1:1 calls
+
+- ADM: Internal enum cleanup and update to cubeb 0.36.0
+
+- Assets: Support disabling on specific platforms
+
+- CI: Update to a newer Xcode and iOS version
+
+- CI: Use curl for fetch-artifact.py
+
+- Build improvements
+
+## v2.69.7
+
+- Update WebRTC version to 7871a (m150)
+
+- Call Sim
+  - Stats refinements and dred stats refactor
+  - Update linux container version of audio scripts
+
+- Remove pull_request_target trigger from reviewers workflow
+
+- Add auto-assign assignees to CI
+
+- Update to Event::wait_or_throw to make test failures explicit
+
+- Warn if webrtc.version isn't in webrtc checkout
+
+## v2.69.6
+
+- Remove provenance from npm publish that breaks release
+
+## v2.69.5
+
+- Update WebRTC version to 7778d
+  - Trigger an ICE regather when reconnecting during group calls
+
+- Desktop: convert ringId to callId as unsigned integer
+
+- Enable iOS isMultitaskingCameraAccessEnabled when available
+
+- Update logging for ice candidates
+
+- CI updates:
+  - Upload attestation for electron artifacts
+  - Update GitHub actions to Node24+
+  - Remove workaround for XDG_RUNTIME_DIR missing on Linux arm64 runner
+
+## v2.69.4
+
+- Update to cubeb 0.35.3
+
+## v2.69.3
+
+- Improve remote mute attribution checks
+
+- Improve stats for packet loss analysis
+
+- Handle badly formatted video frames better
+
+- Update WebRTC version to 7778c
+  - Add stats for improved packet loss analysis
+  - Fix relative arrival delay stat when DRED is enabled
+  - Add checks for DRED buffer operations
+  - Add null checks when rotating i420 video frames
+
+- Desktop: Update NodeJS dependencies
+
+- Add resolution and framerate to call_sim summary
+
+- Update media key rotation delay to 5 seconds in group calls.
+
+## v2.69.2
+
+- Android: Update to jni 0.22.4 and gradle 9.3.1
+
+- Remove dead SDP code
+
+## v2.69.1
+
+- Add audio redundancy statistics to Call Summary
+
+- Add Call ID hash to Call Summary
+
+- Fix is relayed in Call Summary
+
+- Update to webrtc 7778b
+  - Merge m148 from upstream
+  - Always allow packet-type-based packet demuxing
+
+- Call Sim: Add DRED options to baseline
+
+## v2.69.0
+
+- Enable libvpx VP9 for android and expose flag
+
+- ADM: Prevent infinite loop in desktop adm playout callback
+
+- ADM: Add support for toggling AGC/AEC/NS on desktop (macOS)
+
+- Update to webrtc 7680g
+  - Return nonzero length for ADM callback-gone case
+
+- Log webrtc version from version.properties
+
+## v2.68.1
+
+- Integrate Opus DRED
+  - Add more audio receiver stats for jitter buffer
+  - Add opus decoder configuration plumbing
+  - Add fields for dred support to the opus encoder configuration
+  - Add opus dnn weights support and asset registry integration
+  - Enable rtc_opus_support_dred in build scripts
+  - Update to webrtc 7680f
+
+- Speculative fix to device disconnection race
+
+- Simplify ADM device switching APIs
+
+- Asset Registry: Disable DRED support for 32-bit devices
+
+## v2.68.0
+
+- Add Android screenshare support
+
+- ADM: Avoid C++ layer for device enumeration / selection
+
+- Update to webrtc 7680c
+  - ADM: avoid using C++ layer to proxy updates and ignore WebRTC's device selection choices
+
+- Update dependencies
+
+- Fix various validations in Signaling and in SfuToDevice RTP
+
+## v2.67.3
+
+- iOS: Move method calls inside buffer accesses
+
+## v2.67.2
+
+- Update to webrtc 7680b
+  - Update to 7680 (m146)
+  - Disable sdp munging checks
+
+- Update to use safe slicing operations
+
+- Add codec implementation to ringrtc_stats
+
+- Update webrtc-sys to default to using prebuilt
+
+- Upgrade libsignal to 0.89.2
+
+- Call Sim: Performance and reporting improvements
+
+## v2.67.1
+
+- Update Uint8Arrays in electron to specify ArrayBuffer.
+
+## v2.67.0
+
+- Refactor StreamSummary to avoid a map
+
+- Update to webrtc 7444h
+  - Revert change that skips DTX refresh packet
+  - Android: Make oboe more resilient to errors when starting
+
+## v2.66.1
+
+- Update BigInt in electron to use native JsBigInt.
+
+## v2.66.0
+
+- Add opus DRED model 0.0.1 and DRED duration config
+
+- Enable Opus PLC
+
+## v2.65.4
+
+- Add AssetRegistry to call state, expose addAsset()
+
+- Update to libsignal v0.88.0
+
+## v2.65.3
+
+- Update to webrtc 7444g
+  - Disable sdp munging checks
+  - Update to opus 1.6.1
+  - Use the smoothed CPU load estimator
+
+- Add asset protos and AssetManager in core
+
+- Update dependencies
+
+## v2.65.2
+
+- Revert: Enable noise suppression and AEC on macOS
+
+## v2.65.1
+
+- Add webrtc_artifact_checksums.json to podspec to fix iOS build
+
+## v2.65.0
+
+- Add direct call timestamps to telemetry
+
+- Implement call link epoch IDs V2
+
+- Fix direct call cli tool and add to CI
+
+- Enable noise suppression and AEC on macOS
+
+- Add webrtc-sys package
+
+## v2.64.1
+
+- Fix bug in starting peek after receiving device_joined_or_left
+
+## v2.64.0
+
+- Update to webrtc 7444f
+  - Send DTX TOC only in lieu of refresh packets
+  - Update logging in connection.cc to log ICE failures
+
+- Desktop: Rename rttMedianConnection to rttMedianConnectionMillis survey field
+
+- iOS: Add ifdef'd support for video file input
+
+- Call Sim: Minor improvements and fixes
+
+## v2.63.0
+
+- Desktop: Always disable mic and camera on call end
+
+- Build vp9 on iOS and allow configuration
+
+- Update to webrtc 7444e
+  - Support rebuild with vp9 on iOS
+  - Remove support for file-based ADM
+
+- Update to cubeb 0.34.0
+
+- Update stats logs and call summary
+
+- Remove "webrtc simulator" builds
+
+## v2.62.0
+
+- Add support for send_call_message_to_adhoc_group
+
+- Update to webrtc 7444c
+  - Skip send for opus DTX refresh packets
+  - Remove unneeded null-DCHECK
+
+- Android: Publish to GCS instead of Maven Central
+
+- Add freeze_count to ringrtc_stats and call summary blob
+
+- Remove debug logs parser
+
+- Call Sim: General improvements and fixes
+
+- Update dependencies
+
+## v2.61.0
+
+- Call Summary
+  - Fix CPU stats
+  - Provide fractions instead of percentages
+  - Always provide raw stats text
+
+- Update to webrtc 7444a (m142)
+
+- Desktop: Make sure that play (and record) don't restart
+
+- Update node, ios, and Rust dependencies
+
+- Update to Rust 1.91.1
+
+- CI: Update runners for new ios, macos, and android versions
+
+## v2.60.7
+
+- Desktop: Don't bubble up active call not found error
+
+## v2.60.6
+
+- Desktop: Fix audio mute state after call ends
+
+## v2.60.5
+
+- Fix packet loss calculation
+
+## v2.60.4
+
+- Desktop: Retry build
+
+## v2.60.3
+
+- Retry build
+
+## v2.60.2
+
+- Improve call summary stats handling
+
+## v2.60.1
+
+- Desktop: Retry build
+
+## v2.60.0
+
+- Add support for the calling survey feature
+
+- Desktop: Allow for "microphone warm up"
+
+- Improve usability of virtual audio for rusty and other test use cases
+
+- Update to webrtc 7339f
+  - Update field trials mechanism
+  - Add separate rtp packet observer for received data
+  - Avoid errors when unregistering sinks
+
+- Build improvements
+
+## v2.59.4
+
+- Desktop: Update to cubeb 0.33.0
+
+- Desktop: Use OIDC auth instead of an automation token
+
+## v2.59.3
+
+- iOS: Use UUID as RemotePeer for received messages
+
+- Update to webrtc 7339d
+  - Add backup connection candidate stats and ICE check stats
+
+- Add ICE stats and connection stats for backup candidate pairs
+
+- Call Sim: Fix cleanup of tcpdump for clients
+
+- CI: Switch to macos-14 runner for Desktop builds
+
+## v2.59.2
+
+- Add support for fragmenting large data messages to SFU
+
+- Add error stats to deviceToSfu
+
+- Add macOS support to virtual_audio
+
+- Update to Rust 2024
+
+- Call Sim: Improvements to support long running tests
+
+## v2.59.1
+
+- Revert: iOS: Use UUID as RemotePeer for received messages
+
+## v2.59.0
+
+- Update to webrtc 7339c
+  - Update to webrtc 7339a (m140)
+  - Decrement rust ADM refcount in PCF destructor
+
+- iOS: Use UUID as RemotePeer for received messages
+
+- Desktop: Improve ADM lifecycle management
+
+- Desktop: Get rid of ProtobufBuffer type
+
+- Desktop: Drop last uses of Buffer/JsBuffer
+
+- Remove support for old data rtp ssrc
+
+- Call Sim: Average all mos values in reports
+
+- Rust 2024: Trivial fixes
+
+- Update CI and tests
+
+## v2.58.1
+
+- Desktop: New Audio Device Module improvements
+  - Reduce some error!s to warn!s in ADM
+  - Update to cubeb 0.31.2, which saves battery life
+  - handle missing default device
+
+- CI: Notify via bug on slow tests failure
+
+## v2.58.0
+
+- Desktop: New Audio Device Module improvements
+  - Refactor ADM to use cubeb in an async manner
+  - Implement device changed callbacks
+
+- Some minor logging refinements
+
+## v2.57.1
+
+- Desktop: Update to cubeb 0.30.1
+
+- Update Rust to 1.89.0
+
+- Update dependencies and runners
+
+## v2.57.0
+
+- Desktop: Convert Buffer types to Uint8Array and simplifications
+
+- Update to webrtc 7204c
+  - Use siso to build instead of ninja
+  - Don't pass non-owned relay_port_factory
+
+- Virtual audio setup script for linux
+
+## v2.56.0
+
+- Check remote peer for all direct call messages
+
+- Update to webrtc 7204a (m138)
+
+- Call Sim: Use real ADM
+
+## v2.55.0
+
+- Desktop: Improve ADM log redaction
+
+- Desktop: Convert Buffer types to Uint8Array
+
+- Desktop: Setup the event reporter first for the call endpoint
+
+- Call Links: Use correct epoch endianness for iOS
+
+- CI: Update Sonatype URL to deal with OSSRH sunset
+
+- CI: Update the python version mypy uses
+
+## v2.54.1
+
+- Desktop: Remove endorsementPublicKey from createGroupCallClient
+
+## v2.54.0
+
+- Support receiving SendEndorsements over RTP in SfuToDevice
+
+- Desktop: New Audio Device Module improvements
+  - Always use ringrtc ADM
+  - Output in stereo
+
+- Update to webrtc 7103e
+  - Always use the ringrtc ADM
+  - Avoid creating and converting session descriptions
+
+- Avoid auto-declining calls on failure
+
+- Send data rtp with new ssrc
+
+- Call Sim: Bump version of plotly
+
+## v2.53.0
+
+- Call links: Add support for epoch id
+
+- Update to webrtc 7103d
+  - Revert changes to initial bitrate (set default back to 300kbps)
+  - Start checking source code formatting
+  - Avoid logging delay warnings
+  - Fix test hangs
+  - Remove obsolete sdp string munging
+
+- Group Calls: Delay ending to ensure leaving
+
+- Update dependencies
+
+## v2.52.3
+
+- Android: Tell proguard to keep the jni_zero classes
+
+## v2.52.2
+
+- Update to webrtc 7103b
+  - Update to WebRTC 7103 (m136)
+  - Disable perfetto linking
+
+- CI: Update slow tests and add profiling reports
+
+- Rename `build-electron` to `build-desktop`
+
+## v2.52.1
+
+- Android: Add AudioConfig class and configure ADMs properly
+
+- Update to webrtc 6998d
+  - Add new configuration options for the Oboe ADM
+
+- CI: Use prebuilt for profiling run
+
+## v2.52.0
+
+- Add support for remote mute
+
+- Update to webrtc 6998c
+  - Revert video delay changes
+
+## v2.51.0
+
+- Desktop: Move VideoSupport.ts to Client
+
+## v2.50.6
+
+- Update to webrtc 6998b
+  - Android: Enable 16KB page size for any 64-bit platform
+
+- Build improvements
+
+## v2.50.5
+
+- Update to webrtc 6998a (m134)
+
+- Android: Support 16KB pages for Arm64
+
+## v2.50.4
+
+- Desktop: New Audio Device Module improvements
+  - Bump cubeb version
+
+- Node: Allow options override in enableCapture()
+
+## v2.50.3
+
+- Android: Add SpeechEvent to the ClassCache
+
+- Update to webrtc 6834g
+  - Revert "Mark audio packets as having an encrypted TOC byte"
+
+- Update Rust code formatting
+
+## v2.50.2
+
+- Group Calls: Add receiving PeekInfo over RTP in SfuToDevice
+
+- Desktop: New Audio Device Module improvements
+  - Improve handling of failure to initialize streams
+
+- Update to webrtc 6834f
+  - Rebuild since tag 6834e was not pointing to the latest commit
+
+- CI: Set up runner for call sim profiling
+
+## v2.50.1
+
+- CI: Run Linux arm64 build and tests on native CI runners and fix test logic
+
+- Fix undefined symbol error for Linux Arm64 devices
+
+- Update to webrtc 6834e
+  - Rebuild for Linux Arm64 to disable libyuv_use_sme
+
+## v2.50.0
+
+- Remove obsolete primary device flag
+
+- Group Calls: Add ICE password to join request
+
+- Desktop: New Audio Device Module improvements
+  - Grab more characters from cubeb logs
+
+- Call Sim:
+  - Adjust perf options
+  - Add profiling suite
+
+- Desktop: Use container for Ubuntu 20.04 artifact build
+
+- Update dependencies
+
+## v2.49.5
+
+- Desktop: New Audio Device Module improvements
+  - Bump cubeb to 0.22.0
+
+- Update to Rust 1.84.1
+
+- Add num_packets and merge buffer support to MrpStreams
+
+## v2.49.4
+
+- Lower time threshold for speech event notification
+
+- Update to webrtc 6834d
+  - Fix for buffer overwrite
+
+- Call Sim: Add option to sim to collect performance data
+
+- CI: Use Ubuntu 22.04 for building arm64 artifact
+
+## v2.49.3
+
+- Update to webrtc 6834c (m132)
+
+- Desktop: New Audio Device Module improvements
+  - Bump cubeb to 0.20.0
+
+- Update dependencies
+
+## v2.49.2
+
+- Update to webrtc 6723c
+  - Use RE2 instead of std::regex for SDP munging
+  - Remove RED support
+  - iOS: Fix null-pointer deref if audiounit init failed
+  - For encrypted video, check for keyframe after decryption
+  - Update to oboe v1.9.3
+
+- Calling server should enforce max call size
+
+- Desktop: New Audio Device Module improvements
+  - Refresh default devices periodically
+
+- Call Sim: Update docker builds
+
+- Group Calls: Make the Client::start() function take a struct
+
+- CI: Fix mypy issue
+
+- Update Rust dependencies
+
+## v2.49.1
+
+Desktop: Fix crash caused by new Audio Device Module
+
+## v2.49.0
+
+- Remove support for unencrypted audio header
+
+- Desktop: New Audio Device Module improvements
+  - Fix broken windows build
+  - Remove redundant ADM creation
+  - Disable voice processing on inputs for macos
+  - Cache output of enumerate_devices
+
+- Update to webrtc 6723b
+  - Enable video layers allocation header extension in group calls
+  - Remove checks for dependency descriptors
+  - Fix some tests and disable others
+
+- Increase priority of non-relay candidates
+
+- Add prebuilt_webrtc_sim feature
+
+- Build improvements
+
+## v2.48.7
+
+- Desktop: New Audio Device Module improvements
+  - Logging improvements for ringrtc ADM
+  - Use a dedicated runner to build for linux ARM, fixing crash
+
+- Notify clients for important speech events
+
+## v2.48.6
+
+- Desktop: New Audio Device Module improvements
+  - Don't show `Monitor of` devices as inputs to match existing ADM behavior
+  - Uprev cubeb to 0.17.0 to fix cross-compilation
+
+## v2.48.5
+
+- Desktop: Improve new Audio Device Module support on mac and linux
+  - Update cubeb
+  - Reenable build on aarch64 linux
+  - Debug logging
+
+- Additional debug logging
+
+- Build improvements
+
+## v2.48.4
+
+- Update to webrtc 6723a (m130)
+
+- Desktop: Updates to the new Audio Device Module
+
+- Update dependencies
+
+- Build improvements
+
+## v2.48.3
+
+- Desktop: Install pulse to build for linux
+
+- Desktop: Add action to cross-compile for linux aarch64
+
+- Desktop: Add onEnded to capture options
+
+## v2.48.2
+
+- iOS: Use MainActor annotations
+
+## v2.48.1
+
+- Desktop: Add new Audio Device Module option
+  - Implement ADM using cubeb
+  - Update ADM switch to support a startup flag
+  - Use min_latency to limit latency requested
+  - Skip building ringrtc ADM on linux aarch64
+
+- Add CallLink AdminAction logs to improve debugging
+
+- Android: Package libraries unstripped by default
+
+## v2.48.0
+
+- Desktop: Allow VideoSupport to accept a MediaStream
+
+- Group Calls: Avoid creating a client if one already exists
+
+- Update to webrtc 6613c
+  - Desktop/Mac: check for a channel change for input only
+
+- Update node and ios dependencies
+
+## v2.47.1
+
+- Group Calls: Allow connection to a TCP+TLS server candidate
+
+- Update dependencies
+
+## v2.47.0
+
+- Update to webrtc 6613a (m128)
+
+- Update PeekInfo::unique_pending_users to maintain order from SFU
+
+- Desktop: Add function to get CallID from EraID on GroupCall object
+
+- Retain old ratchet secrets to allow for out-of-order decryption
+
+- Call Sim: Add group calling support
+
+- logs-notebook: Parse system stats
+
+- Simplify running WebRTC tests
+
+## v2.46.2
+
+- Update to webrtc 6478k
+  - iOS: Fixed issue with missing network interfaces
+
+- Android: Disable the use of sessionId for Oboe
+
+- Update to Rust 1.80.1
+
+- Build improvements
+
+## v2.46.1
+
+- CI: Upload desktop symbols to GCS
+
+- Update to webrtc 6478j
+  - Reduce kDefaultMinPixelsPerFrame
+  - Revert "Add Rust_setIncomingAudioMuted"
+  - Revert "Log more info when select fails"
+
+- Update dependencies
+
+- Build improvements
+
+## v2.46.0
+
+- Send audio enabled status to remote device in 1:1 calls
+
+- Update to webrtc 6478i
+  - Add ice switch reason to logging
+  - Android: Oboe ADM uninitialize on stop
+  - Don't get stats from unused transceivers
+
+- Build improvements
+
+## v2.45.0
+
+- Call links: Add restrictions to create call link API
+
+- Update to webrtc 6478h
+  - Android: Add new OboeStream class for reliability
+
+## v2.44.5
+
+- Update to webrtc 6478g
+  - Android: Oboe refinements and latency improvements
+
+## v2.44.4
+
+- Group Calls: Reduce log noise
+
+- Run dump_syms on CI
+
+- Support overlapping memory copy for decrypt
+
+- Enable sending dependency descriptor in group calls
+
+- Send encrypted TOC byte in group calls
+
+- Update dependencies
+
+- Update to webrtc 6478f
+  - Improve network type detection on macOS
+  - Enable sending dependency descriptor in group calls
+  - Mark audio packets as having an encrypted TOC byte
+  - Fix ios device orientation left/right assignment
+
+## v2.44.3
+
+- Android: Add audio device module based on Oboe
+
+- Update to webrtc 6478e
+  - Add audio device module for android based on Oboe
+  - Remove support for setting mobile aec
+  - Simplify handling of audio callbacks
+
+- Desktop ADM: Resolve dependency cycle and other improvements
+
+## v2.44.2
+
+- Desktop ADM: Add support for switching to RingRTC ADM
+
+- Fix Python deprecation warning
+
+- Update to webrtc 6478b
+  - ringrtc: Add stub ADM
+  - Revert "Enable sending dependency descriptor in group calls"
+
+## v2.44.1
+
+- Update to webrtc 6478a
+  - Update to WebRTC 6478 (m126)
+  - Enable sending dependency descriptor in group calls
+
+- Group Calls: Enable sending dependency descriptor
+
+- Refactored protobuf to own crate
+
+- Call Sim: Refactoring
+
+- Update dependencies
+
+## v2.44.0
+
+- Remove reliable payload type, reuse existing data payload type
+
+- Update to webrtc 6261l
+  - Remove code for supporting SDES
+  - Propagate externally-negotiated keys
+  - Only attempt to relay connections to addresses that are globally unique
+  - Remove lbred experiment
+  - Test fixes
+
+- Make it more convenient to build and run unit tests.
+
+- iOS: Remove SignalCoreKit dependency
+
+- Code Cleanup
+
+## v2.43.0 (not released)
+
+- Add support for reliable Admin Actions (approve, deny, remove, block)
+
+- Propagate errors starting camera
+
+- Desktop: Add receivedAtData argument to handleAutoEndedIncoming
+
+- Update to webrtc 6261j
+  - Resolve warnings from delay settings
+
+## v2.42.0
+
+- Add support for reporting rtc_stats to client application
+
+- Update to webrtc 6261i
+  - Support for reporting rtc_stats
+  - Enable per-layer PLI for screen sharing
+
+## v2.41.0
+
+- Call links: Add Call Link state to PeekInfo
+
+- Update to webrtc 6261g
+  - Update video settings
+  - iOS: Match WebRTC acknowledgments filename
+
+- iOS: Update builds and tests
+
+- Update dependencies and documentation
+
+## v2.40.1
+
+- iOS: Raised hands array can be empty
+
+## v2.40.0
+
+- Group Calls: Support multi-recipient message sending
+
+- Group Calls: Update bitrate limits for screen sharing
+
+- Update to webrtc 6261e
+  - Update to use Opus 1.5
+
+## v2.39.3
+
+- Update to webrtc 6261d
+  - Add receive support for encrypted TOC byte
+  - Add logging when select fails
+
+- Add receive support for encrypted TOC byte
+
+- Update dependencies
+
+## v2.39.2
+
+- Group Calls: Apply removal of demux IDs separately
+
+- Log notebook improvements
+
+- Build improvements
+
+- Update to Rust 1.76.0
+
+## v2.39.1
+
+- Call Sim: Add jitter buffer config
+
+- Don't probe when close to the max probe rate
+
+- Group Calls: Synchronize access to last_height_by_demux_id
+
+- Update dependencies
+
+## v2.39.0
+
+- Update to WebRTC m122
+
+- Desktop: Update IceServer fields to be optional
+
+- Add receive support for dependency descriptor to determine unencrypted length
+
+- Group Calls: Handle client_status in sfu.join()
+
+- Call links: Replace update revocation API with an explicit delete API
+
+- Update dependencies
+
+## v2.38.0
+
+- Update to webrtc 6099c
+  - Accept list of IceServers for Turn configuration
+
+- Desktop: Accept list of IceServers for Turn configuration
+
+- Enable "First Ready" Turn pruning policy
+
+## v2.37.1
+
+- Update to webrtc 6099b
+  - Apply upstream m120 change to JsepTransportController
+
+- Call Sim: Add PESQ and PLC MOS support
+
+## v2.37.0
+
+- Update to WebRTC m120
+
+- Desktop: added_time and speaker_time are not optional
+
+- Desktop: Support installing via npm
+
+- Update dependencies
+
+## v2.36.0
+
+- Use unified plan for group calls
+
+- Update jni crate to 0.21.1
+
+- Desktop: Remove legacy call message fields
+
+## v2.35.0
+
+- Update zkgroup to 0.37.0
+
+- Code Cleanup
+
+- Desktop: Always use the Windows ADM2
+
+- Android: Generate assets/acknowledgments/ringrtc.md as part of build
+
+- Make lints on CI slightly faster
+
+- Build improvements and dependency updates
+
+- Update to Rust 1.74.1
+
+## v2.34.5
+
+- Use unified plan for 1:1 calls
+
+- iOS: Make trivial RemoteDeviceState for IndividualCalls
+
+- iOS: Make isUsingFrontCamera publically readable
+
+- Call Sim: Add deterministic loss handling and lbred test
+
+- Build webrtc using github actions
+
+## v2.34.4
+
+- Fetch build artifacts using a proxy where necessary
+
+- Update to WebRTC m118
+
+## v2.34.3
+
+- Update to webrtc 5845j
+  - Add low bitrate redundancy support
+  - Lower port allocation step delay
+  - Prune TurnPorts on a per-server basis
+  - Unregister sink properly when closing
+
+- Call Sim: Improvements for running large test sets
+
+## v2.34.2
+
+- Group Calls: Propagate demux_id to LocalDeviceState
+
+## v2.34.1
+
+- Cleanup logging
+
+- Desktop: Remove device preloading to avoid permission prompt
+
+## v2.34.0
+
+- Group Calls: Add Hand Raise feature
+
+- Electron: Allow ICE server hostname to be set
+
+- Build improvements and dependency updates
+
+## v2.33.0
+
+- Update to webrtc 5845h
+  - Add Rust_setIncomingAudioMuted
+  - Update libvpx dependency
+
+- Group Calls: Add Reactions feature
+
+- Group Calls: Prevent comfort noise from getting stuck on
+
+- Replace TaskQueueRuntime with Actors
+
+- Call Sim: Speed up chart generation
+
+## v2.32.1
+
+- Desktop: Downgrade dependency for client
+
+## v2.32.0
+
+- Add callback for low upload bandwidth in a video call
+
+- Increase max video receive resolution for desktop
+
+- Update webrtc to 5845f
+  - Disable audio and media flow by default
+  - Allow configuration of audio jitter buffer max target delay
+
+- iOS: Stop building for Catalyst
+
+- Call links: Add `reset-approvals` to test client
+
+- Update Rust to 1.72.1
+
+- Build improvements and dependency updates
+
+## v2.31.2
+
+- Update webrtc to 5845c
+  - Update the hardcoded PulseAudio device name to "Signal Calling"
+  - Add more audio control and safe defaults
+  - Add accessor for bandwidth estimate
+
+- Update webrtc to 5845d
+  - Disable early initialization of recording
+
+- Generate license files for WebRTC builds
+
+- Call Sim: Add test iterations and mos averaging
+
+- Add more audio configuration and control
+
+- Improve builds on GitHub Actions
+
+- Build webrtc on AWS for android, ios, linux, mac
+
+## v2.31.1
+
+- Update tag for build automation
+
+## v2.31.0
+
+- Group Calls: Separate PeekInfo device counts on in/excluding pending devices
+
+- Desktop: Migrate to deviceCountIncluding/ExcludingPendingDevices as well
+
+- Update to WebRTC m116
+
+- Desktop: Use stack arrays for JS arguments rather than vectors
+
+- Build improvements; Support more build automation
+
+- Log improvements
+
+## v2.30.0
+
+- Add JoinState.PENDING, for call link calls with admin approval
+
+- Group Calls: Compute send rates based on devices, not users
+
+- CI: Only run the slow tests on the private repo
+
+- Call Sim: Use a fixed resolution for output video
+
+- Log notebook improvements
+
+## v2.29.1
+
+- Electron: Disable output format limits when screensharing
+
+## v2.29.0
+
+- Call Links: Add Admin Actions support
+
+- Desktop: Adapt video resolutions in 1:1 calls
+
+- Add a Call Simulator for testing
+
+- Reference signalapp/webrtc@5615c
+  - Add configuration options to support simulation
+  - Support adapting video frames
+
+- Reference signalapp/webrtc@5615d
+  - Configure audio jitter buffer max delay
+
+- Improvements to build scripts for automating WebRTC builds
+
+- Test and logging improvements
+
+## v2.28.1
+
+- Group Calls: Add support for TCP connections
+
+- Call Links: Switch to X-Room-Id header
+
+- Adjust max audio jitter buffer size to support increased packet time
+
+- Test and logging improvements
+
+## v2.28.0
+
+- Call Links: Implement Peek and Join support
+
+- Refactor: BandwidthMode to DataMode
+
+- Android: Fix exception check when throwing an error up to Java
+
+- Improvements to make tests more reliable
+
+## v2.27.0
+
+- Update to WebRTC 5615 (m112)
+
+- Implement Call Link Create/Read/Update APIs
+
+- Set audio packet time to 60ms
+
+- Apply audio encoder configuration in group calls
+
+- ios: Fix video capture size selection
+
+- Refactor HTTP JSON parsing so it's more reusable
+
+- Bump Rust toolchain to nightly-2023-03-17
+
+- Build improvements and dependency updates
+
+## v2.26.4
+
+- Desktop: Stop duplicate MediaStreamTracks
+
+## v2.26.3
+
+- Remove h264 video codec support
+  - Reference signalapp/webrtc@5481c
+
+- Disable ANY address ports by default
+
+- Build improvements
+
+## v2.26.2
+
+- Node: Require expected calling message fields
+
+- Log notebook improvements
+
+## v2.26.1
+
+- Revert "Android: Increase max jitter buffer size" (from v2.25.0)
+
+## v2.26.0
+
+- Adjustments to CallId, EraId, RingId and derivations/conversions
+
+- Group Calls: Limit bitrate for the lowest layer
+
+- Reference signalapp/webrtc@5481b
+  - VideoAdapter: Fix scaling of very large frames
+  - Log more info when video input starts
+
+- Reference signalapp/webrtc@5481a
+  - Set inactive timeout to 30s
+  - rffi: Set a bandwidth limit on the lowest layer of a group call
+  - Allow tcp candidates in group calls
+
+- Log notebook improvements
+
+- Build improvements
+
+## v2.25.2
+
+- Node: Ensure that a frame is fully copied before sending it to WebRTC
+
+- Node: Clean up our eslint config, and fix uncovered issues
+
+- Log stats 2sec into a call, then every 10sec after
+
+- Build improvements
+
+## v2.25.1
+
+- Update to WebRTC 5481 (m110)
+
+- Use default ptime for all bandwidth modes
+
+- Desktop: Add workaround for slow call to enumerateDevices
+
+- Update dependencies (Rust and Electron)
+
+## v2.25.0
+
+- Allow SFU to return multiple ICE candidates (for IPv6 support)
+
+- Android: Add more devices to hardware encoding blocklist
+
+- Android: Increase max jitter buffer size
+
+- Desktop: Initialize call endpoint lazily
+
+- Desktop: Allow explicitly rejecting very tall or very wide frames
+
+- Add cpu statistics to logging
+
+- Reference signalapp/webrtc@5359d
+  - Improved logging around network switch
+  - Allow TURN ports to be pruned
+
+- CI: Add "Slow Tests" that will run once every night
+
+- Update dependencies, logging, build improvements
+
+## v2.24.0
+
+- Desktop: Get TURN servers after call creation to improve glare handling
+
+- Desktop: Add test cases for glare handling
+
+- Desktop: Set a minimum frame rate for screenshare capture
+
+- Reference signalapp/webrtc@5359c
+  - Remove Android API 19 support
+  - Cleanup merge diffs
+  - Include candidate information for ICE route changes
+  - Allow any address ports to be disabled
+
+- Log when the selected ICE candidate pair changes
+
+- Add debuglogs notebook for analyzing logs
+
+- CI: Add builds and tests for all platforms
+
+- Build improvements
+
+## v2.23.1
+
+- Support fetching prebuilds from build-artifacts.signal.org
+
+- Add support for setting WebRTC field trials
+
+- Android: Add support non-vendored NDK
+
+- Update logging, builds
+
+## v2.23.0
+
+- Update to WebRTC 5359 (m108)
+
+- Enable Opus DTX and set default encoding bitrate to 32kbps
+
+- Desktop: Handle failure when entering PiP
+
+- Desktop: Move builds to NPM
+
+- Update dependencies, builds
+
+## v2.22.0
+
+- Group Calls: Only allow ringing if you are the call creator
+
+- Electron: Add callId to the call ended notification function
+
+- Improve display of stats in logs
+
+- Update dependencies
+
+- Electron: Save debug information when building
+
+## v2.21.5
+
+- Group Calls: Improve ring handling
+
+- Group Calls: Update group membership upon unknown media keys
+
+- Improve display of stats in logs
+
+- Update builds and documentation
+
+- Update Rust
+
+## v2.21.4
+
+- iOS: Add isValidOfferMessage and isValidOpaqueRing to the API
+
+## v2.21.3
+
+- iOS: Allow WebRTC field trials to be set
+
+- Update dependencies, builds
+
+## v2.21.2
+
+- Android: Fix possible crash from AndroidNetworkMonitor
+
+- Electron: Update dependencies (neon mainly)
+
+- Reference signalapp/webrtc@5005b
+  - Cherry-pick commits to fix issues
+
+## v2.21.1
+
+- Group Calls: Expose `isHigherResolutionPending` to apps
+
+- Android: Fix race when audio levels change early
+
+- iOS: Set deployment target to 12.2
+
+- Other logging improvements
+
+## v2.21.0
+
+- Update to WebRTC 5005 (m102)
+
+- Allow clients to specify the active speaker's height
+
+- Reference signalapp/webrtc@5005a
+  - Add logging for audio device timing
+
+## v2.20.14
+
+- Reference signalapp/webrtc@4896g
+  - Windows: Support multi-channel output
+
+## v2.20.13
+
+- Android: Remove audio level debug logging
+
+- Group Calls: Expose decoded video height to apps
+
+- Handle out-of-order IceCandidate and Hangup messages
+
+- Turn off backtraces to stderr by default
+
+## v2.20.12
+
+- Group Calls: Prefer recently received group call rings
+
+- Reduce binary size by dropping unicode support from the regex crate
+
+- Enforce that errors are handled on background tokio runtimes
+
+- Update Android builds
+  - Update gradle dependencies
+  - Use `-C linker` instead of ndk toolchains
+
+## v2.20.11
+
+- Add support for TURN over TLS
+
+- Android: Add echo likelihood to logs
+
+- Reference signalapp/webrtc@4896f
+  - Add support for TURN over TLS
+  - Enable echo detection
+
+- Update Rust
+
+- Update builds
+
+## v2.20.10
+
+- Group Calls: Enable audio recording properly
+
+## v2.20.9
+
+- Reference signalapp/webrtc@4896d
+  - Have one default port allocator flags instead of two
+
+## v2.20.8
+
+- Reference signalapp/webrtc@4896c
+  - Remove bitrate multiplier
+
+- Electron: Add logging to video support
+
+## v2.20.7
+
+- Log PeerConnection ICE gathering errors
+
+- Let rust core enable media (playback and recording), not clients
+
+## v2.20.6
+
+- Prioritize VP9 and H.264 hardware codecs for 1:1 calls
+
+- Add more logging for checking connectivity and group call issues
+
+- Update parse_log.py utility for more debugging
+
+- Reference signalapp/webrtc@4896b
+  - Cherry-pick upstream fixes for network crash and iOS audio/logging
+
+- Update Android builds
+
+## v2.20.5
+
+- Fix a deadlock when calling set_network_route
+
+## v2.20.4
+
+- Remove old video frames when re-enabling video
+
+- Use less bandwidth when using TURN relays
+
+- Improve support when developing on M1 chips
+
+- Avoid notifying remote ringing in case of accepted before connected
+
+- Process remote status events received before the call is accepted
+
+- Android: Allow local video recording to be started while ringing
+
+- Reference signalapp/webrtc@4896a
+  - Fix issue with opus frame length for AudioSendStream
+
+- Adjust logging
+
+## v2.20.3
+
+- iOS: Fix mapping of log output
+
+## v2.20.2
+
+- Update to WebRTC 4896 (M100)
+
+- Disable transport-cc for audio
+
+## v2.20.1
+
+- Add VP9 codec support and enable for Android hardware/Electron
+
+- Add state for ConnectingAfterAccepted to fix connect/accept race on caller's end
+
+- Group Calls: Fire peek changed events even if the call is empty
+
+- Reference signalapp/webrtc@4638j
+  - Reduce more noise from error/warning logs
+
+- Update dependencies, builds, and ci
+
+## v2.20.0
+
+- Clean up "lite" interfaces
+
+- Add recall support
+
+- Fix typos
+
+- Add WebRTC error and warning logs to RingRTC logging
+
+- Reference signalapp/webrtc@4638i
+  - Reduce noise from error/warning logs
+
+## v2.19.2
+
+- Introduce a "lite" part of RingRTC
+
+## v2.19.1
+
+- Android: Add default enum for audio processing
+
+## v2.19.0
+
+- Group Calls: Increase max send bitrate for large calls
+
+- Group Calls: Use v2 frontend api and remove notion of endpoint_id
+
+- Reference signalapp/webrtc@4638h
+  - Android: Add Aec3/AecM switch
+  - Windows: Workaround for multi-channel input
+
+- Android: Add aec switch and remove legacy default
+
+- Electron: Bubble up more DemuxIds
+
+- Update Rust and dependencies
+
+## v2.18.1
+
+- Fix group call rate constant
+
+- iOS: Fix audio level api for group calls and tests
+
+## v2.18.0
+
+- Update Audio Level API to specify desired interval
+
+- Electron: Use WebCodecs to capture and send video
+
+- Reference signalapp/webrtc@4638f
+  - Group Calls: Enable 3rd spatial layer for video
+
+- Update dependencies
+
+## v2.17.2
+
+- Electron: Revert new state and fix issue with prering ended handling
+
+## v2.17.1
+
+- Electron: Fix incoming call notifications for better call history
+
+- Reference signalapp/webrtc@4638e
+  - Mac: Fix stereo playout bug
+
+- Update dependencies
+
+## v2.17.0
+
+- Add API to get the incoming and outgoing audio levels
+
+## v2.16.1
+
+- Node: Optimize use of CanvasVideoRenderer.renderVideoFrame
+
+- Node: Update builds and logging
+
+## v2.16.0
+
+- Group Calls: Leave via RTP instead of HTTP
+
+- Group Calls: Don't use DTLS
+
+- Group Calls: Increase default max receive rate
+
+## v2.15.0
+
+- Android: Add audio processing options (to control AEC/NS)
+
+- Android: Improve JNI/Rust interfaces
+
+- Remove legacy Multi-Ring checks and hangup
+
+## v2.14.3
+
+- Avoid handling RTP Data before accepted
+
+- Reference signalapp/webrtc@4638c
+  - Port crash fix
+
+## v2.14.2
+
+- Don't terminate a 1:1 call because of transient RTP data error
+
+- Reference signalapp/webrtc@4638b
+  - Make it possible to share an APM between PeerConnections (ensures AEC/NS operation)
+
+## v2.14.1
+
+- Desktop: Clear out the incoming video frame to avoid rendering old data
+
+- iOS: Delete the dSYMs out of the built xcframework
+
+## v2.14.0
+
+- Update WebRTC to 4638 (M95)
+
+- Further improvements to WebRTC pointer management
+
+- Replace DataChannel with direct RTP data
+
+- Logging/Testing/Build improvements
+
+## v2.13.6
+
+- Use SetAudioPlayout() function for group calls
+
+## v2.13.5
+
+- Improve how WebRTC pointer is tracked across FFI
+
+- Update Rust
+
+- Update dependencies
+
+- Update builds
+
+## v2.13.4
+
+- Electron: Use Neon's Channel to avoid polling for events/logs
+
+- Desktop: Allow logger to be initialized multiple times
+
+- Enable the use of the SetAudioPlayout() function to start playout after accept
+
+- Reference signalapp/webrtc@4389k
+  - Initialize ADM playout before starting
+
+## v2.13.3
+
+- iOS & Android: Pass PeerConnectionFactory down to Rust for group calls
+
+- Desktop: Fix an issue generating device lists on Windows
+
+- Add test client for group calls
+
+- Adjust some interfaces between RingRTC and WebRTC
+
+- Reference signalapp/webrtc@4389j
+  - Cleanup iOS interfaces
+
+## v2.13.2
+
+- Desktop: Update local preview source object correctly
+
+- Android: Build Java against the same SDK/NDK that WebRTC uses
+
+## v2.13.1
+
+- Desktop: Add support for auto-ended call timestamps
+
+- Desktop: Formatting and other updates
+
+- Android: Fix signature for new argument
+
+## v2.13.0
+
+- Desktop: Option to use new or default audio device module on Windows
+
+- Reference signalapp/webrtc@4389i
+  - Support new Windows ADM
+
+- Desktop: Support glare scenarios
+
+- Request updated membership proof for group calls at least once a day
+
+- Request bitrate constraints for group calls according to BandwidthMode
+
+- Fix PeerConnectionFactory leaks
+
+- iOS: Remove dependency on PromiseKit
+
+- Android: Enable a Hardware AEC blocklist and fix a memory leak
+
+- Android: Native PeerConnectionFactory uses AndroidNetworkMonitor and JavaAudioDeviceModule
+
+## v2.12.0
+
+- Enable ICE continual gathering
+
+- Add signaling for the removal of ICE candidates
+
+- Add notifications for network route changes
+
+- Adjust ringing timeout to 60 seconds
+
+- iOS: Fixes to address resource leaks
+
+- Reference signalapp/webrtc@4389h
+  - iOS: AudioSession adjustments for volume issues
+
+- Update builds and documentation
+
+## v2.11.1
+
+- Update Group Ringing feature
+
+## v2.11.0
+
+- Add Group Ringing feature
+
+- Reference signalapp/webrtc@4389f
+
+- Remove DTLS and SDP
+
+## v2.10.8
+
+- Group Calling: Reduce notifications for active speakers
+
+- Android: Modify NDK dependencies and use armv7 instead of arm
+
+- Update logging
+
+## v2.10.7
+
+- iOS: Add support for building for Catalyst
+
+- iOS: Update builds
+
+- Update dependencies
+
+## v2.10.6
+
+- Electron: Use Buffer everywhere we used to use ArrayBuffer
+
+- iOS: Update builds and tests to support M1 iOS simulator
+
+- Update to Rust nightly
+
+## v2.10.5
+
+- Screenshare: Allow screenshare without a camera
+
+## v2.10.4
+
+- Screenshare: Add optimizations
+
+## v2.10.3
+
+- Screenshare: Fix bandwidth for group call
+
+## v2.10.2
+
+- Screenshare: Fix sending of status
+
+## v2.10.1
+
+- Screenshare: Fixes for legacy clients
+
+- Build Fixes: Support older Linux distros and other optimizations
+
+- Reference signalapp/webrtc@4389c
+
+## v2.10.0
+
+- Add Screensharing feature
+
+- Electron: Support alternative target architectures
+
+## v2.9.7
+
+- Electron: Rebuild (no functional changes)
+
+## v2.9.6
+
+- Revert change for shared picture ID in WebRTC
+
+## v2.9.5
+
+- Reference signalapp/webrtc@4389a
+
+- Update dependencies
+
+- Update builds and tests
+
+## v2.9.4
+
+- Add statistics to monitor connection information
+
+- Reference signalapp/webrtc@4183l
+
+- Adjust logging and build issues
+
+## v2.9.3
+
+- Electron: Update neon to use n-api runtime
+
+- CI optimizations and lint improvements
+
+## v2.9.2
+
+- Electron: Update to version 11
+
+- Android: Add setOrientation() API
+
+- Update contributing readme
+
+## v2.9.1
+
+- Electron: Fix Windows build
+
+## v2.9.0
+
+- Add very low bandwidth support for audio
+
+- Remove SCTP
+
+- Update documentation
+
+## v2.8.10
+
+- Android: Fix JNI out of memory issues for large groups
+
+## v2.8.9
+
+- Android: Fix memory issues for Direct Calling
+
+- Electron: Fix issue where camera was not released
+
+## v2.8.8
+
+- iOS: Fix issue when ending a Group Call
+
+## v2.8.7
+
+- Group Calling: Fix issue with video resolution requests
+
+## v2.8.6
+
+- Update Group Calling feature
+
+- Reference signalapp/webrtc@4183h
+
+## v2.8.5
+
+- Android: Improve stability for Group Calling
+
+## v2.8.4
+
+- Update Group Calling feature
+
+## v2.8.3
+
+- Update Group Calling feature
+
+## v2.8.2
+
+- Update Group Calling feature
+
+- Android: Add more devices to hardware encoder blacklist
+
+- Reference signalapp/webrtc@4183g
+
+## v2.8.1
+
+- Electron: Fix video track setting
+
+## v2.8.0
+
+- Add Group Calling feature
+
+- Reference signalapp/webrtc@4183f
+
+- Update Rust dependencies
+
+- Update builds and documentation
+
+## v2.7.4
+
+- Electron: Fix debug build
+
+## v2.7.3
+
+- Refactor calling code (non-functional improvements)
+
+- Update opus codec settings
+
+- Update builds and documentation
+
+## v2.7.2
+
+- Electron: Expose more message types
+
+## v2.7.1
+
+- Reference signalapp/webrtc@4183a
+  - Electron: Should prevent early microphone access
+
+- Electron: Do not stretch video if different resolution
+
+## v2.7.0
+
+- Update Rust dependencies
+
+- Implement "V4" protocol with protobufs; deprecate SDP
+
+- Electron: Improve logging and handling of device selection
+
+## v2.6.0
+
+- Reference signalapp/webrtc@4183
+
+- Implement "V3" protocol; deprecate DTLS
+
+- Fix offer-busy handling and support better glare experience
+
+- Electron: Fix issue when sending busy would end current call
+
+## v2.5.2
+
+- Electron: Mac minimum sdk and os set to 10.10
+
+## v2.5.1
+
+- Electron: Improve device selection on Windows
+
+- Fix message queue issue
+
+## v2.5.0
+
+- Disable processing of incoming RTP before incoming call is accepted
+
+- Electron: A/V device selection support
+
+- Implement low bandwidth mode support
+
+## v2.4.3
+
+- iOS: Update video support
+
+## v2.4.2
+
+- Reference signalapp/webrtc@4147d
+
+## v2.4.1
+
+- Fixes for release
+
+## v2.4.0
+
+- Reference signalapp/webrtc@4147b
+
+- Implement data channel support over RTP; deprecate SCTP
+
+- Add audio statistics logging
+
+- Minor fixes and improvements
+
+## v2.3.1
+
+- Fix for call request support
+
+- Fix to ensure hangups sent
+
+## v2.3.0
+
+- Reference signalapp/webrtc@4103
+
+- Add support for call request permissions
+
+## v2.2.0
+
+- Reference signalapp/webrtc@4044g
+
+- iOS: Remove 32-bit support, require 11.0 target
+
+## v2.1.1
+
+- Reference signalapp/webrtc@4044f
+
+## v2.1.0
+
+- Implement native interface
+
+- Reference signalapp/webrtc@4044e
+
+- Minor API improvements (call, proceed, receivedOffer)
+
+## v2.0.3
+
+- Android: Use video sink for remote video stream
+
+## v2.0.2
+
+- Reference signalapp/webrtc@4044d
+
+## v2.0.1
+
+- Reference signalapp/webrtc@4044c
+  - Fixes a call forking bug
+  - Improves connectivity using PORTALLOCATOR_ENABLE_ANY_ADDRESS_PORTS
+  - Cherry picked updates from WebRTC
+
+- Disable TURN port pruning
+
+- Fix glare handling before connection
+
+## v2.0.0
+
+- Add Multi-Ring feature
+
+- Android: Fix video encoder crash on some devices
+
+- Update build documentation
+
+- Update Rust dependencies
+
+## v1.3.1
+
+- Fix issue preventing some calls from ringing
+
+## v1.3.0
+
+- Update build documentation
+
+- Reference signalapp/webrtc@4044
+
+## v1.2.0
+
+- Move to vendored WebRTC at signalapp/webrtc
+
+- Reference signalapp/webrtc@3987, includes cherry picked updates from WebRTC 4044
+
+## v1.1.0
+
+- Disable unused audio codecs and RTP header extensions
+
+- Adjust settings and logging
+
+- iOS: Minor optimizations
+
+## v1.0.2
+
+- Cherry pick updates from WebRTC 4044
+
+## v1.0.1
+
+- Android: improve logging
+
+## v1.0.0
+
+- Add Call Manager component
+
+## v0.3.3
+
+- Update WebRTC to 3987
+
+- Update Rust dependencies
+
+- iOS: build system improvements
+
+## v0.3.2
+
+- iOS: Fix iOS 13 issue with camera capture
+
+## v0.3.1
+
+- Android: Filter list of cameras when switching cameras
+
+## v0.3.0
+
+- Update WebRTC to m79
+
+- Android: Improve WebRTC debug logging
+
+## v0.2.0
+
+- Improve logging on Android
+
+- Build system improvements
+
+## v0.1.9
+
+- Make termination a two-phase close and dispose operation
+
+## v0.1.8
+
+- Improve logging on Android
+
+- Patch WebRTC M78 for AudioRecord regression
+
+## v0.1.7
+
+- Add integration tests
+
+- Build system fixes and clean up
+
+## v0.1.6
+
+- Android: Use an application supplied logging object
+
+## v0.1.5
+
+- Update WebRTC to m78
+
+- Add integration tests
+
+- Build system fixes and clean up
+
+## v0.1.4
+
+- Update Makefile targets for 'clean' and 'distclean'
+
+- Simplify the IceReconnecting logic
+
+- Remove non-critical DataChannel error callbacks
+
+## v0.1.3
+
+- Add IceReconnectingState
+
+## v0.1.2
+
+- iOS Support
+
+- Update WebRTC to m77
+
+## v0.1.1
+
+- Initial Release
+
+- Based on WebRTC release m76

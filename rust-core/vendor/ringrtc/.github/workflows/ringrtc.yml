@@ -1,0 +1,364 @@
+name: RingRTC CI
+on:
+  push:
+    branches: [ main, 'staging/*' ]
+  pull_request: # all target branches
+
+jobs:
+  code_formatting:
+    name: Code Formatting
+    runs-on: ubuntu-latest-4-cores
+    steps:
+    - uses: actions/checkout@v6
+    - run: rustup toolchain install nightly --profile minimal --component rustfmt
+    - name: Check rust format
+      run: cargo +nightly fmt -- --check
+    - name: Install for node
+      run: npm ci
+      working-directory: src/node
+    - name: Check typescript format
+      run: npm run check-format
+      working-directory: src/node
+
+  lints:
+    name: Lints
+    runs-on: ubuntu-latest-4-cores
+    steps:
+    - name: Install deps
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libpulse-dev
+    - name: Install Python tools
+      run: pip3 install flake8 mypy
+    - uses: actions/checkout@v6
+    - name: Cargo Cache
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-targets: "false"
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --component clippy --target aarch64-linux-android,aarch64-apple-ios
+    - name: Install extra Rust tools
+      run: cargo +stable install --version 0.8.4 --locked cargo-about
+    - run: shellcheck **/*.sh bin/build-aar bin/build-desktop bin/build-ios bin/build-javadoc bin/build-rustdoc bin/fetch-artifact bin/gsync-webrtc bin/prepare-workspace bin/rust-lint-check bin/set-up-for-cocoapods src/rust/scripts/run-tests
+    # Skip the Python scripts not written with flake8 style. (Try not to add more.)
+    # We ignore 503; it's contradictory with 504!
+    # https://www.flake8rules.com/rules/W503.html, https://www.flake8rules.com/rules/W504.html
+    # E501 is line length >79.
+    - run: cd bin && python3 -m flake8 . --exclude measure-cpu.py --ignore=W503,E501
+    - name: Set up mypy types
+      run: mkdir .mypy_cache/
+    # Only include typed Python scripts here.
+    - run: python3 -m mypy --python-version 3.13 --strict bin/convert_webrtc_acknowledgments.py bin/fetch-artifact.py
+    - name: Check acknowledgments
+      run: ./bin/regenerate_acknowledgments.sh && git diff --name-status --exit-code acknowledgments
+    - name: Clippy
+      run: cargo clippy --all-targets -- -D warnings
+    - name: Clippy (with sim)
+      run: cargo clippy --all-targets --features sim -- -D warnings
+    - name: Clippy (Android & iOS)
+      run: cargo clippy --package ringrtc --target aarch64-linux-android --target aarch64-apple-ios -- -D warnings
+    - name: Clippy (Electron)
+      run: cargo clippy --package ringrtc --features electron,virtual_audio -- -D warnings
+    - name: Clippy (group_call)
+      run: cargo clippy --package ringrtc --bin group_call --features native,sim_http -- -D warnings
+    - name: Clippy (call_link)
+      run: cargo clippy --package ringrtc --bin call_link --features uuid,sim,sim_http,rand/chacha -- -D warnings
+    - name: Clippy (call_sim-cli)
+      run: cargo clippy --package ringrtc --bin call_sim-cli --features call_sim -- -D warnings
+    - name: Clippy (call_sim)
+      run: cargo clippy --package call_sim -- -D warnings
+    - name: Clippy (mrp)
+      run: cargo clippy --package mrp -- -D warnings
+    - name: Clippy (protobuf)
+      run: cargo clippy --package protobuf --features call_sim -- -D warnings
+    - name: Clippy (signaling_server)
+      run: cargo clippy -- -D warnings
+      working-directory: call_sim/docker/signaling_server
+    - name: Clippy (direct)
+      run: cargo clippy --package ringrtc --bin direct --features=direct
+    - name: Install for node
+      run: npm ci
+      working-directory: src/node
+    - name: Check typescript
+      run: npm run oxlint
+      working-directory: src/node
+    - name: Check package.json for prebuildChecksum
+      run: >-
+        grep -q '"prebuildChecksum": ""' package.json
+      working-directory: src/node
+    - name: Compare package.json and package-lock.json versions
+      run: >
+        PKG_OG=$(jq -r .version package.json);
+        PKG_LOCK=$(jq -r .version package-lock.json);
+        if [ "$PKG_OG" != "$PKG_LOCK" ]; then
+          echo "package.json and package-lock.json versions do not match";
+          exit 1;
+        fi
+      working-directory: src/node
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest-4-cores
+    steps:
+    - name: Install deps
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libpulse-dev
+    - uses: actions/checkout@v6
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal
+    - name: Run rust tests
+      run: cd src/rust && ./scripts/run-tests
+
+  electron:
+    name: Electron Tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest-4-cores, windows-latest-8-cores, macos-latest, ubuntu-24.04-arm64-4-cores]
+    runs-on: ${{ matrix.os }}
+    outputs:
+      macos_size_bytes: ${{ steps.get_size.outputs.darwin_libringrtc-arm64_size }}
+      base_macos_size_bytes: ${{ steps.get_size.outputs.base_darwin_libringrtc-arm64_size }}
+      ubuntu_x64_size_bytes: ${{ steps.get_size.outputs.linux_libringrtc-x64_size }}
+      base_ubuntu_x64_size_bytes: ${{ steps.get_size.outputs.base_linux_libringrtc-x64_size }}
+      ubuntu_arm64_size_bytes: ${{ steps.get_size.outputs.linux_libringrtc-arm64_size }}
+      base_ubuntu_arm64_size_bytes: ${{ steps.get_size.outputs.base_linux_libringrtc-arm64_size }}
+      windows_size_bytes: ${{ steps.get_size.outputs.win32_libringrtc-x64_size }}
+      base_windows_size_bytes: ${{ steps.get_size.outputs.base_win32_libringrtc-x64_size }}
+    defaults:
+      run:
+        shell: bash # as opposed to PowerShell
+    steps:
+    - name: Install dependencies
+      run: |
+        if [[ "${{ runner.os }}" == "macOS" ]]; then
+          brew install protobuf coreutils
+        elif [[ "${{ runner.os }}" == "Linux" ]]; then
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream && sudo apt-get update && sudo apt-get install -y protobuf-compiler libpulse-dev libpulse0 pipewire && systemctl --user daemon-reload && systemctl --user --now enable pipewire pipewire-pulse
+        fi
+    - uses: actions/checkout@v6
+    - uses: actions/setup-node@v6
+      with:
+        node-version-file: 'src/node/.nvmrc'
+    - name: Install Protoc for Windows
+      uses: ./.github/actions/install-protoc
+      if: ${{ runner.os == 'Windows' }}
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal
+    - run: USE_PREBUILD=1 TYPE=release TEST_RINGRTC_ADM=yes make electron
+      if: ${{ runner.os != 'Windows' }}
+    - run: USE_PREBUILD=1 TYPE=release TEST_RINGRTC_ADM_UTILS=yes make electron
+      if: ${{ runner.os == 'Windows' }}
+
+    - name: Get cached base sizes
+      id: cache-base
+      uses: actions/cache/restore@v6  # Read-only
+      with:
+        path: base_sizes.txt
+        key: ${{ matrix.os }}-sizes-${{ github.event.pull_request.base.sha }}
+      if: ${{ github.event_name == 'pull_request' }}
+
+    - name: Get size
+      id: get_size
+      env:
+        GENERATE_BASE: ${{ case( github.event_name == 'push', 'y', 'n') }}
+        BASE_PATH: 'base_sizes.txt'
+      run: ./bin/github-actions-helpers.sh output_desktop_size
+
+    - name: Save sizes for push
+      uses: actions/cache/save@v6
+      with:
+        path: base_sizes.txt
+        key: ${{ matrix.os }}-sizes-${{ github.event.after }}
+      if: ${{ github.event_name == 'push' }}
+
+    - run: npm ci
+      working-directory: src/node
+    - run: npm run build
+      working-directory: src/node
+    - run: xvfb-run --auto-servernum npm test -- --no-sandbox
+      if: ${{ runner.os == 'Linux' }}
+      working-directory: src/node
+    - run: npm test
+      if: ${{ runner.os != 'Linux' }}
+      working-directory: src/node
+
+  cargo_build_using_prebuilt:
+    name: RingRTC as dependency (using Prebuilt WebRTC)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest-4-cores, macos-latest, windows-latest-8-cores, ubuntu-24.04-arm64-4-cores]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash # as opposed to PowerShell
+    steps:
+    - name: Install dependencies
+      run: |
+        if [[ "${{ runner.os }}" = "macOS" ]]; then
+          brew install protobuf coreutils
+        elif [[ "${{ runner.os }}" == "Linux" ]]; then
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler libpulse-dev
+        fi
+    - uses: actions/checkout@v6
+    - uses: actions/setup-node@v6
+      with:
+        node-version-file: 'src/node/.nvmrc'
+    - name: Install Protoc for Windows
+      uses: ./.github/actions/install-protoc
+      if: ${{ runner.os == 'Windows' }}
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal
+    - run: cargo build -p ringrtc --features prebuilt_webrtc
+
+  android:
+    name: Android Build
+    runs-on: ubuntu-latest-4-cores
+    outputs:
+      android_arm64_rffi_size_bytes: ${{ steps.get_size.outputs.android_arm64_rffi_size }}
+      base_android_arm64_rffi_size_bytes: ${{ steps.get_size.outputs.base_android_arm64_rffi_size }}
+      android_arm64_ringrtc_size_bytes: ${{ steps.get_size.outputs.android_arm64_ringrtc_size }}
+      base_android_arm64_ringrtc_size_bytes: ${{ steps.get_size.outputs.base_android_arm64_ringrtc_size }}
+    steps:
+    - name: Install protoc
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+    - uses: actions/checkout@v6
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --target aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+    - name: set up JDK 21
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: 21
+    - run: USE_PREBUILD=1 TYPE=release make android
+
+    - name: Get cached base sizes
+      id: cache-base
+      uses: actions/cache/restore@v6  # Read-only
+      with:
+        path: base_sizes.txt
+        key: android-sizes-${{ github.event.pull_request.base.sha }}
+      if: ${{ github.event_name == 'pull_request' }}
+
+    - name: Get size
+      id: get_size
+      env:
+        GENERATE_BASE: ${{ case( github.event_name == 'push', 'y', 'n') }}
+        BASE_PATH: 'base_sizes.txt'
+        RINGRTC_ARCH: 'arm64'
+      run: ./bin/github-actions-helpers.sh output_android_size
+
+    - name: Save sizes for push
+      uses: actions/cache/save@v6
+      with:
+        path: base_sizes.txt
+        key: android-sizes-${{ github.event.after }}
+      if: ${{ github.event_name == 'push' }}
+
+    # For hardware acceleration for android emulator; see https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/
+    - name: Enable KVM group perms
+      run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+    # From reactivecircus/android-emulator-runner
+    - name: AVD cache
+      uses: actions/cache@v5
+      id: avd-cache
+      with:
+        path: |
+          ~/.android/avd/*
+          ~/.android/adb*
+        key: avd-x86_64-23-linux
+
+    - name: Create AVD and generate snapshot for caching
+      if: steps.avd-cache.outputs.cache-hit != 'true'
+      uses: reactivecircus/android-emulator-runner@e89f39f1abbbd05b1113a29cf4db69e7540cae5a # v2.37.0
+      with:
+        arch: x86_64
+        api-level: 23
+        force-avd-creation: false
+        emulator-options: -no-window -noaudio -no-boot-anim
+        script: echo "Generated AVD snapshot for caching."
+
+    - name: Run tests
+      uses: reactivecircus/android-emulator-runner@e89f39f1abbbd05b1113a29cf4db69e7540cae5a # v2.37.0
+      with:
+        arch: x86_64
+        api-level: 23
+        force-avd-creation: false
+        emulator-options: -no-snapshot-save -no-window -noaudio -no-boot-anim
+        # It is correct that we use *debug*RingrtcLibDir below (specified by connectedCheck),
+        # even though we are using *release* artifacts.
+        script: ./gradlew ringrtc:android:connectedCheck -PdebugRingrtcLibDir=${{ github.workspace }}/out/release/libs -PwebrtcJar=${{ github.workspace }}/out/release/libs/libwebrtc.jar
+
+  ios:
+    name: iOS Tests
+    runs-on: macos-latest-xlarge
+    steps:
+    - uses: actions/checkout@v6
+    - run: brew install protobuf coreutils # for grealpath
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --target aarch64-apple-ios-sim
+    - run: cargo install cbindgen
+    - run: sudo xcodes select $(cat src/ios/SignalRingRTC/.xcode-version)
+    - run: USE_PREBUILD=1 TYPE=release HOST_SIM_ONLY=yes make ios
+    - run: pod install
+      working-directory: src/ios/SignalRingRTC
+    # Pick a phone model here that's likely to work on recent Xcodes.
+    - run: xcodebuild test -workspace SignalRingRTC.xcworkspace -scheme SignalRingRTC -destination 'platform=iOS Simulator,name=iPhone 17'
+      working-directory: src/ios/SignalRingRTC
+      env:
+        TEST_RUNNER_RINGRTC_MAX_LOG_LEVEL: 2 # warnings only
+
+  test_binaries:
+    name: Build test binaries
+    runs-on: ubuntu-latest-4-cores
+    steps:
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libpulse-dev libpulse0
+    - uses: actions/checkout@v6
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal
+    - name: Build direct
+      run: USE_PREBUILD=1 TYPE=release make direct
+    - name: Build gctc
+      run: USE_PREBUILD=1 TYPE=release make gctc
+    - name: Build call_sim-cli
+      run: USE_PREBUILD=1 TYPE=release make call_sim-cli
+
+  ringrtc_size:
+    name: RingRTC Size comparison
+    runs-on: ubuntu-latest-4-cores
+    needs: [electron, android]
+    if: ${{ github.event_name == 'pull_request' }}
+
+    permissions:
+      contents: read
+      pull-requests: write  # to comment on the PR
+
+    steps:
+      - uses: actions/checkout@v6  # grab the script
+      - name: Generate report
+        id: generate_report
+        env:
+          MACOS_SIZE: ${{ needs.electron.outputs.macos_size_bytes }}
+          BASE_MACOS_SIZE: ${{ needs.electron.outputs.base_macos_size_bytes }}
+          UBUNTU_X64_SIZE: ${{ needs.electron.outputs.ubuntu_x64_size_bytes }}
+          BASE_UBUNTU_X64_SIZE: ${{ needs.electron.outputs.base_ubuntu_x64_size_bytes }}
+          UBUNTU_ARM64_SIZE: ${{ needs.electron.outputs.ubuntu_arm64_size_bytes }}
+          BASE_UBUNTU_ARM64_SIZE: ${{ needs.electron.outputs.base_ubuntu_arm64_size_bytes }}
+          WINDOWS_SIZE: ${{ needs.electron.outputs.windows_size_bytes }}
+          BASE_WINDOWS_SIZE: ${{ needs.electron.outputs.base_windows_size_bytes }}
+          ANDROID_ARM64_RFFI_SIZE: ${{ needs.android.outputs.android_arm64_rffi_size_bytes }}
+          BASE_ANDROID_ARM64_RFFI_SIZE: ${{ needs.android.outputs.base_android_arm64_rffi_size_bytes }}
+          ANDROID_ARM64_RINGRTC_SIZE: ${{ needs.android.outputs.android_arm64_ringrtc_size_bytes }}
+          BASE_ANDROID_ARM64_RINGRTC_SIZE: ${{ needs.android.outputs.base_android_arm64_ringrtc_size_bytes }}
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
+        run: ./bin/github-actions-helpers.sh print_table
+      - name: Find comment
+        uses: peter-evans/find-comment@v4
+        id: find-comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-includes: identifying_ringrtc_size_comment_string
+      - name: Post comment
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          body: ${{steps.generate_report.outputs.ringrtc_size_delta_report}}
+          edit-mode: replace
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          token: ${{ secrets.GITHUB_TOKEN }}

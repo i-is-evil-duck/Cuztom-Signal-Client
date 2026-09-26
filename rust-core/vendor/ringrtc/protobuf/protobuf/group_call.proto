@@ -1,0 +1,220 @@
+/*
+ * Copyright 2019-2021 Signal Messenger, LLC
+ * SPDX-License-Identifier: AGPL-3.0-only
+*/
+
+syntax = "proto2";
+
+package group_call;
+
+// Header for an MRPStream
+message MRPHeader {
+  optional uint64 seqnum = 1;
+
+  optional uint64 ack_num = 2;
+
+  optional uint32 num_packets = 3;
+}
+
+// Sent over RTP data.
+ message RemoteMuteRequest {
+   optional uint32 target_demux_id = 1;
+ }
+
+message DeviceToDevice {
+  // Sent over signaling
+  message MediaKey {
+    optional uint32 ratchet_counter = 1;
+    optional bytes secret = 2;
+    optional uint32 demux_id = 3;
+  }
+
+  // Sent over RTP data
+  message Heartbeat {
+    optional bool audio_muted = 1;
+    optional bool video_muted = 2;
+    optional bool presenting = 3;
+    optional bool sharing_screen = 4;
+    optional uint32 muted_by_demux_id = 5;
+  }
+
+  // Sent over RTP data *and* signaling
+  message Leaving {
+    // When sent over signaling, you must indicate which device is leaving.
+    optional uint32 demux_id = 1;
+  }
+
+  // Sent over RTP data
+  message Reaction {
+    optional string value = 1;
+  }
+
+  optional bytes group_id = 1;
+  optional MediaKey media_key = 2;
+  optional Heartbeat heartbeat = 3;
+  optional Leaving leaving = 4;
+  optional Reaction reaction = 5;
+  optional RemoteMuteRequest remote_mute_request = 6;
+}
+
+message DeviceToSfu {
+  message VideoRequestMessage {
+    message VideoRequest {
+      optional uint32 height = 2;
+      optional fixed32 demux_id = 3;
+    }
+
+    repeated VideoRequest requests = 1;
+    reserved 2; // tag 2 was previously "max_count", which is no longer used
+    optional uint32 max_kbps = 3;
+    optional uint32 active_speaker_height = 4;
+  }
+
+  message LeaveMessage {}
+
+  // A generic message type for any action that only needs a "target". Protobuf's encoding doesn't
+  // include message types, so actions can start out using GenericAdminAction and switch to a
+  // dedicated message type as needed.
+  message GenericAdminAction {
+    optional fixed32 target_demux_id = 1;
+  }
+
+  message RaiseHand {
+    optional bool raise = 1;
+    optional uint32 seqnum = 2;
+  }
+
+  optional VideoRequestMessage video_request = 1;
+  optional LeaveMessage leave = 2;
+
+  // Grouped to save space in-memory.
+  oneof admin_action {
+    GenericAdminAction approve = 3;
+    GenericAdminAction deny = 4;
+    GenericAdminAction remove = 5;
+    GenericAdminAction block = 6;
+  }
+
+  optional RaiseHand raise_hand = 7;
+
+  optional MRPHeader mrp_header = 8;
+
+  // Used to pass through DeviceToSfu messages that are too large for one frame
+  // Used in conjunction with MrpHeader::content_length where first packet has content_length
+  // and the rest of the packets only have content and MrpHeader specified. Reassembled
+  // on the receiver side
+  optional bytes content = 9;
+
+  message ClientError {
+    message DecryptionError {
+      optional fixed32 sender_demux_id = 1;
+      optional uint32 count = 2;
+      // Unix timestamp in milliseconds of first error
+      optional uint64 start_ts = 3;
+      // Unix timestamp in milliseconds of last error
+      optional uint64 last_ts = 4;
+    }
+
+    oneof error {
+      DecryptionError decryption = 1;
+    }
+  }
+  message StatsReport {
+    repeated ClientError client_errors = 1;
+  }
+
+  optional StatsReport stats = 10;
+}
+
+message SfuToDevice {
+  message PeekInfo {
+    message PeekDeviceInfo {
+      optional fixed32 demux_id = 1;
+      optional string opaque_user_id = 2;
+      optional bool  requires_svc = 3;
+    }
+
+    enum CallLinkRestrictions {
+      NONE = 0;
+      ADMIN_APPROVAL = 1;
+    }
+
+    message CallLinkState {
+      optional string encrypted_name = 1;
+      optional CallLinkRestrictions restrictions = 2;
+      optional bool revoked = 3;
+      optional uint64 expiration_unix_timestamp = 4;
+    }
+
+    optional string era_id = 1;
+    optional uint32 max_devices = 2;
+    optional string creator = 3;
+
+    repeated PeekDeviceInfo devices = 4;
+    repeated PeekDeviceInfo pending_devices = 5;
+    optional CallLinkState call_link_state = 6;
+  }
+
+  message SendEndorsementsResponse {
+    // The GroupSendEndorsementResponse serialized by libsignal
+    optional bytes serialized = 1;
+    repeated bytes member_ciphertexts = 2;
+  }
+
+  message DeviceJoinedOrLeft {
+    optional PeekInfo peek_info = 1;
+  }
+ 
+  message Speaker {
+   optional fixed32 demux_id = 2;
+  }
+ 
+  // The resolution the SFU wants you to send to it to satisfy the requests
+  // of all of the other devices.
+  message VideoRequest {
+    optional uint32 height = 1;
+  }
+
+  message CurrentDevices {
+    repeated uint32 demux_ids_with_video = 1;
+    repeated fixed32 all_demux_ids       = 2;
+    repeated uint32 allocated_heights    = 3;
+  }
+
+  message Stats {
+    // server => client rate given by congestion control
+    optional uint32 target_send_rate_kbps = 1;
+    // server => client ideal rate
+    optional uint32 ideal_send_rate_kbps = 2;
+    // server => client rate allocated (likely less than target_send_rate_kbps)
+    optional uint32 allocated_send_rate_kbps = 3;
+  }
+
+  message Removed {}
+
+  message RaisedHands {
+    repeated fixed32 demux_ids = 1;
+    repeated uint32 seqnums = 2;
+    optional uint32 target_seqnum = 3;
+  }
+
+  reserved 1;
+  optional VideoRequest video_request               = 2;
+  reserved 3;
+  optional Speaker speaker                          = 4;
+  reserved 5;
+  optional DeviceJoinedOrLeft device_joined_or_left = 6;
+  optional CurrentDevices current_devices           = 7;
+  optional Stats stats                              = 8;
+  optional Removed removed                          = 9;
+  optional RaisedHands raised_hands                 = 10;
+  optional MRPHeader mrp_header                     = 11;
+
+  // Used to pass through SfuToDevice messages that are too large for one frame
+  // Used in conjunction with MrpHeader::content_length where first packet has content_length
+  // and the rest of the packets only have content and MrpHeader specified. Reassembled
+  // on the receiver side
+  optional bytes content                            = 12;
+
+  optional SendEndorsementsResponse endorsements    = 13;
+}

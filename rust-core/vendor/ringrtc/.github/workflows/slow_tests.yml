@@ -1,0 +1,145 @@
+name: Slow Tests
+
+on:
+  schedule:
+    # "High load times include the start of every hour.
+    #  To decrease the chance of delay, schedule your workflow to run
+    #  at a different time of the hour."
+    # We pick 8:25 UTC, aiming for "later than PST/UTC-8 night work" and
+    # "earlier than ADT/UTC-3 morning work".
+    - cron: '25 8 * * *'
+  workflow_dispatch: {} # no parameters
+  workflow_call: {} # no parameters
+
+jobs:
+  check-up-to-date:
+    name: Already up to date?
+    runs-on: ubuntu-latest-4-cores
+    if: ${{ github.event_name == 'schedule' && github.repository_owner == 'signalapp' && endsWith(github.repository, '-private') }}
+    outputs:
+      has-changes: ${{ steps.check.outputs.has-changes }}
+    steps:
+    - uses: actions/checkout@v6
+    - run: git log --after '24 hours ago' --exit-code || echo 'has-changes=true' >> $GITHUB_OUTPUT
+      id: check
+
+  ios:
+    name: Build for all iOS targets
+    runs-on: macos-latest
+    needs: [check-up-to-date]
+    if: ${{ always() && (needs.check-up-to-date.outputs.has-changes || github.event_name != 'schedule') }}
+
+    steps:
+    - uses: actions/checkout@v6
+    - run: brew install protobuf coreutils # for grealpath
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --target x86_64-apple-ios,aarch64-apple-ios,aarch64-apple-ios-sim --component rust-src
+    - run: cargo install cbindgen
+    - run: sudo xcodes select $(cat src/ios/SignalRingRTC/.xcode-version)
+    - run: bin/fetch-artifact -p ios
+    - run: bin/build-ios --release --ringrtc-only
+
+  report_failures:
+    name: Report Failures
+    runs-on: ubuntu-latest-4-cores
+    needs: [ios, sim_profile]
+    if: ${{ failure() && github.event_name == 'schedule' }}
+
+    permissions:
+      # createCommitComment is supposed to only need the default 'read' permissions...
+      # ...but maybe it's different for private repositories.
+      contents: write
+      issues: write
+
+    steps:
+    - uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.repos.createCommitComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            commit_sha: context.sha,
+            body: 'Failed Slow Tests: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}>'
+          })
+    - name: Create github issue
+      run: |
+        gh issue create \
+            --title "Slow tests failure on $(date -I)" \
+            --body "Failed Slow Tests: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}>"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+
+
+  sim_profile:
+    name: Simulator profiling
+    permissions:
+      # Needed for google-github-actions/auth.
+      id-token: 'write'
+      contents: read
+    runs-on: ubuntu-latest-4-cores
+    needs: [check-up-to-date]
+    if: ${{ always() && (needs.check-up-to-date.outputs.has-changes || github.event_name != 'schedule') }}
+    steps:
+      - name: Install dependencies
+        run: sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream && sudo apt-get update && sudo apt-get install -y protobuf-compiler libpulse-dev libpulse0 pipewire libfontconfig1-dev && systemctl --user daemon-reload && systemctl --user --now enable pipewire pipewire-pulse
+      - uses: actions/checkout@v6
+      - name: gcloud auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: 'projects/741367068918/locations/global/workloadIdentityPools/github/providers/github-actions'
+          service_account: 'github-actions@signal-build-artifacts.iam.gserviceaccount.com'
+      - run: rustup toolchain install $(cat rust-toolchain) --profile minimal
+      - name: Build call sim
+        run: USE_PREBUILD=1 TYPE=release make call_sim-cli
+      - name: Get media files
+        run: mkdir media && gcloud storage cp gs://calling-ci-resources.signal.org/* media
+        working-directory: call_sim/
+      - name: Run call sim
+        run: cargo run --release -- profiling_suite -b -c --profile --skip-visqol-mos-build
+        working-directory: call_sim/
+      - name: Get comparison points
+        run: gcloud storage cp gs://calling-ci-profiling.signal.org/baseline_*.folded $(gcloud storage ls gs://calling-ci-profiling.signal.org/daily_audio* | head -n1) $(gcloud storage ls gs://calling-ci-profiling.signal.org/daily_video* | head -n1)  test_results/profiling_suite-*/perf_test
+        working-directory: call_sim/
+      - run: cargo install inferno
+      - name: Generate baseline comparisons
+        run: |
+          cd test_results/profiling_suite-*/perf_test
+          inferno-diff-folded baseline_video.folded video-speaker_b-none/client_b.stacks.folded | inferno-flamegraph > video-speaker_b-none/baseline_diff.svg
+          inferno-diff-folded video-speaker_b-none/client_b.stacks.folded baseline_video.folded | inferno-flamegraph --negate > video-speaker_b-none/baseline_diff_inverted.svg
+          inferno-diff-folded baseline_audio.folded audio-speaker_b-none/client_b.stacks.folded | inferno-flamegraph > audio-speaker_b-none/baseline_diff.svg
+          inferno-diff-folded audio-speaker_b-none/client_b.stacks.folded baseline_audio.folded | inferno-flamegraph --negate > audio-speaker_b-none/baseline_diff_inverted.svg
+        working-directory: call_sim/
+      - name: Generate latest comparisons
+        run: |
+          cd test_results/profiling_suite-*/perf_test
+          inferno-diff-folded daily_video_*.folded video-speaker_b-none/client_b.stacks.folded | inferno-flamegraph > video-speaker_b-none/daily_diff.svg
+          inferno-diff-folded video-speaker_b-none/client_b.stacks.folded daily_video_*.folded | inferno-flamegraph --negate > video-speaker_b-none/daily_diff_inverted.svg
+          inferno-diff-folded daily_audio_*.folded audio-speaker_b-none/client_b.stacks.folded | inferno-flamegraph > audio-speaker_b-none/daily_diff.svg
+          inferno-diff-folded audio-speaker_b-none/client_b.stacks.folded daily_audio_*.folded | inferno-flamegraph --negate > audio-speaker_b-none/daily_diff_inverted.svg
+        working-directory: call_sim/
+      - name: Upload new folded stack files
+        if: ${{ github.event_name == 'schedule' && github.repository_owner == 'signalapp' && endsWith(github.repository, '-private') }}
+        run: |
+          cd test_results/profiling_suite-*/perf_test
+          rm daily_*.folded  # Don't try to reupload what we just downloaded
+          cp video-speaker_b-none/client_b.stacks.folded daily_video_$(date -I).folded
+          cp audio-speaker_b-none/client_b.stacks.folded daily_audio_$(date -I).folded
+          gcloud storage cp daily_video_*.folded daily_audio_*.folded gs://calling-ci-profiling.signal.org/
+        working-directory: call_sim/
+      - name: Clean up downloaded folded stacks
+        run: |
+          cd test_results/profiling_suite-*/perf_test
+          rm *.folded
+        working-directory: call_sim/
+      - name: Remove media files
+        run: find test_results \( -name '*.yuv' -o -name '*.wav' -o -name '*.raw' -o -name '*.mp4' \) -exec rm -f {} \;
+        working-directory: call_sim/
+      - name: Compress
+        run: tar czf test_results.tgz test_results/
+        working-directory: call_sim/
+      - name: Upload Perf artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: call_sim/test_results.tgz
+          retention-days: 30

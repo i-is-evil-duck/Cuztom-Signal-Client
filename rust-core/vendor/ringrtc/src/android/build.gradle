@@ -1,0 +1,167 @@
+plugins {
+    id 'com.android.library' version '9.1.1'
+    id 'maven-publish'
+    id 'signing'
+}
+
+repositories {
+    google()
+    mavenCentral()
+    mavenLocal()
+}
+
+ext.debug_jni_lib_dirs   = project.hasProperty("debugRingrtcLibDir") ? [debugRingrtcLibDir] : ["jniLibs"]
+ext.release_jni_lib_dirs = project.hasProperty("releaseRingrtcLibDir") ? [releaseRingrtcLibDir] : ["jniLibs"]
+ext.webrtc_jar           = project.hasProperty("webrtcJar") ? webrtcJar : "libs/libwebrtc.jar"
+ext.asset_dir            = project.hasProperty("assetDir") ? assetDir : "assets"
+
+base {
+    archivesName = "ringrtc-android"
+}
+
+android {
+    namespace = 'org.signal.ringrtc'
+
+    compileSdk = 34
+
+    defaultConfig {
+        minSdk = 21
+        targetSdk = 33
+        versionName = ringrtcVersion
+        consumerProguardFiles "proguard-rules.pro"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    sourceSets {
+        release {
+            jniLibs.srcDirs = release_jni_lib_dirs
+            java.srcDirs = ['api/']
+            assets.srcDirs = [asset_dir]
+        }
+        debug {
+            jniLibs.srcDirs = debug_jni_lib_dirs
+            java.srcDirs = ['api/']
+            assets.srcDirs = [asset_dir]
+        }
+    }
+
+    compileOptions {
+        coreLibraryDesugaringEnabled = true
+    }
+
+    packaging {
+        // Libraries are already stripped if necessary when linked.
+        jniLibs.keepDebugSymbols.add('**/*.so')
+    }
+
+    publishing {
+        singleVariant("release")
+    }
+}
+
+dependencies {
+    api files(webrtc_jar)
+    api 'androidx.annotation:annotation:1.10.0'
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'
+    androidTestImplementation "androidx.test:runner:1.5.0"
+    androidTestImplementation "androidx.test:core:1.5.0"
+    androidTestImplementation "org.mockito:mockito-android:5.12.0"
+}
+
+tasks.register('javadoc', Javadoc) {
+    source = fileTree(dir: 'api', include: '**/*.java')
+    failOnError = false
+    if (project.hasProperty('docsDir')) {
+        destinationDir = new File(docsDir, 'javadoc')
+    }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType('release')) { variant ->
+        tasks.named('javadoc').configure { task ->
+            task.classpath = files(androidComponents.sdkComponents.bootClasspath) +
+                project.configurations.named("${variant.name}CompileClasspath").get()
+        }
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            mavenJava(MavenPublication) {
+                from components.release
+
+                group = 'org.signal'
+                artifactId = base.archivesName.get()
+                version = ringrtcVersion
+
+                pom {
+                    name = 'ringrtc-android'
+                    packaging = 'aar'
+                    description = 'RingRTC for Android'
+                    url = 'https://github.com/signalapp/ringrtc/'
+
+                    scm {
+                        url = 'https://github.com/signalapp/ringrtc/'
+                        connection = 'scm:git:git@github.com:signalapp/ringrtc.git'
+                        developerConnection = 'scm:git:git@github.com:signalapp/ringrtc.git'
+                    }
+
+                    licenses {
+                        license {
+                            name = 'AGPL-3.0-only'
+                            url = 'https://www.gnu.org/licenses/agpl-3.0.txt'
+                            distribution = 'repo'
+                        }
+                    }
+
+                    developers {
+                        developer {
+                            name = 'Calling Team'
+                            organizationUrl = 'https://www.signal.org/'
+                        }
+                    }
+                }
+            }
+        }
+
+        repositories {
+            maven {
+                name = "SignalBuildArtifacts"
+                // We can't use Gradle's built-in GCS support with the way we authenticate
+                // GitHub Actions. Fortunately, GCS's REST APIs are basically just normal HTTP
+                // GET/PUT with an auth token, which is compatible with what Gradle will do.
+                url = uri("https://storage.googleapis.com/build-artifacts.signal.org/libraries/maven")
+                credentials(HttpHeaderCredentials) {
+                    name = "Authorization"
+                    value = "Bearer ${System.getenv("CLOUDSDK_AUTH_ACCESS_TOKEN") ?: ""}"
+                }
+                authentication {
+                    header(HttpHeaderAuthentication)
+                }
+            }
+        }
+    }
+
+    signing {
+        required = { isReleaseVersion && gradle.taskGraph.hasTask(getPath() + ":publish") }
+
+        def signingKeyId = findProperty("signingKeyId")
+        def signingKey = findProperty("signingKey")
+        def signingPassword = findProperty("signingPassword")
+        if (signingKeyId != null && signingKey != null && signingPassword != null) {
+            useInMemoryPgpKeys(signingKeyId.trim(), signingKey.trim(), signingPassword.trim())
+        }
+
+        sign publishing.publications.mavenJava
+    }
+}
+
+tasks.register('version') {
+    group = 'Info'
+    description = 'Prints the versions as read from the version config file.'
+    doLast {
+        println "RingRTC version: " + ringrtcVersion
+        println "WebRTC version : " + project.webrtc_version
+    }
+}

@@ -1,0 +1,3973 @@
+//
+// Copyright 2023 Signal Messenger, LLC
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+
+use std::{collections::HashMap, fmt::Write, str::FromStr};
+
+use anyhow::{Result, anyhow};
+use itertools::Itertools;
+use log::{error, info};
+use plotters::{
+    backend::SVGBackend,
+    chart::ChartBuilder,
+    drawing::IntoDrawingArea,
+    element::Circle,
+    prelude::IntoSegmentedCoord,
+    series::{Histogram, LineSeries},
+    style::{Color, IntoFont, RGBColor, full_palette::WHITE},
+};
+use regex::Regex;
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    task::JoinSet,
+};
+
+use crate::{
+    common::{
+        ChartDimension, GroupConfig, NetworkConfigWithOffset, NetworkProfile, TestCaseConfig,
+    },
+    test::{AudioTestResults, GroupRun, Sound, TestCase},
+};
+
+// Chart colors.
+const DIM_GRAY: RGBColor = RGBColor(105, 105, 105);
+const VERY_LIGHT_GRAY: RGBColor = RGBColor(250, 250, 250);
+const STEEL_BLUE: RGBColor = RGBColor(70, 130, 180);
+
+type ChartPoint = (f32, f32);
+
+#[derive(Debug, Clone)]
+pub enum LineShape {
+    Linear,
+    Hv,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatsConfig {
+    pub title: String,
+    pub chart_name: String,
+    pub x_label: String,
+    pub y_label: String,
+    pub x_min: Option<f32>,
+    /// By default, charts will use the StatsData.points.len for x_max.
+    pub x_max: Option<f32>,
+    pub y_min: Option<f32>,
+    /// By default, charts will use the StatsData.overall_max + 10% for y_max.
+    pub y_max: Option<f32>,
+    /// Line presentation, the default is `Linear`, which connects each point to the
+    /// next. Some charts look better with the `Hv` type, which maintains its value until
+    /// the next point along the x-axis.
+    pub line_shape: LineShape,
+    /// Whether to show a total alongside min/max/ave for counting stats.
+    pub show_total: bool,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            title: "".to_string(),
+            chart_name: "".to_string(),
+            x_label: "".to_string(),
+            y_label: "".to_string(),
+            x_min: Option::None,
+            x_max: Option::None,
+            y_min: Option::None,
+            y_max: Option::None,
+            line_shape: LineShape::Linear,
+            show_total: false,
+        }
+    }
+}
+
+/// Our current standard value for ignoring the first "5 seconds" of garbage data.
+const STATS_SKIP_N: usize = 5;
+
+#[derive(Debug, Clone)]
+pub struct StatsData {
+    /// Calculated statistics for the entire range (for better charting).
+    overall_min: f32,
+    overall_max: f32,
+
+    /// Filter settings to only calculate statistics over a sub-range. Usually, the first
+    /// data point or set of data points is not useful and should be filtered out. And
+    /// sometimes we might want to stop calculation as soon as we know the media part of
+    /// the test is over.
+    /// Defaults to STATS_SKIP_N > .. usize::MAX. We default to this since most stats use
+    /// this min, only to reduce some of the complexity in this file.
+    filter_min: usize,
+    filter_max: usize,
+
+    /// The period that each data point represents on the x-axis.
+    /// Defaults to 1 (i.e. each point implies a value for the prior second).
+    period: f32,
+
+    /// Point data in the form (index, value).
+    pub points: Vec<ChartPoint>,
+
+    /// Running sum of squares of the values within the filtered range, used to
+    /// calculate the standard deviation.
+    sum_sq: f64,
+
+    /// Calculated statistics within the filtered range.
+    pub min: f32,
+    pub max: f32,
+    pub ave: f32,
+    pub std_dev: f32,
+    pub total: f64,
+
+    /// Track the max inserted index in case data is aperiodic.
+    pub max_index: f32,
+}
+
+impl Default for StatsData {
+    fn default() -> Self {
+        Self {
+            overall_min: f32::MAX,
+            overall_max: 0.0,
+            filter_min: STATS_SKIP_N,
+            filter_max: usize::MAX,
+            period: 1.0,
+            points: vec![],
+            sum_sq: 0.0,
+            min: f32::MAX,
+            max: 0.0,
+            ave: 0.0,
+            std_dev: 0.0,
+            total: 0.0,
+            max_index: 0.0,
+        }
+    }
+}
+
+impl StatsData {
+    /// Creates a StatsData but skipping the first N items so that they aren't taken into
+    /// account when calculating the statistics. This is actually useful to avoid skipping
+    /// as is currently done by default.
+    pub fn new_skip_n(n: usize) -> Self {
+        Self {
+            filter_min: n,
+            ..Default::default()
+        }
+    }
+
+    pub fn set_filter(&mut self, min: usize, max: usize) {
+        self.filter_min = min;
+        self.filter_max = max;
+    }
+
+    pub fn set_period(&mut self, period: f32) {
+        self.period = period;
+    }
+
+    /// Push data to an arbitrary index and update statistics.
+    pub fn push_with_index(&mut self, index: f32, value: f32) {
+        self.points.push((index, value));
+
+        if self.points.len() > self.filter_min && self.points.len() <= self.filter_max {
+            let n = (self.points.len() - self.filter_min) as f64;
+            self.total += value as f64;
+            self.sum_sq += (value as f64) * (value as f64);
+            let mean = self.total / n;
+            self.ave = mean as f32;
+            // Population standard deviation: sqrt(Σx²/N − mean²), max(0.0) guards float error.
+            self.std_dev = ((self.sum_sq / n) - mean * mean).max(0.0).sqrt() as f32;
+            self.min = self.min.min(value);
+            self.max = self.max.max(value);
+        }
+
+        // To ensure good ranges for charting, we need to keep the overall min/max.
+        self.overall_min = self.overall_min.min(value);
+        self.overall_max = self.overall_max.max(value);
+        self.max_index = self.max_index.max(index);
+    }
+
+    /// Push data to the next periodic index and update statistics.
+    pub fn push(&mut self, value: f32) {
+        self.push_with_index(((self.points.len() + 1) as f32) * self.period, value);
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Stats {
+    pub config: StatsConfig,
+    pub data: StatsData,
+}
+
+#[derive(Debug, Default)]
+pub enum AnalysisReportMos {
+    /// No mos value is available.
+    #[default]
+    None,
+    /// There is a single mos value available.
+    Single(f32),
+    /// There is a stats collection of mos values available.
+    Series(Box<Stats>),
+}
+
+impl AnalysisReportMos {
+    /// Return a single MOS value (i.e. the average) or None for display.
+    fn get_mos_for_display(&self) -> Option<f32> {
+        match self {
+            AnalysisReportMos::None => None,
+            AnalysisReportMos::Single(mos) => Some(*mos),
+            AnalysisReportMos::Series(stats) => Some(stats.data.ave),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AnalysisReport {
+    /// Hold the audio results for reporting.
+    pub audio_test_results: AudioTestResults,
+    /// Store video results for reporting.
+    pub vmaf: Option<f32>,
+}
+
+impl AnalysisReport {
+    pub async fn parse_visqol_mos_results(file_name: &str) -> Result<Option<f32>> {
+        // Look through the file until we find the MOS line and return the value.
+        let file = File::open(file_name).await?;
+        let reader = BufReader::new(file);
+
+        // Example: MOS-LQO:		4.14442
+        let re_mos_line = Regex::new(r"MOS-LQO:\s*(?P<mos>[-+]?[0-9]*\.?[0-9]+)")?;
+
+        let mut mos = None;
+
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await? {
+            if let Some(cap) = re_mos_line.captures(&line) {
+                mos = Some(f32::from_str(&cap["mos"])?);
+                break;
+            }
+        }
+
+        Ok(mos)
+    }
+
+    pub async fn parse_pesq_mos_results(file_name: &str) -> Result<Option<f32>> {
+        // Look through the file until we find the MOS line and return the value.
+        let file = File::open(file_name).await?;
+        let reader = BufReader::new(file);
+
+        // Example: 4.470762252807617
+        let re_mos_line = Regex::new(r"(?P<mos>[-+]?[0-9]*\.?[0-9]+)")?;
+
+        let mut mos = None;
+
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await? {
+            if let Some(cap) = re_mos_line.captures(&line) {
+                mos = Some(f32::from_str(&cap["mos"])?);
+                break;
+            }
+        }
+
+        Ok(mos)
+    }
+
+    pub async fn parse_plc_mos_results(file_name: &str) -> Result<Option<f32>> {
+        // Look through the file until we find the MOS line and return the value.
+        let file = File::open(file_name).await?;
+        let reader = BufReader::new(file);
+
+        // Example: 0  /degraded/loss-0_16k.wav   4.193227
+        let re_mos_line = Regex::new(r"0.*wav\s*(?P<mos>[-+]?[0-9]*\.?[0-9]+)")?;
+
+        let mut mos = None;
+
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await? {
+            if let Some(cap) = re_mos_line.captures(&line) {
+                mos = Some(f32::from_str(&cap["mos"])?);
+                break;
+            }
+        }
+
+        Ok(mos)
+    }
+
+    async fn parse_video_analysis(file_name: &str) -> Result<f32> {
+        let mut file = File::open(file_name).await?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).await?;
+        if contents.is_empty() {
+            // The analysis step failed.
+            // The most common reason for this is because no frames were successfully sent.
+            return Ok(0.0);
+        }
+        let json: serde_json::Value = serde_json::from_slice(&contents)?;
+        json["pooled_metrics"]["vmaf"]["mean"]
+            .as_f64()
+            .map(|x| x as f32)
+            .ok_or_else(|| anyhow!("invalid vmaf json"))
+    }
+
+    // There isn't much to build for audio, now that it is pre-calculated.
+    pub async fn build(
+        audio_test_results: AudioTestResults,
+        video_analysis_file_name: Option<&str>,
+    ) -> Result<Self> {
+        let vmaf = if let Some(video_analysis_file_name) = video_analysis_file_name
+            && let Ok(vmaf) = Self::parse_video_analysis(video_analysis_file_name).await
+        {
+            Some(vmaf)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            audio_test_results,
+            vmaf,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct DockerStatsReport {
+    timestamp: Vec<u64>,
+    cpu_usage: Stats,
+    mem_usage: Stats,
+    tx_bitrate: Stats,
+    rx_bitrate: Stats,
+    item_count: usize,
+}
+
+impl DockerStatsReport {
+    async fn parse(
+        file_name: &str,
+    ) -> Result<(Vec<u64>, StatsData, StatsData, StatsData, StatsData)> {
+        // Look through the file and pull out the periodic (1 second) docker stats.
+        let file = File::open(file_name).await?;
+        let reader = BufReader::new(file);
+
+        // Timestamp\tCPU\tMEM\nTX_Bitrate\nRX_Bitrate
+        // 1234567890 21.84	8994816	70845	71137
+        let re_stats_line = Regex::new(
+            r"(?P<time>\d+)\s*(?P<cpu>[0-9]*\.?[0-9]+)\s*(?P<mem>\d+)\s*(?P<tx>\d+)\s*(?P<rx>\d+)(.*)",
+        )?;
+
+        let mut timestamp = vec![];
+        let mut cpu_usage = StatsData::default();
+        let mut mem_usage = StatsData::default();
+        let mut tx_bitrate = StatsData::default();
+        let mut rx_bitrate = StatsData::default();
+
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await? {
+            if let Some(cap) = re_stats_line.captures(&line) {
+                timestamp.push(u64::from_str(&cap["time"])?);
+                cpu_usage.push(f32::from_str(&cap["cpu"])?);
+                mem_usage.push(f32::from_str(&cap["mem"])? / 1048576.0);
+                tx_bitrate.push(f32::from_str(&cap["tx"])? / 1000.0);
+                rx_bitrate.push(f32::from_str(&cap["rx"])? / 1000.0);
+            }
+        }
+
+        Ok((timestamp, cpu_usage, mem_usage, tx_bitrate, rx_bitrate))
+    }
+
+    pub async fn build(file_name: &str, client_name: &str) -> Result<Self> {
+        let (timestamp, cpu_usage, mem_usage, tx_bitrate, rx_bitrate) =
+            DockerStatsReport::parse(file_name).await?;
+
+        // We'll use the timestamp length as representative of the common size.
+        let item_count = timestamp.len();
+
+        let cpu_usage_stats = Stats {
+            config: StatsConfig {
+                title: "Container CPU Usage".to_string(),
+                chart_name: format!("{}.container.cpu_usage.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "% of Core".to_string(),
+                ..Default::default()
+            },
+            data: cpu_usage,
+        };
+
+        let mem_usage_stats = Stats {
+            config: StatsConfig {
+                title: "Container Memory Usage".to_string(),
+                chart_name: format!("{}.container.mem_usage.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Mebibytes".to_string(),
+                ..Default::default()
+            },
+            data: mem_usage,
+        };
+
+        let tx_bitrate_stats = Stats {
+            config: StatsConfig {
+                title: "Container Send Bitrate".to_string(),
+                chart_name: format!("{}.container.send_bitrate.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Kbps".to_string(),
+                ..Default::default()
+            },
+            data: tx_bitrate,
+        };
+
+        let rx_bitrate_stats = Stats {
+            config: StatsConfig {
+                title: "Container Receive Bitrate".to_string(),
+                chart_name: format!("{}.container.receive_bitrate.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Kbps".to_string(),
+                ..Default::default()
+            },
+            data: rx_bitrate,
+        };
+
+        Ok(Self {
+            timestamp,
+            cpu_usage: cpu_usage_stats,
+            mem_usage: mem_usage_stats,
+            tx_bitrate: tx_bitrate_stats,
+            rx_bitrate: rx_bitrate_stats,
+            item_count,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ConnectionStats {
+    pub current_round_trip_time: Stats,
+    pub available_outgoing_bitrate: Stats,
+}
+
+#[derive(Debug, Default)]
+pub struct AudioSendStats {
+    pub ssrc: String,
+    pub packets_per_second: Stats,
+    pub average_packet_size: Stats,
+    pub bitrate: Stats,
+    pub remote_packet_loss: Stats,
+    pub remote_jitter: Stats,
+    pub remote_round_trip_time: Stats,
+    pub audio_energy: Stats,
+}
+
+#[derive(Debug, Default)]
+pub struct VideoSendStats {
+    pub ssrc: String,
+    pub packets_per_second: Stats,
+    pub average_packet_size: Stats,
+    pub bitrate: Stats,
+    pub source_framerate: Stats,
+    pub source_resolution: Stats,
+    pub framerate: Stats,
+    pub key_frames_encoded: Stats,
+    pub retransmitted_packets_sent: Stats,
+    pub retransmitted_bitrate: Stats,
+    pub send_delay_per_packet: Stats,
+    pub nack_count: Stats,
+    pub pli_count: Stats,
+    pub remote_packet_loss: Stats,
+    pub remote_jitter: Stats,
+    pub remote_round_trip_time: Stats,
+    pub resolution: Stats,
+}
+
+#[derive(Debug, Default)]
+pub struct AudioReceiveStats {
+    pub ssrc: String,
+    pub packets_per_second: Stats,
+    pub packet_loss: Stats,
+    pub bitrate: Stats,
+    pub jitter: Stats,
+    pub audio_energy: Stats,
+    pub jitter_buffer_delay: Stats,
+    pub jitter_buffer_target_delay: Stats,
+    pub jitter_buffer_flushes: Stats,
+    pub concealed_samples_pct: Stats,
+    pub fec_packets_received: Stats,
+    pub relative_arrival_delay_per_packet: Stats,
+}
+
+#[derive(Debug, Default)]
+pub struct VideoReceiveStats {
+    pub ssrc: String,
+    pub packets_per_second: Stats,
+    pub packet_loss: Stats,
+    pub bitrate: Stats,
+    pub framerate: Stats,
+    pub key_frames_decoded: Stats,
+    pub resolution: Stats,
+}
+
+#[derive(Debug, Default)]
+pub struct AudioAdaptation {
+    pub bitrate: Stats,
+    pub packet_length: Stats,
+}
+
+#[derive(Debug)]
+pub struct ClientLogReport {
+    pub connection_stats: ConnectionStats,
+    pub audio_send_stats: AudioSendStats,
+    pub video_send_stats: Vec<VideoSendStats>,
+    pub audio_receive_stats_list: Vec<AudioReceiveStats>,
+    pub video_receive_stats_list: Vec<VideoReceiveStats>,
+    pub audio_adaptation: AudioAdaptation,
+}
+
+impl ClientLogReport {
+    async fn parse(
+        file_name: &str,
+    ) -> Result<(
+        ConnectionStats,
+        AudioSendStats,
+        HashMap<String, VideoSendStats>,
+        HashMap<String, AudioReceiveStats>,
+        HashMap<String, VideoReceiveStats>,
+        AudioAdaptation,
+    )> {
+        // Look through the file and pull out RingRTC logs, particularly the `stats!` details.
+        let file = File::open(file_name).await?;
+        let reader = BufReader::new(file);
+
+        // Example: ringrtc_stats!,connection,0xca111d,1667611058243536,0ms,100000bps
+        let re_connection_line = Regex::new(
+            r".*ringrtc_stats!,connection,0x[0-9a-fA-F]+,\d+,(?P<current_round_trip_time>\d+)ms,(?P<available_outgoing_bitrate>\d+)bps",
+        )?;
+
+        // Example: ringrtc_stats!,audio,send,2002,40.0,100.0,32000.0bps,0.0%,0ms,0ms,0.000
+        let re_audio_send_line = Regex::new(
+            r".*ringrtc_stats!,audio,send,(?P<ssrc>\d+),(?P<packets_per_second>[-+]?[0-9]*\.?[0-9]+),(?P<average_packet_size>[-+]?[0-9]*\.?[0-9]+),(?P<bitrate>[-+]?[0-9]*\.?[0-9]+)bps,(?P<remote_packet_loss>[-+]?[0-9]*\.?[0-9]+)%,(?P<remote_jitter>\d+)ms,(?P<remote_round_trip_time>\d+)ms,(?P<audio_energy>[-+]?[0-9]*\.?[0-9]+)",
+        )?;
+
+        // Example: ringrtc_stats!,video,send,2003,8.0,1052.9,67430bps,1280x720,8.0fps,1280x720,2.0fps,0,4.0ms,0,0.0bps,162.4ms,0,0,bandwidth,0,0.0%,170.2ms,1.0ms
+        let re_video_send_line = Regex::new(
+            r".*ringrtc_stats!,video,send,(?P<ssrc>\d+),(?P<packets_per_second>[-+]?[0-9]*\.?[0-9]+),(?P<average_packet_size>[-+]?[0-9]*\.?[0-9]+),(?P<bitrate>[-+]?[0-9]*\.?[0-9]+)bps,(?P<source_resolution>\d+x\d+),(?P<source_framerate>[0-9]*\.?[0-9]+)fps,(?P<resolution>\d+x\d+),(?P<framerate>[0-9]*\.?[0-9]+)fps,(?P<key_frames_encoded>\d+),(?P<encode_time_per_frame>[0-9]*\.?[0-9]+)ms,(?P<retransmitted_packets_sent>\d+),(?P<retransmitted_bitrate>[0-9]*\.?[0-9]+)bps,(?P<send_delay_per_packet>[0-9]*\.?[0-9]+)ms,(?P<nack_count>\d+),(?P<pli_count>\d+),(?P<quality_limitation_reason>\w+),(?P<quality_limitation_resolution_changes>\d+),(?P<remote_packet_loss>[-+]?[0-9]*\.?[0-9]+)%,(?P<remote_jitter>[0-9]*\.?[0-9]+)ms,(?P<remote_round_trip_time>[0-9]*\.?[0-9]+)ms",
+        )?;
+
+        // Example: ringrtc_stats!,audio,recv,1002,40.0,0.00%,32000.0bps,0ms,0.000,50ms,40ms,0,0.00%,0,0ms
+        let re_audio_receive_line = Regex::new(
+            r".*ringrtc_stats!,audio,recv,(?P<ssrc>\d+),(?P<packets_per_second>[-+]?[0-9]*\.?[0-9]+),(?P<packet_loss>[-+]?[0-9]*\.?[0-9]+)%,(?P<bitrate>[-+]?[0-9]*\.?[0-9]+)bps,(?P<jitter>\d+)ms,(?P<audio_energy>[-+]?[0-9]*\.?[0-9]+),(?P<jitter_buffer_delay>\d+)ms,(?P<jitter_buffer_target_delay>\d+)ms,(?P<jitter_buffer_flushes>\d+),(?P<concealed_samples_pct>[-+]?[0-9]*\.?[0-9]+)%,(?P<fec_packets_received>\d+),(?P<relative_arrival_delay_per_packet>\d+)ms",
+        )?;
+
+        // Example: ringrtc_stats!,video,recv,2003,7.0,0.0%,61305bps,1.0fps,1,3.3ms,1280x720
+        let re_video_receive_line = Regex::new(
+            r".*ringrtc_stats!,video,recv,(?P<ssrc>\d+),(?P<packets_per_second>[-+]?[0-9]*\.?[0-9]+),(?P<packet_loss>[-+]?[0-9]*\.?[0-9]+)%,(?P<bitrate>[0-9]+)bps,(?P<framerate>[0-9]*\.?[0-9]+)fps,(?P<key_frames_decoded>\d+),(?P<decode_time_per_frame>[0-9]*\.?[0-9]+)ms,(?P<resolution>\d+x\d+)",
+        )?;
+
+        // Example: ringrtc_adapt!,audio,240,18000,60
+        let re_adaptation_line = Regex::new(
+            r".*ringrtc_adapt!,audio,(?P<time>\d+),(?P<bitrate>\d+),(?P<packet_length>\d+)",
+        )?;
+
+        let mut connection_stats = ConnectionStats::default();
+        let mut audio_send_stats = AudioSendStats::default();
+        let mut video_send_stats_map = HashMap::<String, VideoSendStats>::new();
+        let mut audio_receive_stats_map = HashMap::<String, AudioReceiveStats>::new();
+        let mut video_receive_stats_map = HashMap::<String, VideoReceiveStats>::new();
+        // Adaptation stats are aperiodic; don't skip any leading data points.
+        let mut audio_adaptation_stats = AudioAdaptation {
+            bitrate: Stats {
+                data: StatsData::new_skip_n(0),
+                ..Default::default()
+            },
+            packet_length: Stats {
+                data: StatsData::new_skip_n(0),
+                ..Default::default()
+            },
+        };
+
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await? {
+            if let Some(cap) = re_connection_line.captures(&line) {
+                connection_stats
+                    .current_round_trip_time
+                    .data
+                    .push(f32::from_str(&cap["current_round_trip_time"])?);
+                connection_stats
+                    .available_outgoing_bitrate
+                    .data
+                    .push(f32::from_str(&cap["available_outgoing_bitrate"])? / 1000.0);
+                continue;
+            }
+
+            if let Some(cap) = re_audio_send_line.captures(&line) {
+                audio_send_stats.ssrc = cap["ssrc"].to_string();
+                audio_send_stats
+                    .packets_per_second
+                    .data
+                    .push(f32::from_str(&cap["packets_per_second"])?);
+                audio_send_stats
+                    .average_packet_size
+                    .data
+                    .push(f32::from_str(&cap["average_packet_size"])?);
+                audio_send_stats
+                    .bitrate
+                    .data
+                    .push(f32::from_str(&cap["bitrate"])? / 1000.0);
+                audio_send_stats
+                    .remote_packet_loss
+                    .data
+                    .push(f32::from_str(&cap["remote_packet_loss"])?);
+                audio_send_stats
+                    .remote_jitter
+                    .data
+                    .push(f32::from_str(&cap["remote_jitter"])?);
+                audio_send_stats
+                    .remote_round_trip_time
+                    .data
+                    .push(f32::from_str(&cap["remote_round_trip_time"])?);
+                audio_send_stats
+                    .audio_energy
+                    .data
+                    .push(f32::from_str(&cap["audio_energy"])?);
+                continue;
+            }
+
+            if let Some(cap) = re_video_send_line.captures(&line) {
+                let ssrc = cap["ssrc"].to_string();
+                let video_send_stats = video_send_stats_map.entry(ssrc.clone()).or_default();
+
+                video_send_stats.ssrc = ssrc;
+                video_send_stats
+                    .packets_per_second
+                    .data
+                    .push(f32::from_str(&cap["packets_per_second"])?);
+                video_send_stats
+                    .average_packet_size
+                    .data
+                    .push(f32::from_str(&cap["average_packet_size"])?);
+                video_send_stats
+                    .bitrate
+                    .data
+                    .push(f32::from_str(&cap["bitrate"])? / 1000.0);
+                video_send_stats
+                    .source_framerate
+                    .data
+                    .push(f32::from_str(&cap["source_framerate"])?);
+                video_send_stats
+                    .framerate
+                    .data
+                    .push(f32::from_str(&cap["framerate"])?);
+                video_send_stats
+                    .key_frames_encoded
+                    .data
+                    .push(f32::from_str(&cap["key_frames_encoded"])?);
+                video_send_stats
+                    .retransmitted_packets_sent
+                    .data
+                    .push(f32::from_str(&cap["retransmitted_packets_sent"])?);
+                video_send_stats
+                    .retransmitted_bitrate
+                    .data
+                    .push(f32::from_str(&cap["retransmitted_bitrate"])?);
+                video_send_stats
+                    .send_delay_per_packet
+                    .data
+                    .push(f32::from_str(&cap["send_delay_per_packet"])?);
+                video_send_stats
+                    .nack_count
+                    .data
+                    .push(f32::from_str(&cap["nack_count"])?);
+                video_send_stats
+                    .pli_count
+                    .data
+                    .push(f32::from_str(&cap["pli_count"])?);
+                video_send_stats
+                    .remote_packet_loss
+                    .data
+                    .push(f32::from_str(&cap["remote_packet_loss"])?);
+                video_send_stats
+                    .remote_jitter
+                    .data
+                    .push(f32::from_str(&cap["remote_jitter"])?);
+                video_send_stats
+                    .remote_round_trip_time
+                    .data
+                    .push(f32::from_str(&cap["remote_round_trip_time"])?);
+
+                let res = &cap["source_resolution"];
+                let res: usize = res
+                    .split('x')
+                    .map(|n| n.parse::<usize>().unwrap())
+                    .product();
+                video_send_stats.source_resolution.data.push(res as f32);
+
+                let res = &cap["resolution"];
+                let res: usize = res
+                    .split('x')
+                    .map(|n| n.parse::<usize>().unwrap())
+                    .product();
+                video_send_stats.resolution.data.push(res as f32);
+
+                continue;
+            }
+
+            if let Some(cap) = re_audio_receive_line.captures(&line) {
+                let ssrc = cap["ssrc"].to_string();
+                let audio_receive_stats = audio_receive_stats_map.entry(ssrc.clone()).or_default();
+
+                audio_receive_stats.ssrc = ssrc;
+                audio_receive_stats
+                    .packets_per_second
+                    .data
+                    .push(f32::from_str(&cap["packets_per_second"])?);
+                audio_receive_stats
+                    .bitrate
+                    .data
+                    .push(f32::from_str(&cap["bitrate"])? / 1000.0);
+                audio_receive_stats
+                    .audio_energy
+                    .data
+                    .push(f32::from_str(&cap["audio_energy"])?);
+                audio_receive_stats
+                    .packet_loss
+                    .data
+                    .push(f32::from_str(&cap["packet_loss"])?);
+                audio_receive_stats
+                    .jitter
+                    .data
+                    .push(f32::from_str(&cap["jitter"])?);
+                audio_receive_stats
+                    .jitter_buffer_delay
+                    .data
+                    .push(f32::from_str(&cap["jitter_buffer_delay"])?);
+                audio_receive_stats
+                    .jitter_buffer_target_delay
+                    .data
+                    .push(f32::from_str(&cap["jitter_buffer_target_delay"])?);
+                audio_receive_stats
+                    .jitter_buffer_flushes
+                    .data
+                    .push(f32::from_str(&cap["jitter_buffer_flushes"])?);
+                audio_receive_stats
+                    .concealed_samples_pct
+                    .data
+                    .push(f32::from_str(&cap["concealed_samples_pct"])?);
+                audio_receive_stats
+                    .fec_packets_received
+                    .data
+                    .push(f32::from_str(&cap["fec_packets_received"])?);
+                audio_receive_stats
+                    .relative_arrival_delay_per_packet
+                    .data
+                    .push(f32::from_str(&cap["relative_arrival_delay_per_packet"])?);
+                continue;
+            }
+
+            if let Some(cap) = re_video_receive_line.captures(&line) {
+                let ssrc = cap["ssrc"].to_string();
+                let video_receive_stats = video_receive_stats_map.entry(ssrc.clone()).or_default();
+                video_receive_stats.ssrc = ssrc;
+                video_receive_stats
+                    .packets_per_second
+                    .data
+                    .push(f32::from_str(&cap["packets_per_second"])?);
+                video_receive_stats
+                    .bitrate
+                    .data
+                    .push(f32::from_str(&cap["bitrate"])? / 1000.0);
+                video_receive_stats
+                    .packet_loss
+                    .data
+                    .push(f32::from_str(&cap["packet_loss"])?);
+                video_receive_stats
+                    .framerate
+                    .data
+                    .push(f32::from_str(&cap["framerate"])?);
+                video_receive_stats
+                    .key_frames_decoded
+                    .data
+                    .push(f32::from_str(&cap["key_frames_decoded"])?);
+
+                let res = &cap["resolution"];
+                let res: usize = res
+                    .split('x')
+                    .map(|n| n.parse::<usize>().unwrap())
+                    .product();
+                video_receive_stats.resolution.data.push(res as f32);
+                continue;
+            }
+
+            if let Some(cap) = re_adaptation_line.captures(&line) {
+                let time_index = f32::from_str(&cap["time"])?;
+                audio_adaptation_stats
+                    .bitrate
+                    .data
+                    .push_with_index(time_index, f32::from_str(&cap["bitrate"])? / 1000.0);
+                audio_adaptation_stats
+                    .packet_length
+                    .data
+                    .push_with_index(time_index, f32::from_str(&cap["packet_length"])?);
+                continue;
+            }
+        }
+
+        Ok((
+            connection_stats,
+            audio_send_stats,
+            video_send_stats_map,
+            audio_receive_stats_map,
+            video_receive_stats_map,
+            audio_adaptation_stats,
+        ))
+    }
+
+    pub async fn build(file_name: &str, client_name: &str) -> Result<Self> {
+        let (
+            connection_stats,
+            audio_send_stats,
+            video_send_stats_map,
+            audio_receive_stats_map,
+            video_receive_stats_map,
+            audio_adaptation,
+        ) = ClientLogReport::parse(file_name).await?;
+
+        // We assume that all entries in the send stats vectors are in sync.
+        // stats in the receive_stats are dependent on the clients join time
+        // for now we ignore discrepancies in the receive_stats length
+        let connection_point_count = connection_stats.current_round_trip_time.data.points.len();
+        if (connection_point_count != audio_send_stats.bitrate.data.points.len())
+            || video_send_stats_map
+                .values()
+                .any(|stats| connection_point_count != stats.bitrate.data.points.len())
+        {
+            return Err(anyhow!("RingRTC stats were not in sync!"));
+        }
+
+        let current_round_trip_time = Stats {
+            config: StatsConfig {
+                title: "Current Round Trip Time".to_string(),
+                chart_name: format!("{}.log.connection.rtt.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "milliseconds".to_string(),
+                ..Default::default()
+            },
+            data: connection_stats.current_round_trip_time.data,
+        };
+
+        let available_outgoing_bitrate = Stats {
+            config: StatsConfig {
+                title: "Available Outgoing Bitrate".to_string(),
+                chart_name: format!("{}.log.connection.outgoing_bitrate.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Kbps".to_string(),
+                ..Default::default()
+            },
+            data: connection_stats.available_outgoing_bitrate.data,
+        };
+
+        let connection_stats = ConnectionStats {
+            current_round_trip_time,
+            available_outgoing_bitrate,
+        };
+
+        let packets_per_second = Stats {
+            config: StatsConfig {
+                title: "Audio Send Packet Rate".to_string(),
+                chart_name: format!("{}.log.audio.send.packet_rate.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Packets/Second".to_string(),
+                ..Default::default()
+            },
+            data: audio_send_stats.packets_per_second.data,
+        };
+
+        let average_packet_size = Stats {
+            config: StatsConfig {
+                title: "Audio Send Packet Size".to_string(),
+                chart_name: format!("{}.log.audio.send.packet_size.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Average Size Per Period".to_string(),
+                ..Default::default()
+            },
+            data: audio_send_stats.average_packet_size.data,
+        };
+
+        let bitrate = Stats {
+            config: StatsConfig {
+                title: "Audio Send Bitrate".to_string(),
+                chart_name: format!("{}.log.audio.send.bitrate.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Kbps".to_string(),
+                ..Default::default()
+            },
+            data: audio_send_stats.bitrate.data,
+        };
+
+        let remote_packet_loss = Stats {
+            config: StatsConfig {
+                title: "Audio Send Remote Packet Loss".to_string(),
+                chart_name: format!("{}.log.audio.send.remote_loss.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "%".to_string(),
+                ..Default::default()
+            },
+            data: audio_send_stats.remote_packet_loss.data,
+        };
+
+        let remote_jitter = Stats {
+            config: StatsConfig {
+                title: "Audio Send Remote Jitter".to_string(),
+                chart_name: format!("{}.log.audio.send.remote_jitter.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "milliseconds".to_string(),
+                ..Default::default()
+            },
+            data: audio_send_stats.remote_jitter.data,
+        };
+
+        let remote_round_trip_time = Stats {
+            config: StatsConfig {
+                title: "Audio Send Remote Round Trip Time".to_string(),
+                chart_name: format!("{}.log.audio.send.remote_rtt.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "milliseconds".to_string(),
+                ..Default::default()
+            },
+            data: audio_send_stats.remote_round_trip_time.data,
+        };
+
+        let audio_energy = Stats {
+            config: StatsConfig {
+                title: "Audio Send Audio Energy".to_string(),
+                chart_name: format!("{}.log.audio.send.audio_energy.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Energy".to_string(),
+                y_max: Some(1.0),
+                ..Default::default()
+            },
+            data: audio_send_stats.audio_energy.data,
+        };
+
+        let audio_send_stats = AudioSendStats {
+            ssrc: audio_send_stats.ssrc,
+            packets_per_second,
+            average_packet_size,
+            bitrate,
+            remote_packet_loss,
+            remote_jitter,
+            remote_round_trip_time,
+            audio_energy,
+        };
+
+        let mut video_send_stats_list = Vec::with_capacity(video_send_stats_map.len());
+        for (ssrc, video_send_stats) in video_send_stats_map {
+            let packets_per_second = Stats {
+                config: StatsConfig {
+                    title: format!("Video Send Packet Rate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.packet_rate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Packets/Second".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.packets_per_second.data,
+            };
+
+            let average_packet_size = Stats {
+                config: StatsConfig {
+                    title: format!("Video Send Packet Size (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.packet_size.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Average Size Per Period".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.average_packet_size.data,
+            };
+
+            let bitrate = Stats {
+                config: StatsConfig {
+                    title: format!("Video Send Bitrate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.bitrate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Kbps".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.bitrate.data,
+            };
+
+            let source_framerate = Stats {
+                config: StatsConfig {
+                    title: format!("Video Source Framerate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.source_framerate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "fps".to_string(),
+                    y_max: Some(32.0),
+                    ..Default::default()
+                },
+                data: video_send_stats.source_framerate.data,
+            };
+
+            let framerate = Stats {
+                config: StatsConfig {
+                    title: format!("Video Send Framerate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.framerate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "fps".to_string(),
+                    y_max: Some(32.0),
+                    ..Default::default()
+                },
+                data: video_send_stats.framerate.data,
+            };
+
+            let key_frames_encoded = Stats {
+                config: StatsConfig {
+                    title: format!("Video Key Frames Encoded (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.key_frames_encoded.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "# frames".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.key_frames_encoded.data,
+            };
+
+            let retransmitted_packets_sent = Stats {
+                config: StatsConfig {
+                    title: format!("Video Retransmitted Packets (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.retransmitted_packets.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "# Packets".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.retransmitted_packets_sent.data,
+            };
+
+            let retransmitted_bitrate = Stats {
+                config: StatsConfig {
+                    title: format!("Video Send Retransmitted Bitrate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.retransmitted_bitrate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Kbps".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.retransmitted_bitrate.data,
+            };
+
+            let send_delay_per_packet = Stats {
+                config: StatsConfig {
+                    title: format!("Video Send Send Delay Per Packet (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.delay_per_packet.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "ms".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.send_delay_per_packet.data,
+            };
+
+            let nack_count = Stats {
+                config: StatsConfig {
+                    title: format!("Video Received NACK Count (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.nack_count.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "# NACKs".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.nack_count.data,
+            };
+
+            let pli_count = Stats {
+                config: StatsConfig {
+                    title: format!("Video Received PLI Count (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.pli_count.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "# PLIs".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.pli_count.data,
+            };
+
+            let remote_packet_loss = Stats {
+                config: StatsConfig {
+                    title: format!("Video Send Remote Packet Loss (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.remote_loss.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "%".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.remote_packet_loss.data,
+            };
+
+            let remote_jitter = Stats {
+                config: StatsConfig {
+                    title: format!("Video Send Remote Jitter (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.send.remote_jitter.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "milliseconds".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.remote_jitter.data,
+            };
+
+            let remote_round_trip_time = Stats {
+                config: StatsConfig {
+                    title: "Video Send Remote Round Trip Time".to_string(),
+                    chart_name: format!("{}.log.video.send.remote_rtt.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "milliseconds".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.remote_round_trip_time.data,
+            };
+
+            let source_resolution = Stats {
+                config: StatsConfig {
+                    title: "Video Source Resolution".to_string(),
+                    chart_name: format!("{}.log.video.send.source_resolution.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Resolution (sq. pixels)".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.source_resolution.data,
+            };
+
+            let resolution = Stats {
+                config: StatsConfig {
+                    title: "Video Send Resolution".to_string(),
+                    chart_name: format!("{}.log.video.send.resolution.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Resolution (sq. pixels)".to_string(),
+                    ..Default::default()
+                },
+                data: video_send_stats.resolution.data,
+            };
+
+            video_send_stats_list.push(VideoSendStats {
+                ssrc: video_send_stats.ssrc,
+                packets_per_second,
+                average_packet_size,
+                bitrate,
+                source_framerate,
+                source_resolution,
+                framerate,
+                key_frames_encoded,
+                retransmitted_packets_sent,
+                retransmitted_bitrate,
+                send_delay_per_packet,
+                nack_count,
+                pli_count,
+                remote_packet_loss,
+                remote_jitter,
+                remote_round_trip_time,
+                resolution,
+            });
+        }
+
+        let mut audio_receive_stats_list = Vec::with_capacity(audio_receive_stats_map.len());
+        for (ssrc, audio_receive_stats) in audio_receive_stats_map {
+            let packets_per_second = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Packet Rate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.audio.receive.packet_rate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Packets/Second".to_string(),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.packets_per_second.data,
+            };
+
+            let packet_loss = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Packet Loss (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.audio.receive.loss.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "%".to_string(),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.packet_loss.data,
+            };
+
+            let bitrate = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Bitrate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.audio.receive.bitrate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Kbps".to_string(),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.bitrate.data,
+            };
+
+            let jitter = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Jitter (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.audio.receive.jitter.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "milliseconds".to_string(),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.jitter.data,
+            };
+
+            let audio_energy = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Audio Energy (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.audio.receive.audio_energy.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "dB".to_string(),
+                    y_max: Some(1.0),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.audio_energy.data,
+            };
+
+            let jitter_buffer_delay = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Jitter Buffer Delay (ssrc={ssrc})"),
+                    chart_name: format!(
+                        "{}.log.audio.receive.jitter_buffer_delay.svg",
+                        client_name
+                    ),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "milliseconds".to_string(),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.jitter_buffer_delay.data,
+            };
+
+            let jitter_buffer_target_delay = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Jitter Buffer Target Delay (ssrc={ssrc})"),
+                    chart_name: format!(
+                        "{}.log.audio.receive.jitter_buffer_target_delay.svg",
+                        client_name
+                    ),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "milliseconds".to_string(),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.jitter_buffer_target_delay.data,
+            };
+
+            let jitter_buffer_flushes = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Jitter Buffer Flushes (ssrc={ssrc})"),
+                    chart_name: format!(
+                        "{}.log.audio.receive.jitter_buffer_flushes.svg",
+                        client_name
+                    ),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Flushes".to_string(),
+                    show_total: true,
+                    ..Default::default()
+                },
+                data: audio_receive_stats.jitter_buffer_flushes.data,
+            };
+
+            let concealed_samples_pct = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Concealed Samples (ssrc={ssrc})"),
+                    chart_name: format!(
+                        "{}.log.audio.receive.concealed_samples_pct.svg",
+                        client_name
+                    ),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "%".to_string(),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.concealed_samples_pct.data,
+            };
+
+            let fec_packets_received = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive FEC Packets Received (ssrc={ssrc})"),
+                    chart_name: format!(
+                        "{}.log.audio.receive.fec_packets_received.svg",
+                        client_name
+                    ),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Packets".to_string(),
+                    show_total: true,
+                    ..Default::default()
+                },
+                data: audio_receive_stats.fec_packets_received.data,
+            };
+
+            let relative_arrival_delay_per_packet = Stats {
+                config: StatsConfig {
+                    title: format!("Audio Receive Relative Arrival Delay Per Packet (ssrc={ssrc})"),
+                    chart_name: format!(
+                        "{}.log.audio.receive.relative_arrival_delay_per_packet.svg",
+                        client_name
+                    ),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "milliseconds".to_string(),
+                    ..Default::default()
+                },
+                data: audio_receive_stats.relative_arrival_delay_per_packet.data,
+            };
+
+            audio_receive_stats_list.push(AudioReceiveStats {
+                ssrc: audio_receive_stats.ssrc,
+                packets_per_second,
+                packet_loss,
+                bitrate,
+                jitter,
+                audio_energy,
+                jitter_buffer_delay,
+                jitter_buffer_target_delay,
+                jitter_buffer_flushes,
+                concealed_samples_pct,
+                fec_packets_received,
+                relative_arrival_delay_per_packet,
+            });
+        }
+
+        let mut video_receive_stats_list = Vec::with_capacity(video_receive_stats_map.len());
+        for (ssrc, video_receive_stats) in video_receive_stats_map {
+            let packets_per_second = Stats {
+                config: StatsConfig {
+                    title: format!("Video Receive Packet Rate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.receive.packet_rate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Packets/Second".to_string(),
+                    ..Default::default()
+                },
+                data: video_receive_stats.packets_per_second.data,
+            };
+
+            let packet_loss = Stats {
+                config: StatsConfig {
+                    title: format!("Video Receive Packet Loss (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.receive.loss.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "%".to_string(),
+                    ..Default::default()
+                },
+                data: video_receive_stats.packet_loss.data,
+            };
+
+            let bitrate = Stats {
+                config: StatsConfig {
+                    title: format!("Video Receive Bitrate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.receive.bitrate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Kbps".to_string(),
+                    ..Default::default()
+                },
+                data: video_receive_stats.bitrate.data,
+            };
+
+            let framerate = Stats {
+                config: StatsConfig {
+                    title: format!("Video Receive Framerate (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.receive.framerate.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "fps".to_string(),
+                    y_max: Some(32.0),
+                    ..Default::default()
+                },
+                data: video_receive_stats.framerate.data,
+            };
+
+            let key_frames_decoded = Stats {
+                config: StatsConfig {
+                    title: format!("Video Key Frames Decoded (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.receive.key_frames_decoded.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "# frames".to_string(),
+                    ..Default::default()
+                },
+                data: video_receive_stats.key_frames_decoded.data,
+            };
+
+            let resolution = Stats {
+                config: StatsConfig {
+                    title: format!("Video Receive Resolution (ssrc={ssrc})"),
+                    chart_name: format!("{}.log.video.receive.resolution.svg", client_name),
+                    x_label: "Test Seconds".to_string(),
+                    y_label: "Resolution (sq. pixels)".to_string(),
+                    ..Default::default()
+                },
+                data: video_receive_stats.resolution.data,
+            };
+
+            video_receive_stats_list.push(VideoReceiveStats {
+                ssrc: video_receive_stats.ssrc,
+                packets_per_second,
+                packet_loss,
+                bitrate,
+                framerate,
+                key_frames_decoded,
+                resolution,
+            });
+        }
+
+        let bitrate = Stats {
+            config: StatsConfig {
+                title: "Adaptation Bitrate Changes".to_string(),
+                chart_name: format!("{}.audio.adaptation.bitrate.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "Kbps".to_string(),
+                x_max: Some(audio_adaptation.bitrate.data.max_index + 5.0),
+                line_shape: LineShape::Hv,
+                ..Default::default()
+            },
+            data: audio_adaptation.bitrate.data,
+        };
+
+        let packet_length = Stats {
+            config: StatsConfig {
+                title: "Adaptation Packet Length Changes".to_string(),
+                chart_name: format!("{}.audio.adaptation.packet_length.svg", client_name),
+                x_label: "Test Seconds".to_string(),
+                y_label: "milliseconds".to_string(),
+                x_max: Some(audio_adaptation.packet_length.data.max_index + 5.0),
+                line_shape: LineShape::Hv,
+                ..Default::default()
+            },
+            data: audio_adaptation.packet_length.data,
+        };
+
+        let audio_adaptation = AudioAdaptation {
+            bitrate,
+            packet_length,
+        };
+
+        Ok(Self {
+            connection_stats,
+            audio_send_stats,
+            video_send_stats: video_send_stats_list,
+            audio_receive_stats_list,
+            video_receive_stats_list,
+            audio_adaptation,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct Report {
+    pub report_name: String,
+    pub test_path: String,
+
+    pub test_case_name: String,
+    pub sound_name: String,
+    pub video_name: String,
+    pub network_profile: NetworkProfile,
+
+    pub client_name: String,
+    pub client_name_wav: String,
+
+    /// Only available if there were actually media files generated.
+    pub analysis_report: Option<AnalysisReport>,
+
+    pub docker_stats_report: DockerStatsReport,
+    pub client_log_report: ClientLogReport,
+
+    /// If there is no video being tested, don't generate charts or columns for it.
+    pub show_video: bool,
+    /// Keep track of how many iterations were assigned for the test case.
+    pub iterations: u16,
+}
+
+impl Report {
+    /// Build a report from client_b's perspective.
+    pub async fn build_b(
+        test_case: &TestCase<'_>,
+        test_case_config: &TestCaseConfig,
+        audio_test_results: AudioTestResults,
+    ) -> Result<Self> {
+        let analysis_report = if test_case_config.save_media_files {
+            Some(
+                AnalysisReport::build(
+                    // Note: _Move_ the audio_test_results to the report.
+                    audio_test_results,
+                    test_case
+                        .client_b
+                        .output_yuv
+                        .as_ref()
+                        .map(|output_yuv| format!("{}/{}.json", test_case.test_path, output_yuv))
+                        .as_deref(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let docker_stats_report = DockerStatsReport::build(
+            &format!(
+                "{}/{}_stats.log",
+                test_case.test_path, test_case.client_b.name
+            ),
+            test_case.client_b.name,
+        )
+        .await?;
+        let client_log_report = ClientLogReport::build(
+            &format!("{}/{}.log", test_case.test_path, test_case.client_b.name),
+            test_case.client_b.name,
+        )
+        .await?;
+
+        let test_report = Report {
+            report_name: test_case.report_name.to_string(),
+            test_path: test_case.test_path.to_string(),
+            test_case_name: test_case.test_case_name.to_string(),
+            sound_name: test_case.client_a.sound.name.to_string(),
+            video_name: test_case
+                .client_a
+                .video
+                .map(|v| v.name.clone())
+                .unwrap_or_default(),
+            network_profile: test_case.network_profile.clone(),
+            client_name: test_case.client_b.name.to_string(),
+            client_name_wav: test_case.client_b.output_wav.to_string(),
+            analysis_report,
+            docker_stats_report,
+            client_log_report,
+            show_video: test_case_config.client_a_config.video.input_name.is_some()
+                || test_case_config.client_b_config.video.input_name.is_some(),
+            iterations: test_case_config.iterations,
+        };
+
+        if test_case_config.create_charts {
+            test_report.create_charts(&test_case.test_path).await;
+        }
+
+        Ok(test_report)
+    }
+
+    fn create_bar_chart(
+        test_path: &str,
+        stats: &Stats,
+        domain: Vec<String>,
+        data: Vec<f32>,
+    ) -> Result<()> {
+        let output_path = format!("{}/{}", test_path, stats.config.chart_name);
+        let root = SVGBackend::new(&output_path, (800, 600)).into_drawing_area();
+        root.fill(&WHITE)?;
+
+        let y_min = stats.config.y_min.unwrap_or(0.0);
+        let y_max = stats
+            .config
+            .y_max
+            .unwrap_or((stats.data.overall_max * 1.1).max(1.0));
+
+        let mut chart = ChartBuilder::on(&root)
+            .caption(
+                &stats.config.title,
+                ("Arial", 30).into_font().color(&DIM_GRAY),
+            )
+            .margin(5)
+            .margin_right(25)
+            .x_label_area_size(60)
+            .y_label_area_size(60)
+            .build_cartesian_2d(domain.into_segmented(), y_min..y_max)?;
+
+        chart
+            .configure_mesh()
+            .x_desc(&stats.config.x_label)
+            .y_desc(&stats.config.y_label)
+            .y_label_formatter(&|y| format!("{:.1}", y))
+            .axis_style(DIM_GRAY)
+            .light_line_style(VERY_LIGHT_GRAY)
+            .max_light_lines(1)
+            .disable_x_mesh()
+            .label_style(("Arial", 16).into_font().color(&DIM_GRAY))
+            .axis_desc_style(("Arial", 18).into_font().color(&DIM_GRAY))
+            .draw()?;
+
+        chart.draw_series(
+            Histogram::vertical(&chart)
+                .style(STEEL_BLUE.filled())
+                .margin(25)
+                .data(domain.iter().zip(data.iter()).map(|(x, y)| (x, *y))),
+        )?;
+
+        root.present()?;
+
+        Ok(())
+    }
+
+    fn create_line_chart(test_path: &str, stats: &Stats) -> Result<()> {
+        let output_path = format!("{}/{}", test_path, stats.config.chart_name);
+        let root = SVGBackend::new(&output_path, (800, 600)).into_drawing_area();
+        root.fill(&WHITE)?;
+
+        let x_min = stats.config.x_min.unwrap_or(0.0);
+        let x_max = stats
+            .config
+            .x_max
+            .unwrap_or(stats.data.points.len() as f32 + 5.0);
+        let y_min = stats.config.y_min.unwrap_or(0.0);
+        let y_max = stats
+            .config
+            .y_max
+            .unwrap_or((stats.data.overall_max * 1.1).max(1.0));
+
+        let mut chart = ChartBuilder::on(&root)
+            .caption(
+                &stats.config.title,
+                ("Arial", 30).into_font().color(&DIM_GRAY),
+            )
+            .margin(5)
+            .margin_right(25)
+            .x_label_area_size(60)
+            .y_label_area_size(60)
+            .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+
+        chart
+            .configure_mesh()
+            .x_desc(&stats.config.x_label)
+            .y_desc(&stats.config.y_label)
+            .x_label_formatter(&|x| format!("{:.1}", x))
+            .y_label_formatter(&|y| format!("{:.1}", y))
+            .axis_style(DIM_GRAY)
+            .light_line_style(VERY_LIGHT_GRAY)
+            .max_light_lines(1)
+            .label_style(("Arial", 16).into_font().color(&DIM_GRAY))
+            .axis_desc_style(("Arial", 18).into_font().color(&DIM_GRAY))
+            .draw()?;
+
+        let marker_size = if stats.data.points.len() > 60 { 1 } else { 5 };
+
+        // Apply line shaping to the data points.
+        let data_points: Vec<(f32, f32)> = if matches!(stats.config.line_shape, LineShape::Hv) {
+            // Convert to horizontal-vertical line shape since plotters doesn't support it.
+            let mut hv_points = Vec::new();
+            for i in 0..stats.data.points.len() {
+                let (x, y) = stats.data.points[i];
+                hv_points.push((x, y));
+
+                if i < stats.data.points.len() - 1 {
+                    let next_x = stats.data.points[i + 1].0;
+                    hv_points.push((next_x, y));
+                }
+            }
+            hv_points
+        } else {
+            // Default to LineShape::Linear.
+            stats.data.points.clone()
+        };
+
+        chart.draw_series(LineSeries::new(
+            data_points.iter().cloned(),
+            STEEL_BLUE.stroke_width(2),
+        ))?;
+
+        chart.draw_series(
+            stats
+                .data
+                .points
+                .iter()
+                .cloned()
+                .map(|(x, y)| Circle::new((x, y), marker_size, STEEL_BLUE.filled())),
+        )?;
+
+        root.present()?;
+
+        Ok(())
+    }
+
+    pub async fn create_charts(&self, test_path: &str) {
+        let connection_stats = &self.client_log_report.connection_stats;
+        let audio_send_stats = &self.client_log_report.audio_send_stats;
+        let audio_receive_stats = &self.client_log_report.audio_receive_stats_list;
+        let video_send_stats = &self.client_log_report.video_send_stats;
+        let video_receive_stats = &self.client_log_report.video_receive_stats_list;
+        let audio_adaptation = &self.client_log_report.audio_adaptation;
+
+        let mut line_chart_stats = vec![
+            &self.docker_stats_report.cpu_usage,
+            &self.docker_stats_report.mem_usage,
+            &self.docker_stats_report.tx_bitrate,
+            &self.docker_stats_report.rx_bitrate,
+            &connection_stats.current_round_trip_time,
+            &connection_stats.available_outgoing_bitrate,
+            &audio_send_stats.packets_per_second,
+            &audio_send_stats.average_packet_size,
+            &audio_send_stats.bitrate,
+            &audio_send_stats.remote_packet_loss,
+            &audio_send_stats.remote_jitter,
+            &audio_send_stats.remote_round_trip_time,
+            &audio_send_stats.audio_energy,
+            &audio_adaptation.bitrate,
+            &audio_adaptation.packet_length,
+        ];
+        line_chart_stats.extend(audio_receive_stats.iter().flat_map(|per_ssrc| {
+            vec![
+                &per_ssrc.packets_per_second,
+                &per_ssrc.packet_loss,
+                &per_ssrc.bitrate,
+                &per_ssrc.jitter,
+                &per_ssrc.audio_energy,
+                &per_ssrc.jitter_buffer_delay,
+                &per_ssrc.jitter_buffer_target_delay,
+                &per_ssrc.jitter_buffer_flushes,
+                &per_ssrc.concealed_samples_pct,
+                &per_ssrc.fec_packets_received,
+                &per_ssrc.relative_arrival_delay_per_packet,
+            ]
+        }));
+
+        if self.show_video {
+            line_chart_stats.extend(video_send_stats.iter().flat_map(|per_ssrc| {
+                vec![
+                    &per_ssrc.packets_per_second,
+                    &per_ssrc.average_packet_size,
+                    &per_ssrc.bitrate,
+                    &per_ssrc.source_framerate,
+                    &per_ssrc.framerate,
+                    &per_ssrc.key_frames_encoded,
+                    &per_ssrc.retransmitted_packets_sent,
+                    &per_ssrc.retransmitted_bitrate,
+                    &per_ssrc.send_delay_per_packet,
+                    &per_ssrc.nack_count,
+                    &per_ssrc.pli_count,
+                    &per_ssrc.remote_packet_loss,
+                    &per_ssrc.remote_jitter,
+                    &per_ssrc.remote_round_trip_time,
+                    &per_ssrc.source_resolution,
+                    &per_ssrc.resolution,
+                ]
+            }));
+
+            line_chart_stats.extend(video_receive_stats.iter().flat_map(|per_ssrc| {
+                vec![
+                    &per_ssrc.packets_per_second,
+                    &per_ssrc.packet_loss,
+                    &per_ssrc.bitrate,
+                    &per_ssrc.framerate,
+                    &per_ssrc.key_frames_decoded,
+                    &per_ssrc.resolution,
+                ]
+            }));
+        }
+
+        if let Some(analysis_report) = &self.analysis_report {
+            // Generate charts for audio mos results if they represent a series.
+            let audio_reports = [
+                &analysis_report.audio_test_results.visqol_mos_speech,
+                &analysis_report.audio_test_results.visqol_mos_audio,
+                &analysis_report.audio_test_results.pesq_mos,
+                &analysis_report.audio_test_results.plc_mos,
+                &analysis_report.audio_test_results.mos_average,
+            ];
+            for report in audio_reports {
+                if let AnalysisReportMos::Series(stats) = report {
+                    line_chart_stats.push(stats);
+                }
+            }
+        }
+
+        let mut set = JoinSet::new();
+        for stats in line_chart_stats.into_iter() {
+            let path = test_path.to_string();
+            let stats = stats.clone();
+            set.spawn_blocking(move || {
+                if let Err(err) = Report::create_line_chart(&path, &stats) {
+                    error!("create_line_chart() error: {}", err);
+                }
+            });
+        }
+        while (set.join_next().await).is_some() {}
+    }
+
+    pub async fn create_test_case_report(
+        &self,
+        set_name: &str,
+        reference_spectrogram: &str,
+        network_configs: &Vec<NetworkConfigWithOffset>,
+        test_case_config: &TestCaseConfig,
+    ) -> Result<()> {
+        let mut buf = vec![];
+        let html = Html::new();
+
+        buf.extend_from_slice(
+            html.header(&format!("{}/{} Report", set_name, self.report_name))
+                .as_bytes(),
+        );
+
+        buf.extend_from_slice(
+            html.report_heading(
+                set_name,
+                test_case_config,
+                &self.report_name,
+                &self.client_name,
+                &self.analysis_report,
+            )
+            .as_bytes(),
+        );
+        buf.extend_from_slice(html.network_config_section(network_configs).as_bytes());
+        buf.extend_from_slice(html.call_config_section(test_case_config).as_bytes());
+
+        // Add charts for audio mos results if they represent a series to the "Audio Core" section.
+        let mut audio_core_stats: Vec<&Stats> = vec![];
+
+        if let Some(analysis_report) = &self.analysis_report {
+            if let AnalysisReportMos::Series(stats) =
+                &analysis_report.audio_test_results.visqol_mos_speech
+            {
+                audio_core_stats.push(stats);
+            }
+            if let AnalysisReportMos::Series(stats) =
+                &analysis_report.audio_test_results.visqol_mos_audio
+            {
+                audio_core_stats.push(stats);
+            }
+            if let AnalysisReportMos::Series(stats) = &analysis_report.audio_test_results.pesq_mos {
+                audio_core_stats.push(stats);
+            }
+            if let AnalysisReportMos::Series(stats) = &analysis_report.audio_test_results.plc_mos {
+                audio_core_stats.push(stats);
+            }
+            if let AnalysisReportMos::Series(stats) =
+                &analysis_report.audio_test_results.mos_average
+            {
+                audio_core_stats.push(stats);
+            }
+        }
+
+        if !audio_core_stats.is_empty() {
+            let audio_core_stats = Self::build_stats_rows(&html, &audio_core_stats);
+            buf.extend_from_slice(
+                html.accordion_section(
+                    "audioCore",
+                    vec![HtmlAccordionItem {
+                        label: "Call Audio Core".to_string(),
+                        body: audio_core_stats,
+                        collapsed: true,
+                    }],
+                )
+                .as_bytes(),
+            );
+        }
+
+        if test_case_config.client_b_config.audio.generate_spectrogram {
+            buf.extend_from_slice(
+                html.accordion_section(
+                    "spectrograms",
+                    vec![HtmlAccordionItem {
+                        label: "Call Audio Spectrograms".to_string(),
+                        body: html.two_image_section(
+                            Some("Call Audio Spectrograms"),
+                            reference_spectrogram,
+                            Some("Original"),
+                            &format!("{}.png", self.client_name_wav),
+                            Some("Measured"),
+                        ),
+                        collapsed: true,
+                    }],
+                )
+                .as_bytes(),
+            );
+        }
+
+        let container_stats = Self::build_stats_rows(
+            &html,
+            &[
+                &self.docker_stats_report.cpu_usage,
+                &self.docker_stats_report.mem_usage,
+                &self.docker_stats_report.tx_bitrate,
+                &self.docker_stats_report.rx_bitrate,
+            ],
+        );
+        buf.extend_from_slice(
+            html.accordion_section(
+                "dockerStats",
+                vec![HtmlAccordionItem {
+                    label: "Docker Stats".to_string(),
+                    body: container_stats,
+                    collapsed: true,
+                }],
+            )
+            .as_bytes(),
+        );
+
+        if test_case_config.client_b_config.audio.adaptation > 0 {
+            let audio_adaptation = &self.client_log_report.audio_adaptation;
+            let audio_adaptation = Self::build_stats_rows(
+                &html,
+                &[&audio_adaptation.bitrate, &audio_adaptation.packet_length],
+            );
+            buf.extend_from_slice(
+                html.accordion_section(
+                    "audioAdaptation",
+                    vec![HtmlAccordionItem {
+                        label: "Audio Adaptation".to_string(),
+                        body: audio_adaptation,
+                        collapsed: true,
+                    }],
+                )
+                .as_bytes(),
+            );
+        }
+
+        let connection_stats = &self.client_log_report.connection_stats;
+        let connection_stats = Self::build_stats_rows(
+            &html,
+            &[
+                &connection_stats.current_round_trip_time,
+                &connection_stats.available_outgoing_bitrate,
+            ],
+        );
+        buf.extend_from_slice(
+            html.accordion_section(
+                "connectionStats",
+                vec![HtmlAccordionItem {
+                    label: "Client Connection Stats".to_string(),
+                    body: connection_stats,
+                    collapsed: true,
+                }],
+            )
+            .as_bytes(),
+        );
+
+        let audio_send_stats = &self.client_log_report.audio_send_stats;
+        let audio_send_stats_body = Self::build_stats_rows(
+            &html,
+            &[
+                &audio_send_stats.packets_per_second,
+                &audio_send_stats.average_packet_size,
+                &audio_send_stats.bitrate,
+                &audio_send_stats.remote_packet_loss,
+                &audio_send_stats.remote_jitter,
+                &audio_send_stats.remote_round_trip_time,
+                &audio_send_stats.audio_energy,
+            ],
+        );
+        buf.extend_from_slice(
+            html.accordion_section(
+                "audioSendStats",
+                vec![HtmlAccordionItem {
+                    label: format!("Client Audio Send Stats (SSRC={})", audio_send_stats.ssrc),
+                    body: audio_send_stats_body,
+                    collapsed: true,
+                }],
+            )
+            .as_bytes(),
+        );
+
+        for audio_receive_stats in &self.client_log_report.audio_receive_stats_list {
+            let ssrc = &audio_receive_stats.ssrc;
+            let audio_receive_stats = Self::build_stats_rows(
+                &html,
+                &[
+                    &audio_receive_stats.packets_per_second,
+                    &audio_receive_stats.packet_loss,
+                    &audio_receive_stats.bitrate,
+                    &audio_receive_stats.jitter,
+                    &audio_receive_stats.jitter_buffer_delay,
+                    &audio_receive_stats.jitter_buffer_target_delay,
+                    &audio_receive_stats.jitter_buffer_flushes,
+                    &audio_receive_stats.audio_energy,
+                    &audio_receive_stats.concealed_samples_pct,
+                    &audio_receive_stats.fec_packets_received,
+                    &audio_receive_stats.relative_arrival_delay_per_packet,
+                ],
+            );
+            buf.extend_from_slice(
+                html.accordion_section(
+                    &format!("audioReceiveStats-{ssrc}"),
+                    vec![HtmlAccordionItem {
+                        label: "Client Audio Receive Stats".to_string(),
+                        body: audio_receive_stats,
+                        collapsed: true,
+                    }],
+                )
+                .as_bytes(),
+            );
+        }
+
+        if self.show_video {
+            for video_send_stats in &self.client_log_report.video_send_stats {
+                let ssrc = &video_send_stats.ssrc;
+                let video_send_stats = Self::build_stats_rows(
+                    &html,
+                    &[
+                        &video_send_stats.packets_per_second,
+                        &video_send_stats.average_packet_size,
+                        &video_send_stats.bitrate,
+                        &video_send_stats.source_framerate,
+                        &video_send_stats.framerate,
+                        &video_send_stats.key_frames_encoded,
+                        &video_send_stats.retransmitted_packets_sent,
+                        &video_send_stats.retransmitted_bitrate,
+                        &video_send_stats.send_delay_per_packet,
+                        &video_send_stats.nack_count,
+                        &video_send_stats.pli_count,
+                        &video_send_stats.remote_packet_loss,
+                        &video_send_stats.remote_jitter,
+                        &video_send_stats.remote_round_trip_time,
+                    ],
+                );
+
+                buf.extend_from_slice(
+                    html.accordion_section(
+                        &format!("videoSendStats-{ssrc}"),
+                        vec![HtmlAccordionItem {
+                            label: format!("Client Video Send Stats (ssrc={ssrc})"),
+                            body: video_send_stats,
+                            collapsed: true,
+                        }],
+                    )
+                    .as_bytes(),
+                );
+            }
+
+            for video_receive_stats in &self.client_log_report.video_receive_stats_list {
+                let ssrc = &video_receive_stats.ssrc;
+                let video_receive_stats = Self::build_stats_rows(
+                    &html,
+                    &[
+                        &video_receive_stats.packets_per_second,
+                        &video_receive_stats.packet_loss,
+                        &video_receive_stats.bitrate,
+                        &video_receive_stats.framerate,
+                        &video_receive_stats.key_frames_decoded,
+                    ],
+                );
+
+                buf.extend_from_slice(
+                    html.accordion_section(
+                        &format!("videoReceiveStats-{ssrc}"),
+                        vec![HtmlAccordionItem {
+                            label: format!("Client Video Receive Stats (ssrc={ssrc})"),
+                            body: video_receive_stats,
+                            collapsed: true,
+                        }],
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+
+        buf.extend_from_slice(html.footer().as_bytes());
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&format!("{}/report.html", self.test_path))
+            .await?;
+
+        if let Err(err) = file.write_all(buf.as_slice()).await {
+            error!("Error writing file! {err}");
+        }
+
+        Ok(())
+    }
+
+    fn build_stats_rows(html: &Html, stats_charts: &[&Stats]) -> String {
+        let mut stats_html = String::new();
+
+        // Put up to two charts per row.
+        for stats_chart in stats_charts.chunks(2) {
+            match stats_chart {
+                [stats_chart_left, stats_chart_right] => {
+                    stats_html.push_str(&html.stats_row(
+                        Some(stats_chart_left),
+                        Some(stats_chart_right),
+                        false,
+                        true,
+                    ));
+                }
+                [stats_chart_left] => {
+                    stats_html.push_str(&html.stats_row(Some(stats_chart_left), None, false, true));
+                }
+                _ => {}
+            }
+        }
+
+        stats_html
+    }
+
+    /// Return the stats value (the average) for the given dimension.
+    fn get_stats_value_for_chart(report: &Report, chart_dimension: &ChartDimension) -> f32 {
+        match chart_dimension {
+            ChartDimension::MosSpeech => report.analysis_report.as_ref().map_or(0f32, |ar| {
+                ar.audio_test_results
+                    .visqol_mos_speech
+                    .get_mos_for_display()
+                    .unwrap_or(0f32)
+            }),
+            ChartDimension::MosAudio => report.analysis_report.as_ref().map_or(0f32, |ar| {
+                ar.audio_test_results
+                    .visqol_mos_audio
+                    .get_mos_for_display()
+                    .unwrap_or(0f32)
+            }),
+            ChartDimension::ContainerCpuUsage => report.docker_stats_report.cpu_usage.data.ave,
+            ChartDimension::ContainerMemUsage => report.docker_stats_report.mem_usage.data.ave,
+            ChartDimension::ContainerTxBitrate => report.docker_stats_report.tx_bitrate.data.ave,
+            ChartDimension::ContainerRxBitrate => report.docker_stats_report.rx_bitrate.data.ave,
+            ChartDimension::ConnectionCurrentRoundTripTime => {
+                report
+                    .client_log_report
+                    .connection_stats
+                    .current_round_trip_time
+                    .data
+                    .ave
+            }
+            ChartDimension::ConnectionOutgoingBitrate => {
+                report
+                    .client_log_report
+                    .connection_stats
+                    .available_outgoing_bitrate
+                    .data
+                    .ave
+            }
+            ChartDimension::AudioSendPacketsPerSecond => {
+                report
+                    .client_log_report
+                    .audio_send_stats
+                    .packets_per_second
+                    .data
+                    .ave
+            }
+            ChartDimension::AudioSendPacketSize => {
+                report
+                    .client_log_report
+                    .audio_send_stats
+                    .average_packet_size
+                    .data
+                    .ave
+            }
+            ChartDimension::AudioSendBitrate => {
+                report.client_log_report.audio_send_stats.bitrate.data.ave
+            }
+            ChartDimension::AudioSendRemotePacketLoss => {
+                report
+                    .client_log_report
+                    .audio_send_stats
+                    .remote_packet_loss
+                    .data
+                    .ave
+            }
+            ChartDimension::AudioSendRemoteJitter => {
+                report
+                    .client_log_report
+                    .audio_send_stats
+                    .remote_jitter
+                    .data
+                    .ave
+            }
+            ChartDimension::AudioSendRemoteRoundTripTime => {
+                report
+                    .client_log_report
+                    .audio_send_stats
+                    .remote_round_trip_time
+                    .data
+                    .ave
+            }
+            ChartDimension::AudioSendAudioEnergy => {
+                report
+                    .client_log_report
+                    .audio_send_stats
+                    .audio_energy
+                    .data
+                    .ave
+            }
+            ChartDimension::AudioReceivePacketsPerSecond => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.packets_per_second.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::AudioReceivePacketLoss => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.packet_loss.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::AudioReceiveBitrate => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.bitrate.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::AudioReceiveJitter => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.jitter.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::AudioReceiveAudioEnergy => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.audio_energy.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::AudioReceiveJitterBufferDelay => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.jitter_buffer_delay.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::AudioReceiveJitterBufferTargetDelay => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.jitter_buffer_target_delay.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::AudioReceiveConcealedSamplesPct => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.concealed_samples_pct.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::AudioReceiveFecPacketsReceived => average(
+                &report
+                    .client_log_report
+                    .audio_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.fec_packets_received.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendPacketsPerSecond => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.packets_per_second.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendPacketSize => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.average_packet_size.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendBitrate => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.bitrate.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendFramerate => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.framerate.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendKeyFramesEncoded => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.key_frames_encoded.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendRetransmittedPacketsSent => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.retransmitted_packets_sent.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendRetransmittedBitrate => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.retransmitted_bitrate.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendDelayPerPacket => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.send_delay_per_packet.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendNackCount => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.nack_count.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendPliCount => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.pli_count.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendRemotePacketLoss => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.remote_packet_loss.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendRemoteJitter => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.remote_jitter.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoSendRemoteRoundTripTime => average(
+                &report
+                    .client_log_report
+                    .video_send_stats
+                    .iter()
+                    .map(|stats| stats.remote_round_trip_time.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoReceivePacketsPerSecond => average(
+                &report
+                    .client_log_report
+                    .video_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.packets_per_second.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoReceivePacketLoss => average(
+                &report
+                    .client_log_report
+                    .video_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.packet_loss.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoReceiveBitrate => average(
+                &report
+                    .client_log_report
+                    .video_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.bitrate.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoReceiveFramerate => average(
+                &report
+                    .client_log_report
+                    .video_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.framerate.data.ave)
+                    .collect_vec(),
+            ),
+            ChartDimension::VideoReceiveKeyFramesDecoded => average(
+                &report
+                    .client_log_report
+                    .video_receive_stats_list
+                    .iter()
+                    .map(|stats| stats.key_frames_decoded.data.ave)
+                    .collect_vec(),
+            ),
+        }
+    }
+
+    pub async fn create_summary_report(
+        set_name: &str,
+        set_path: &str,
+        time_started: &str,
+        group_reports: &[GroupRun],
+        sounds: &HashMap<String, Sound>,
+    ) -> Result<()> {
+        info!("Creating summary report for {}", set_name);
+
+        let mut buf = vec![];
+        let html = Html::new();
+
+        buf.extend_from_slice(
+            html.header(&format!("Summary Report: {}", set_name))
+                .as_bytes(),
+        );
+
+        buf.extend_from_slice(html.summary_heading(set_name, time_started).as_bytes());
+
+        for (i, report) in group_reports.iter().enumerate() {
+            // Add the summary table to the report contents.
+            let mut report_contents =
+                html.summary_report_section(&report.reports, &report.group_config);
+
+            // Add the call audio core summary table if needed.
+            if let Some(call_audio_core_summary) =
+                html.summary_call_audio_core_section(&report.reports, &report.group_config)
+            {
+                report_contents.push_str(&html.accordion_section(
+                    &format!("groupCallAudioCoreSummary_{}", i),
+                    vec![HtmlAccordionItem {
+                        label: "Call Audio Core Summary".to_string(),
+                        body: call_audio_core_summary,
+                        collapsed: false,
+                    }],
+                ));
+            }
+
+            let mut stats_charts = vec![];
+
+            // Now generate and show any charts configured for the group.
+            for chart_dimension in &report.group_config.chart_dimensions {
+                let mut domain = vec![];
+                let mut data = vec![];
+
+                // Keep our own stats object for all the MOS values we will chart.
+                let mut stats = Stats::default();
+                // For the summary, we want all the data values to be considered for statistics.
+                stats.data.set_filter(0, usize::MAX);
+
+                for (i, test_report) in report.reports.iter().flatten().enumerate() {
+                    // Attempt to get the given x_label (if it exists).
+                    let x_label = if let Some(label) = report.group_config.x_labels.get(i) {
+                        label.to_string()
+                    } else {
+                        // For now, the default is a combination of the test case name and the
+                        // network profile name, since the sound is usually constant for groups
+                        // of tests.
+                        format!(
+                            "{}@{}",
+                            test_report.test_case_name,
+                            test_report.network_profile.get_name()
+                        )
+                    };
+
+                    // Get the value to chart.
+                    let value = Report::get_stats_value_for_chart(test_report, chart_dimension);
+
+                    // For charting keep the value to 3 decimal places.
+                    let rounded_value = (value * 1000.0).round() / 1000.0;
+
+                    domain.push(x_label.to_string());
+                    data.push(rounded_value);
+
+                    stats.data.push(rounded_value);
+                }
+
+                let (title, y_label) = chart_dimension.get_title_and_y_label();
+
+                stats.config.title = title.to_string();
+                stats.config.y_label = y_label.to_string();
+                stats.config.y_max = Some(stats.data.max);
+                stats.config.x_label = "Test Case".to_string();
+                stats.config.chart_name = format!(
+                    "{}.{}.chart.svg",
+                    report.group_config.group_name,
+                    chart_dimension.get_name()
+                );
+
+                if let Err(err) = Report::create_bar_chart(set_path, &stats, domain, data) {
+                    error!("create_line_chart() error: {}", err);
+                }
+
+                stats_charts.push(stats);
+            }
+
+            if !stats_charts.is_empty() {
+                let mut stats_rows = String::new();
+
+                // Put up to two charts per row.
+                for stats_chart in stats_charts.chunks(2) {
+                    match stats_chart {
+                        [stats_chart_left, stats_chart_right] => {
+                            stats_rows.push_str(&html.stats_row(
+                                Some(stats_chart_left),
+                                Some(stats_chart_right),
+                                false,
+                                false,
+                            ));
+                        }
+                        [stats_chart_left] => {
+                            stats_rows.push_str(&html.stats_row(
+                                Some(stats_chart_left),
+                                None,
+                                false,
+                                false,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Add the group charts to our report as a 'sub' accordion.
+                report_contents.push_str(&html.accordion_section(
+                    &format!("groupReport_{}", i),
+                    vec![HtmlAccordionItem {
+                        label: "Charts".to_string(),
+                        body: stats_rows,
+                        collapsed: true,
+                    }],
+                ));
+            }
+
+            // Show the report accordion.
+            buf.extend_from_slice(
+                html.accordion_section(
+                    &format!("group_{}", i),
+                    vec![HtmlAccordionItem {
+                        label: format!("Group: {}", report.group_config.group_name),
+                        body: report_contents,
+                        collapsed: false,
+                    }],
+                )
+                .as_bytes(),
+            );
+        }
+
+        buf.extend_from_slice(
+            html.accordion_section(
+                "mosReference",
+                vec![HtmlAccordionItem {
+                    label: "Reference Sounds".to_string(),
+                    body: html.summary_sounds_item_body(sounds),
+                    collapsed: true,
+                }],
+            )
+            .as_bytes(),
+        );
+
+        buf.extend_from_slice(html.footer().as_bytes());
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&format!("{}/summary.html", set_path))
+            .await?;
+
+        if let Err(err) = file.write_all(buf.as_slice()).await {
+            error!("Error writing file! {err}");
+        }
+
+        Ok(())
+    }
+}
+
+/// A summary row can represent a single record, an aggregate item, or an aggregate average,
+/// calculated from 2 or more aggregate items.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SummaryRowType {
+    Single,
+    Aggregate,
+    AggregateItem,
+}
+
+/// A convenience struct for tracking the averaged values for a row in the summary report. This
+/// is particularly useful when aggregating values from several rows.
+#[derive(Copy, Clone)]
+struct SummaryRow {
+    pub audio_send_packet_size: f32,
+    pub audio_send_packet_rate: f32,
+    pub audio_send_bitrate: f32,
+
+    pub audio_receive_packet_rate: f32,
+    pub audio_receive_bitrate: f32,
+    pub audio_receive_loss: f32,
+    pub audio_receive_loss_std_dev: f32,
+    pub concealed_samples_pct: f32,
+    pub fec_packets_received_total: f32,
+
+    pub container_cpu: f32,
+    pub container_memory: f32,
+    pub container_tx_bitrate: f32,
+    pub container_rx_bitrate: f32,
+
+    pub visqol_mos_speech: Option<f32>,
+    pub visqol_mos_audio: Option<f32>,
+    pub pesq_mos: Option<f32>,
+    pub plc_mos: Option<f32>,
+    pub mos_average: Option<f32>,
+
+    pub vmaf: Option<f32>,
+
+    pub row_type: SummaryRowType,
+    pub row_index: usize,
+
+    pub video_send_resolution: f32,
+    pub video_send_framerate: f32,
+    pub video_recv_resolution: f32,
+    pub video_recv_framerate: f32,
+}
+
+impl SummaryRow {
+    pub fn new(report: &Report) -> Self {
+        // sum average across all SSRCs to get true mixed average
+        let (
+            audio_receive_packet_rate,
+            audio_receive_bitrate,
+            audio_receive_loss,
+            audio_receive_loss_std_dev,
+            concealed_samples_pct,
+            fec_packets_received_total,
+        ) = report
+            .client_log_report
+            .audio_receive_stats_list
+            .iter()
+            .fold((0.0, 0.0, 0.0, 0.0, 0.0, 0.0), |acc, stats| {
+                (
+                    acc.0 + stats.packets_per_second.data.ave,
+                    acc.1 + stats.bitrate.data.ave,
+                    acc.2 + stats.packet_loss.data.ave,
+                    acc.3 + stats.packet_loss.data.std_dev,
+                    acc.4 + stats.concealed_samples_pct.data.ave,
+                    acc.5 + stats.fec_packets_received.data.total,
+                )
+            });
+        Self {
+            audio_send_packet_size: report
+                .client_log_report
+                .audio_send_stats
+                .average_packet_size
+                .data
+                .ave,
+            audio_send_packet_rate: report
+                .client_log_report
+                .audio_send_stats
+                .packets_per_second
+                .data
+                .ave,
+            audio_send_bitrate: report.client_log_report.audio_send_stats.bitrate.data.ave,
+            audio_receive_packet_rate,
+            audio_receive_bitrate,
+            audio_receive_loss,
+            audio_receive_loss_std_dev,
+            concealed_samples_pct,
+            fec_packets_received_total: fec_packets_received_total as f32,
+            container_cpu: report.docker_stats_report.cpu_usage.data.ave,
+            container_memory: report.docker_stats_report.mem_usage.data.ave,
+            container_tx_bitrate: report.docker_stats_report.tx_bitrate.data.ave,
+            container_rx_bitrate: report.docker_stats_report.rx_bitrate.data.ave,
+            visqol_mos_speech: report.analysis_report.as_ref().and_then(|ar| {
+                ar.audio_test_results
+                    .visqol_mos_speech
+                    .get_mos_for_display()
+            }),
+            visqol_mos_audio: report
+                .analysis_report
+                .as_ref()
+                .and_then(|ar| ar.audio_test_results.visqol_mos_audio.get_mos_for_display()),
+            pesq_mos: report
+                .analysis_report
+                .as_ref()
+                .and_then(|ar| ar.audio_test_results.pesq_mos.get_mos_for_display()),
+            plc_mos: report
+                .analysis_report
+                .as_ref()
+                .and_then(|ar| ar.audio_test_results.plc_mos.get_mos_for_display()),
+            mos_average: report
+                .analysis_report
+                .as_ref()
+                .and_then(|ar| ar.audio_test_results.mos_average.get_mos_for_display()),
+            vmaf: report.analysis_report.as_ref().and_then(|ar| ar.vmaf),
+            row_type: SummaryRowType::Single,
+            row_index: 0,
+            video_send_resolution: report
+                .client_log_report
+                .video_send_stats
+                .first()
+                .map(|s| s.resolution.data.ave)
+                .unwrap_or(0.0),
+            video_send_framerate: report
+                .client_log_report
+                .video_send_stats
+                .first()
+                .map(|s| s.framerate.data.ave)
+                .unwrap_or(0.0),
+            video_recv_resolution: report
+                .client_log_report
+                .video_receive_stats_list
+                .first()
+                .map(|s| s.resolution.data.ave)
+                .unwrap_or(0.0),
+            video_recv_framerate: report
+                .client_log_report
+                .video_receive_stats_list
+                .first()
+                .map(|s| s.framerate.data.ave)
+                .unwrap_or(0.0),
+        }
+    }
+
+    pub fn new_aggregate(report: &Report) -> Self {
+        let mut aggregate = Self::new(report);
+        aggregate.row_type = SummaryRowType::Aggregate;
+        aggregate
+    }
+
+    pub fn set_aggregate_item(&mut self, row_index: usize) {
+        self.row_type = SummaryRowType::AggregateItem;
+        self.row_index = row_index;
+    }
+
+    /// Update the aggregated averages for all values.
+    pub fn update(&mut self, new: &Self, count: usize) {
+        let new_average = |old_value: f32, new_value: f32| -> f32 {
+            (old_value * (count as f32 - 1f32) + new_value) / count as f32
+        };
+
+        if count > 1 {
+            self.audio_send_packet_size =
+                new_average(self.audio_send_packet_size, new.audio_send_packet_size);
+            self.audio_send_packet_rate =
+                new_average(self.audio_send_packet_rate, new.audio_send_packet_rate);
+            self.audio_send_bitrate = new_average(self.audio_send_bitrate, new.audio_send_bitrate);
+            self.audio_receive_packet_rate = new_average(
+                self.audio_receive_packet_rate,
+                new.audio_receive_packet_rate,
+            );
+            self.audio_receive_bitrate =
+                new_average(self.audio_receive_bitrate, new.audio_receive_bitrate);
+            self.audio_receive_loss = new_average(self.audio_receive_loss, new.audio_receive_loss);
+            self.audio_receive_loss_std_dev = new_average(
+                self.audio_receive_loss_std_dev,
+                new.audio_receive_loss_std_dev,
+            );
+            self.concealed_samples_pct =
+                new_average(self.concealed_samples_pct, new.concealed_samples_pct);
+            self.fec_packets_received_total = new_average(
+                self.fec_packets_received_total,
+                new.fec_packets_received_total,
+            );
+            self.container_cpu = new_average(self.container_cpu, new.container_cpu);
+            self.container_memory = new_average(self.container_memory, new.container_memory);
+            self.container_tx_bitrate =
+                new_average(self.container_tx_bitrate, new.container_tx_bitrate);
+            self.container_rx_bitrate =
+                new_average(self.container_rx_bitrate, new.container_rx_bitrate);
+
+            // We expect mos and vmaf to always be there or never.
+            if let (Some(old), Some(new)) = (self.visqol_mos_speech, new.visqol_mos_speech) {
+                self.visqol_mos_speech = Some(new_average(old, new));
+            }
+            if let (Some(old), Some(new)) = (self.visqol_mos_audio, new.visqol_mos_audio) {
+                self.visqol_mos_audio = Some(new_average(old, new));
+            }
+            if let (Some(old), Some(new)) = (self.pesq_mos, new.pesq_mos) {
+                self.pesq_mos = Some(new_average(old, new));
+            }
+            if let (Some(old), Some(new)) = (self.plc_mos, new.plc_mos) {
+                self.plc_mos = Some(new_average(old, new));
+            }
+            if let (Some(old), Some(new)) = (self.mos_average, new.mos_average) {
+                self.mos_average = Some(new_average(old, new));
+            }
+            if let (Some(vmaf), Some(new_vmaf)) = (self.vmaf, new.vmaf) {
+                self.vmaf = Some(new_average(vmaf, new_vmaf));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SummaryCallAudioCoreRow {
+    pub mos_over_time: Vec<(i32, f32)>,
+    pub mos_average: Option<f32>,
+    pub row_type: SummaryRowType,
+    pub row_index: usize,
+}
+
+impl SummaryCallAudioCoreRow {
+    pub fn new(report: &Report) -> Option<Self> {
+        if let Some(AnalysisReport {
+            audio_test_results:
+                AudioTestResults {
+                    mos_average: AnalysisReportMos::Series(stats),
+                    ..
+                },
+            ..
+        }) = &report.analysis_report
+        {
+            let mut mos_over_time = stats
+                .data
+                .points
+                .iter()
+                .map(|(time, mos)| (((time * 10.0).round() as i32), *mos))
+                .collect_vec();
+            mos_over_time.sort_by_key(|(time, _)| *time);
+            Some(Self {
+                mos_over_time,
+                mos_average: report
+                    .analysis_report
+                    .as_ref()
+                    .and_then(|ar| ar.audio_test_results.mos_average.get_mos_for_display()),
+                row_type: SummaryRowType::Single,
+                row_index: 0,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn new_aggregate(report: &Report) -> Option<Self> {
+        let mut aggregate = Self::new(report)?;
+        aggregate.row_type = SummaryRowType::Aggregate;
+        Some(aggregate)
+    }
+
+    pub fn set_aggregate_item(&mut self, row_index: usize) {
+        self.row_type = SummaryRowType::AggregateItem;
+        self.row_index = row_index;
+    }
+
+    pub fn update(&mut self, new: &Self, count: usize) {
+        let new_average = |old_value: f32, new_value: f32| -> f32 {
+            (old_value * (count as f32 - 1f32) + new_value) / count as f32
+        };
+
+        if count > 1 {
+            for (new_time, new_value) in &new.mos_over_time {
+                if let Some((_, value)) = self
+                    .mos_over_time
+                    .iter_mut()
+                    .find(|(time, _)| time == new_time)
+                {
+                    *value = new_average(*value, *new_value);
+                } else {
+                    self.mos_over_time.push((*new_time, *new_value));
+                }
+            }
+            self.mos_over_time.sort_by_key(|(time, _)| *time);
+
+            if let (Some(old), Some(new)) = (self.mos_average, new.mos_average) {
+                self.mos_average = Some(new_average(old, new));
+            }
+        }
+    }
+}
+
+pub struct HtmlAccordionItem {
+    label: String,
+    body: String,
+    collapsed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct Html {}
+
+impl Html {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    /// This creates the HTML header, including opening the body with a bootstrap container.
+    pub fn header(self, title: &str) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<!doctype html>\n");
+        buf.push_str("<html lang=\"en\">\n");
+        buf.push_str("<head>\n");
+        buf.push_str("<meta charset=\"utf-8\">\n");
+        buf.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+
+        let _ = writeln!(buf, "<title>{}</title>", title);
+
+        buf.push_str("<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/css/bootstrap.min.css\" \
+                  rel=\"stylesheet\" integrity=\"sha384-Zenh87qX5JnK2Jl0vWa8Ck2rdkQ2Bzep5IDxbcnCeuOxjzrPF/et3URy9Bv1WTRi\" \
+                  crossorigin=\"anonymous\">\n");
+
+        buf.push_str("</head>\n");
+        buf.push_str("<body>\n");
+        buf.push_str("<div class=\"container-fluid\">\n");
+
+        buf
+    }
+
+    /// This closes the HTML and terminates the bootstrap container.
+    pub fn footer(&self) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("</div>\n");
+        buf.push_str("<script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/js/bootstrap.min.js\" \
+                 integrity=\"sha384-IDwe1+LCz02ROU9k972gdyvl+AESN10+x7tBKgc9I5HFtuNz0wWnPclzo6p9vxnk\" \
+                 crossorigin=\"anonymous\"></script>\n");
+        buf.push_str("</body>\n");
+        buf.push_str("</html>\n");
+
+        buf
+    }
+
+    pub fn accordion_section(&self, id: &str, items: Vec<HtmlAccordionItem>) -> String {
+        let mut buf = String::new();
+
+        let _ = writeln!(buf, "<div class=\"accordion\" id=\"{}\">\n", id);
+        buf.push_str("<div class=\"accordion-item\">\n");
+
+        for (i, item) in items.iter().enumerate() {
+            let _ = writeln!(
+                buf,
+                "<h4 class=\"accordion-header\" id=\"{}-heading{}\">\n",
+                id, i
+            );
+            let _ = writeln!(
+                buf,
+                "<button class=\"accordion-button{}\" type=\"button\" data-bs-toggle=\"collapse\" \
+                    data-bs-target=\"#{}-collapse{}\" aria-expanded=\"true\" aria-controls=\"{}-collapse{}\">\n",
+                if item.collapsed { " collapsed" } else { "" },
+                id,
+                i,
+                id,
+                i
+            );
+
+            let _ = writeln!(buf, "<h4>{}</h4>\n", item.label);
+            buf.push_str("</button>\n");
+            buf.push_str("</h4>\n");
+
+            let _ = writeln!(
+                buf,
+                "<div id=\"{}-collapse{}\" class=\"accordion-collapse collapse{}\" \
+                    aria-labelledby=\"{}-heading{}\">\n",
+                id,
+                i,
+                if item.collapsed { "" } else { " show" },
+                id,
+                i
+            );
+
+            buf.push_str("<div class=\"accordion-body\">\n");
+
+            buf.push_str(&item.body);
+
+            buf.push_str("</div>\n");
+            buf.push_str("</div>\n");
+        }
+
+        buf.push_str("</div>\n");
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    fn get_emphasis_for_mos(mos: Option<f32>) -> &'static str {
+        if let Some(weight) = mos {
+            if weight >= 3.8 {
+                "success"
+            } else if weight >= 3.0 {
+                "warning"
+            } else if weight >= 0.0 {
+                "danger"
+            } else {
+                ""
+            }
+        } else {
+            ""
+        }
+    }
+
+    pub fn report_heading(
+        &self,
+        set_name: &str,
+        test_case_config: &TestCaseConfig,
+        test_name: &str,
+        client_name: &str,
+        analysis_report: &Option<AnalysisReport>,
+    ) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+        buf.push_str("<div class=\"col-md-6\">\n");
+
+        let _ = writeln!(buf, "<h2>{}/{}</h2>", set_name, test_name);
+        let _ = writeln!(buf, "<h3 class=\"text-muted\">Client: {}</h3>", client_name);
+
+        buf.push_str("</div>\n");
+        buf.push_str("<div class=\"col-md-6\">\n");
+
+        let (visqol_mos_speech, visqol_mos_audio, pesq_mos, plc_mos, mos_average) =
+            if let Some(analysis_report) = analysis_report {
+                (
+                    analysis_report
+                        .audio_test_results
+                        .visqol_mos_speech
+                        .get_mos_for_display(),
+                    analysis_report
+                        .audio_test_results
+                        .visqol_mos_audio
+                        .get_mos_for_display(),
+                    analysis_report
+                        .audio_test_results
+                        .pesq_mos
+                        .get_mos_for_display(),
+                    analysis_report
+                        .audio_test_results
+                        .plc_mos
+                        .get_mos_for_display(),
+                    analysis_report
+                        .audio_test_results
+                        .mos_average
+                        .get_mos_for_display(),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
+        let text_emphasis = Html::get_emphasis_for_mos(mos_average);
+
+        if test_case_config
+            .client_b_config
+            .audio
+            .visqol_speech_analysis
+        {
+            let visqol_mos_speech_string = visqol_mos_speech
+                .map(|mos| format!("{:.3}", mos))
+                .unwrap_or_else(|| "None".to_string());
+
+            let _ = writeln!(
+                buf,
+                "<h2 class=\"text-right text-{}\">Visqol Speech: {}</h2>",
+                text_emphasis, visqol_mos_speech_string,
+            );
+        }
+
+        if test_case_config.client_b_config.audio.visqol_audio_analysis {
+            let visqol_mos_audio_string = visqol_mos_audio
+                .map(|mos| format!("{:.3}", mos))
+                .unwrap_or_else(|| "None".to_string());
+
+            let _ = writeln!(
+                buf,
+                "<h2 class=\"text-right text-{}\">Visqol Audio: {}</h2>",
+                text_emphasis, visqol_mos_audio_string,
+            );
+        }
+
+        if test_case_config.client_b_config.audio.pesq_speech_analysis {
+            let pesq_mos_string = pesq_mos
+                .map(|mos| format!("{:.3}", mos))
+                .unwrap_or_else(|| "None".to_string());
+
+            let _ = writeln!(
+                buf,
+                "<h2 class=\"text-right text-{}\">PESQ: {}</h2>",
+                text_emphasis, pesq_mos_string,
+            );
+        }
+
+        if test_case_config.client_b_config.audio.plc_speech_analysis {
+            let plc_mos_string = plc_mos
+                .map(|mos| format!("{:.3}", mos))
+                .unwrap_or_else(|| "None".to_string());
+
+            let _ = writeln!(
+                buf,
+                "<h2 class=\"text-right text-{}\">PLC: {}</h2>",
+                text_emphasis, plc_mos_string,
+            );
+        }
+
+        let mos_average_string = mos_average
+            .map(|mos| format!("{:.3}", mos))
+            .unwrap_or_else(|| "None".to_string());
+
+        let _ = writeln!(
+            buf,
+            "<h2 class=\"text-right text-{}\">Average MOS: {}</h2>",
+            text_emphasis, mos_average_string,
+        );
+
+        buf.push_str("</div>\n");
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    pub fn network_config_section(&self, network_configs: &Vec<NetworkConfigWithOffset>) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+        buf.push_str("<div class=\"col-md-12\">\n");
+
+        if network_configs.is_empty() {
+            buf.push_str("<h3>Network Configurations (None)</h3>\n");
+        } else {
+            buf.push_str("<h3>Network Configurations</h3>\n");
+
+            buf.push_str("<table class=\"table\">\n");
+            buf.push_str("<thead>\n");
+            buf.push_str("<tr>\n");
+            buf.push_str("<th>Timestamp</th>\n");
+            buf.push_str("<th>Values</th>\n");
+            buf.push_str("</tr>\n");
+            buf.push_str("</thead>\n");
+            buf.push_str("<tbody>\n");
+
+            for config in network_configs {
+                buf.push_str("<tr>\n");
+                let _ = writeln!(buf, "<td>{}</td>", config.offset.as_secs());
+                let _ = writeln!(
+                    buf,
+                    "<td><code><pre>\n{:#?}</pre></code></td>",
+                    config.network_config
+                );
+                buf.push_str("</tr>\n");
+            }
+
+            buf.push_str("</tbody>\n");
+            buf.push_str("</table>\n");
+        }
+
+        buf.push_str("</div>\n");
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    pub fn call_config_section(&self, test_case_config: &TestCaseConfig) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+
+        buf.push_str("<div class=\"col-md-12\">\n");
+        buf.push_str("<h3>Call Configuration</h3>\n");
+        buf.push_str("</div>\n");
+
+        buf.push_str("<div class=\"col-md-6\">\n");
+        buf.push_str("<h4>Client A</h4>\n");
+        let _ = writeln!(
+            buf,
+            "<p><code><pre>\n{:#?}</pre></code></p>",
+            test_case_config.client_a_config
+        );
+        buf.push_str("</div>\n");
+
+        buf.push_str("<div class=\"col-md-6\">\n");
+        buf.push_str("<h4>Client B</h4>\n");
+        let _ = writeln!(
+            buf,
+            "<p><code><pre>\n{:#?}</pre></code></p>",
+            test_case_config.client_b_config
+        );
+        buf.push_str("</div>\n");
+
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    fn stats_image_and_data(&self, stats: &Stats, show_title: bool, show_stats: bool) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"col-md-6\">\n");
+        if show_title {
+            // Note: Most charts already have an embedded title.
+            let _ = writeln!(buf, "<h4>{}</h4>", stats.config.title);
+        }
+        let _ = writeln!(
+            buf,
+            "<img alt=\"\" class=\"img-fluid\" src=\"{}\" />",
+            stats.config.chart_name
+        );
+
+        if show_stats {
+            buf.push_str("<div class=\"p-3 row justify-content-center\">\n");
+            buf.push_str("<div class=\"col-md-2\">\n");
+            let _ = writeln!(buf, "min: {:.3}", stats.data.min);
+            buf.push_str("</div>\n");
+            buf.push_str("<div class=\"col-md-2\">\n");
+            let _ = writeln!(buf, "max: {:.3}", stats.data.max);
+            buf.push_str("</div>\n");
+            buf.push_str("<div class=\"col-md-2\">\n");
+            let _ = writeln!(buf, "ave: {:.3}", stats.data.ave);
+            buf.push_str("</div>\n");
+            buf.push_str("<div class=\"col-md-2\">\n");
+            let _ = writeln!(buf, "std_dev: {:.3}", stats.data.std_dev);
+            buf.push_str("</div>\n");
+            if stats.config.show_total {
+                buf.push_str("<div class=\"col-md-2\">\n");
+                let _ = writeln!(buf, "tot: {:.0}", stats.data.total);
+                buf.push_str("</div>\n");
+            }
+            buf.push_str("</div>\n");
+        }
+
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    fn stats_row(
+        &self,
+        stats_left: Option<&Stats>,
+        stats_right: Option<&Stats>,
+        show_title: bool,
+        show_stats: bool,
+    ) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+
+        if let Some(stats) = stats_left {
+            buf.push_str(&self.stats_image_and_data(stats, show_title, show_stats));
+        }
+
+        if let Some(stats) = stats_right {
+            buf.push_str(&self.stats_image_and_data(stats, show_title, show_stats));
+        }
+
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    fn two_image_detail(
+        &self,
+        image_left: &str,
+        image_left_title: Option<&str>,
+        image_right: &str,
+        image_right_title: Option<&str>,
+    ) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+        buf.push_str("<div class=\"col-md-6\">\n");
+        if let Some(title) = image_left_title {
+            let _ = writeln!(buf, "<h4>{}</h4>", title);
+        }
+        let _ = writeln!(
+            buf,
+            "<img alt=\"\" class=\"img-fluid\" src=\"{}\" />",
+            image_left
+        );
+        buf.push_str("</div>\n");
+        buf.push_str("<div class=\"col-md-6\">\n");
+        if let Some(title) = image_right_title {
+            let _ = writeln!(buf, "<h4>{}</h4>", title);
+        }
+        let _ = writeln!(
+            buf,
+            "<img alt=\"\" class=\"img-fluid\" src=\"{}\" />",
+            image_right
+        );
+        buf.push_str("</div>\n");
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    pub fn two_image_section(
+        &self,
+        title: Option<&str>,
+        image_left: &str,
+        image_left_title: Option<&str>,
+        image_right: &str,
+        image_right_title: Option<&str>,
+    ) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+        buf.push_str("<div class=\"col-md-12\">\n");
+
+        if let Some(title) = title {
+            let _ = writeln!(buf, "<h3>{}</h3>", title);
+        }
+        buf.push_str(&self.two_image_detail(
+            image_left,
+            image_left_title,
+            image_right,
+            image_right_title,
+        ));
+
+        buf.push_str("</div>\n");
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    pub fn summary_heading(&self, set_name: &str, time_started: &str) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+        buf.push_str("<div class=\"col-md-12\">\n");
+
+        let _ = writeln!(buf, "<h2>Test Set: {}</h2>", set_name);
+        let _ = writeln!(buf, "<h3 class=\"text-muted\">Date: {}</h3>", time_started);
+
+        buf.push_str("</div>\n");
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    fn summary_report_row(
+        &self,
+        group_config: &GroupConfig,
+        report: &Report,
+        summary_row: &SummaryRow,
+        iteration_count_for_group: usize,
+    ) -> String {
+        let mut buf = String::new();
+
+        let table_emphasis = Html::get_emphasis_for_mos(summary_row.mos_average);
+
+        match summary_row.row_type {
+            SummaryRowType::Single => {
+                let _ = writeln!(
+                    buf,
+                    r#"<tr class="table-{} clickable" onclick="window.location='{}/{}/report.html'">"#,
+                    table_emphasis, group_config.group_name, report.report_name
+                );
+            }
+            SummaryRowType::Aggregate => {
+                let _ = writeln!(
+                    buf,
+                    r#"<tr class="table-{}" data-bs-toggle="collapse" data-bs-target=".{}_{}_collapsed">"#,
+                    table_emphasis, group_config.group_name, iteration_count_for_group
+                );
+            }
+            SummaryRowType::AggregateItem => {
+                let _ = writeln!(
+                    buf,
+                    r#"<tr class="table-{} clickable w-auto small fw-light collapse {}_{}_collapsed" onclick="window.location='{}/{}_{}/report.html'">"#,
+                    table_emphasis,
+                    group_config.group_name,
+                    iteration_count_for_group,
+                    group_config.group_name,
+                    report.report_name,
+                    summary_row.row_index
+                );
+            }
+        }
+
+        let indent = if summary_row.row_type == SummaryRowType::AggregateItem {
+            "&nbsp;&nbsp"
+        } else {
+            ""
+        };
+
+        let _ = writeln!(buf, "<td>{}{}</td>", indent, report.test_case_name);
+        let _ = writeln!(buf, "<td>{}{}</td>", indent, report.sound_name);
+        if group_config.summary_report_columns.show_video {
+            let _ = writeln!(buf, "<td>{}{}</td>", indent, report.video_name);
+        }
+        let _ = writeln!(
+            buf,
+            "<td>{}{}</td>",
+            indent,
+            report.network_profile.get_name()
+        );
+
+        if group_config.summary_report_columns.show_send_stats {
+            let _ = writeln!(
+                buf,
+                "<td>{}{:.0}</td>",
+                indent, summary_row.audio_send_packet_size
+            );
+            let _ = writeln!(
+                buf,
+                "<td>{}{:.2}</td>",
+                indent, summary_row.audio_send_packet_rate
+            );
+            let _ = writeln!(
+                buf,
+                "<td>{}{:.2}</td>",
+                indent, summary_row.audio_send_bitrate
+            );
+
+            if group_config.summary_report_columns.show_video {
+                let _ = writeln!(
+                    buf,
+                    "<td>{}{:.2}</td>",
+                    indent, summary_row.video_send_resolution
+                );
+
+                let _ = writeln!(
+                    buf,
+                    "<td>{}{:.2}</td>",
+                    indent, summary_row.video_send_framerate
+                );
+            }
+        }
+
+        if group_config.summary_report_columns.show_receive_stats {
+            let _ = writeln!(
+                buf,
+                "<td>{}{:.2}</td>",
+                indent, summary_row.audio_receive_packet_rate
+            );
+            let _ = writeln!(
+                buf,
+                "<td>{}{:.2}</td>",
+                indent, summary_row.audio_receive_bitrate
+            );
+            let _ = writeln!(
+                buf,
+                "<td>{}{:.2}</td>",
+                indent, summary_row.audio_receive_loss
+            );
+
+            // Coefficient of variation of the loss (stddev / mean). Only meaningful when
+            // there is some loss to measure.
+            let loss_cv = if summary_row.audio_receive_loss > 0.0 {
+                format!(
+                    "{:.2}",
+                    summary_row.audio_receive_loss_std_dev / summary_row.audio_receive_loss
+                )
+            } else {
+                "N/A".to_string()
+            };
+            let _ = writeln!(buf, "<td>{}{}</td>", indent, loss_cv);
+
+            if group_config.summary_report_columns.show_video {
+                let _ = writeln!(
+                    buf,
+                    "<td>{}{:.2}</td>",
+                    indent, summary_row.video_recv_resolution
+                );
+
+                let _ = writeln!(
+                    buf,
+                    "<td>{}{:.2}</td>",
+                    indent, summary_row.video_recv_framerate
+                );
+            }
+
+            let _ = writeln!(
+                buf,
+                "<td>{}{:.2}</td>",
+                indent, summary_row.concealed_samples_pct
+            );
+
+            // Concealment per unit of loss (mean concealment / mean loss).
+            let concealment_per_loss = if summary_row.audio_receive_loss >= 0.5 {
+                format!(
+                    "{:.2}",
+                    summary_row.concealed_samples_pct / summary_row.audio_receive_loss
+                )
+            } else {
+                "N/A".to_string()
+            };
+            let _ = writeln!(buf, "<td>{}{}</td>", indent, concealment_per_loss);
+
+            let _ = writeln!(
+                buf,
+                "<td>{}{:.0}</td>",
+                indent, summary_row.fec_packets_received_total
+            );
+        }
+
+        let _ = writeln!(buf, "<td>{}{:.2}</td>", indent, summary_row.container_cpu);
+        let _ = writeln!(
+            buf,
+            "<td>{}{:.2}</td>",
+            indent, summary_row.container_memory
+        );
+        let _ = writeln!(
+            buf,
+            "<td>{}{:.2}</td>",
+            indent, summary_row.container_tx_bitrate
+        );
+        let _ = writeln!(
+            buf,
+            "<td>{}{:.2}</td>",
+            indent, summary_row.container_rx_bitrate
+        );
+
+        // Show the mos average column if any of the mos value columns are shown.
+        let mut show_mos_average = false;
+
+        if group_config.summary_report_columns.show_visqol_mos_speech {
+            show_mos_average = true;
+            if let Some(mos) = summary_row.visqol_mos_speech {
+                let _ = writeln!(buf, "<td>{}{:.3}</td>", indent, mos);
+            } else {
+                buf.push_str("<td></td>\n");
+            }
+        }
+        if group_config.summary_report_columns.show_visqol_mos_audio {
+            show_mos_average = true;
+            if let Some(mos) = summary_row.visqol_mos_audio {
+                let _ = writeln!(buf, "<td>{}{:.3}</td>", indent, mos);
+            } else {
+                buf.push_str("<td></td>\n");
+            }
+        }
+        if group_config.summary_report_columns.show_pesq_mos {
+            show_mos_average = true;
+            if let Some(mos) = summary_row.pesq_mos {
+                let _ = writeln!(buf, "<td>{}{:.3}</td>", indent, mos);
+            } else {
+                buf.push_str("<td></td>\n");
+            }
+        }
+        if group_config.summary_report_columns.show_plc_mos {
+            show_mos_average = true;
+            if let Some(mos) = summary_row.plc_mos {
+                let _ = writeln!(buf, "<td>{}{:.3}</td>", indent, mos);
+            } else {
+                buf.push_str("<td></td>\n");
+            }
+        }
+
+        if show_mos_average {
+            if let Some(mos) = summary_row.mos_average {
+                let _ = writeln!(buf, "<td>{}{:.3}</td>", indent, mos);
+            } else {
+                buf.push_str("<td></td>\n");
+            }
+        }
+
+        if group_config.summary_report_columns.show_video {
+            if let Some(vmaf) = summary_row.vmaf {
+                let _ = writeln!(buf, "<td>{}{:.3}</td>", indent, vmaf);
+            } else {
+                buf.push_str("<td></td>\n");
+            }
+        }
+
+        buf.push_str("</tr>\n");
+
+        buf
+    }
+
+    pub fn summary_report_section(
+        &self,
+        reports: &Vec<Result<Report>>,
+        group_config: &GroupConfig,
+    ) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+        buf.push_str("<div class=\"col-md-12\">\n");
+
+        buf.push_str("<table class=\"table table-hover table-bordered\">\n");
+        buf.push_str("<thead>\n");
+        buf.push_str("<tr>\n");
+        if group_config.summary_report_columns.show_video {
+            buf.push_str("<th colspan=\"4\" style=\"width: 33%\">Test Case</th>\n");
+        } else {
+            buf.push_str("<th colspan=\"3\" style=\"width: 33%\">Test Case</th>\n");
+        }
+        if group_config.summary_report_columns.show_send_stats {
+            let send_colspan = if group_config.summary_report_columns.show_video {
+                5
+            } else {
+                3
+            };
+            let _ = writeln!(
+                buf,
+                "<th colspan=\"{send_colspan}\">Client Send Stats (average)</th>"
+            );
+        }
+        if group_config.summary_report_columns.show_receive_stats {
+            let recv_colspan = if group_config.summary_report_columns.show_video {
+                9
+            } else {
+                7
+            };
+            let _ = writeln!(
+                buf,
+                "<th colspan=\"{recv_colspan}\">Client Receive Stats (average)</th>"
+            );
+        }
+        buf.push_str("<th colspan=\"4\">Container Stats (average)</th>\n");
+
+        let mut visqol_colspan = 0;
+        if group_config.summary_report_columns.show_visqol_mos_speech {
+            visqol_colspan += 1;
+        }
+        if group_config.summary_report_columns.show_visqol_mos_audio {
+            visqol_colspan += 1;
+        }
+        if visqol_colspan > 0 {
+            let _ = writeln!(buf, "<th colspan=\"{}\">Visqol MOS</th>\n", visqol_colspan);
+        }
+
+        let mut other_colspan = 0;
+        if group_config.summary_report_columns.show_pesq_mos {
+            other_colspan += 1;
+        }
+        if group_config.summary_report_columns.show_plc_mos {
+            other_colspan += 1;
+        }
+        if other_colspan > 0 {
+            let _ = writeln!(buf, "<th colspan=\"{}\">Other MOS</th>\n", other_colspan);
+        }
+
+        if visqol_colspan + other_colspan > 0 {
+            // Show the MOS average.
+            let _ = writeln!(buf, "<th colspan=1>MOS</th>\n");
+        }
+
+        if group_config.summary_report_columns.show_video {
+            buf.push_str("<th rowspan=\"2\">VMAF</th>\n");
+        }
+        buf.push_str("</tr>\n");
+        buf.push_str("<tr>\n");
+        buf.push_str("<th>Name</th>\n");
+        buf.push_str("<th>Sound</th>\n");
+        if group_config.summary_report_columns.show_video {
+            buf.push_str("<th>Video</th>\n");
+        }
+        buf.push_str("<th>Profile</th>\n");
+
+        if group_config.summary_report_columns.show_send_stats {
+            buf.push_str("<th>Packet Size</th>\n");
+            buf.push_str("<th>Packet Rate</th>\n");
+            buf.push_str("<th>Bitrate</th>\n");
+            if group_config.summary_report_columns.show_video {
+                buf.push_str("<th>Resolution</th>\n");
+                buf.push_str("<th>Framerate</th>\n");
+            }
+        }
+        if group_config.summary_report_columns.show_receive_stats {
+            buf.push_str("<th>Packet Rate</th>\n");
+            buf.push_str("<th>Bitrate</th>\n");
+            buf.push_str("<th>Loss</th>\n");
+            buf.push_str("<th>CV</th>\n");
+            if group_config.summary_report_columns.show_video {
+                buf.push_str("<th>Resolution</th>\n");
+                buf.push_str("<th>Framerate</th>\n");
+            }
+            buf.push_str("<th>Cncl Rate</th>\n");
+            buf.push_str("<th>Cncl /Loss</th>\n");
+            buf.push_str("<th>FEC</th>\n");
+        }
+
+        buf.push_str("<th>CPU</th>\n");
+        buf.push_str("<th>Mem</th>\n");
+        buf.push_str("<th>TX Bitrate</th>\n");
+        buf.push_str("<th>RX Bitrate</th>\n");
+        if group_config.summary_report_columns.show_visqol_mos_speech {
+            buf.push_str("<th>Speech</th>\n");
+        }
+        if group_config.summary_report_columns.show_visqol_mos_audio {
+            buf.push_str("<th>Audio</th>\n");
+        }
+        if group_config.summary_report_columns.show_pesq_mos {
+            buf.push_str("<th>PESQ</th>\n");
+        }
+        if group_config.summary_report_columns.show_plc_mos {
+            buf.push_str("<th>PLC</th>\n");
+        }
+
+        if visqol_colspan + other_colspan > 0 {
+            // Show the MOS average.
+            buf.push_str("<th>Average</th>\n");
+        }
+
+        buf.push_str("</tr>\n");
+        buf.push_str("</thead>\n");
+
+        buf.push_str("<tbody>\n");
+
+        let mut summary_rows: Vec<SummaryRow> = vec![];
+        let mut aggregate_summary_row: Option<SummaryRow> = None;
+
+        // Keep track of the number of iterable items there are for the group so that we
+        // can make sure class names are unique.
+        let mut iteration_count_for_group = 0;
+
+        for result in reports {
+            // Each report will result in a row in the summary. Each row can be either for
+            // a specific test case or an aggregate of several iterations, and then the
+            // actual aggregated items themselves. The aggregated items are hidden by default.
+            match result {
+                Ok(report) => {
+                    let mut current_summary_row = SummaryRow::new(report);
+
+                    if report.iterations > 1 {
+                        if !summary_rows.is_empty() {
+                            // We are already aggregating the test iterations.
+                            if let Some(aggregate) = &mut aggregate_summary_row {
+                                aggregate.update(&current_summary_row, summary_rows.len() + 1);
+                                current_summary_row.set_aggregate_item(summary_rows.len() + 1);
+                                summary_rows.push(current_summary_row);
+
+                                if summary_rows.len() == report.iterations as usize {
+                                    // This is the end. Show the aggregate summary row first. Use
+                                    // the current report for naming.
+                                    buf.push_str(&self.summary_report_row(
+                                        group_config,
+                                        report,
+                                        aggregate,
+                                        iteration_count_for_group,
+                                    ));
+
+                                    // Show all the iterations.
+                                    summary_rows.iter().for_each(|summary_line| {
+                                        buf.push_str(&self.summary_report_row(
+                                            group_config,
+                                            report,
+                                            summary_line,
+                                            iteration_count_for_group,
+                                        ));
+                                    });
+
+                                    summary_rows.clear();
+                                    aggregate_summary_row = None;
+                                    iteration_count_for_group += 1;
+                                }
+                            } else {
+                                // This would be a bad state, warn and reset.
+                                info!("There are summary_lines but averaged_summary_line is None!");
+                                summary_rows.clear();
+                                aggregate_summary_row = None;
+                                iteration_count_for_group += 1;
+                            }
+                        } else {
+                            // This is the first of N iterations to track.
+
+                            // Make a new aggregate for all rows in the test iteration.
+                            aggregate_summary_row = Some(SummaryRow::new_aggregate(report));
+
+                            // Set the current row as the first iteration item.
+                            current_summary_row.set_aggregate_item(1);
+
+                            // Add the current row to our list for display once all rows in the
+                            // test iterations are aggregated.
+                            summary_rows.push(current_summary_row);
+                        }
+                    } else {
+                        // Display the report normally, one measurement for the line.
+                        buf.push_str(&self.summary_report_row(
+                            group_config,
+                            report,
+                            &current_summary_row,
+                            iteration_count_for_group,
+                        ));
+                    }
+                }
+                Err(err) => {
+                    buf.push_str("<tr class=\"table-dark\">\n");
+                    let _ = writeln!(buf, "<td>{:?}</td>", err);
+                    buf.push_str("</tr>\n");
+                }
+            }
+        }
+
+        buf.push_str("</tbody>\n");
+        buf.push_str("</table>\n");
+        buf.push_str("</div>\n");
+        buf.push_str("</div>\n");
+
+        buf
+    }
+
+    fn summary_call_audio_core_row(
+        &self,
+        group_config: &GroupConfig,
+        report: &Report,
+        summary_row: &SummaryCallAudioCoreRow,
+        iteration_count_for_group: usize,
+        timestamp_columns: &[i32],
+    ) -> String {
+        let mut buf = String::new();
+
+        let table_emphasis = Html::get_emphasis_for_mos(summary_row.mos_average);
+
+        match summary_row.row_type {
+            SummaryRowType::Single => {
+                let _ = writeln!(
+                    buf,
+                    r#"<tr class="table-{} clickable" onclick="window.location='{}/{}/report.html'">"#,
+                    table_emphasis, group_config.group_name, report.report_name
+                );
+            }
+            SummaryRowType::Aggregate => {
+                let _ = writeln!(
+                    buf,
+                    r#"<tr class="table-{}" data-bs-toggle="collapse" data-bs-target=".{}_{}_call_audio_core_collapsed">"#,
+                    table_emphasis, group_config.group_name, iteration_count_for_group
+                );
+            }
+            SummaryRowType::AggregateItem => {
+                let _ = writeln!(
+                    buf,
+                    r#"<tr class="table-{} clickable w-auto small fw-light collapse {}_{}_call_audio_core_collapsed" onclick="window.location='{}/{}_{}/report.html'">"#,
+                    table_emphasis,
+                    group_config.group_name,
+                    iteration_count_for_group,
+                    group_config.group_name,
+                    report.report_name,
+                    summary_row.row_index
+                );
+            }
+        }
+
+        let indent = if summary_row.row_type == SummaryRowType::AggregateItem {
+            "&nbsp;&nbsp"
+        } else {
+            ""
+        };
+
+        let _ = writeln!(buf, "<td>{}{}</td>", indent, report.test_case_name);
+
+        for timestamp in timestamp_columns {
+            if let Some((_, mos)) = summary_row
+                .mos_over_time
+                .iter()
+                .find(|(time, _)| time == timestamp)
+            {
+                let _ = writeln!(buf, "<td>{}{:.3}</td>", indent, mos);
+            } else {
+                buf.push_str("<td></td>\n");
+            }
+        }
+
+        buf.push_str("</tr>\n");
+
+        buf
+    }
+
+    pub fn summary_call_audio_core_section(
+        &self,
+        reports: &Vec<Result<Report>>,
+        group_config: &GroupConfig,
+    ) -> Option<String> {
+        let mut timestamp_columns = vec![];
+        for report in reports.iter().flatten() {
+            if let Some(summary_row) = SummaryCallAudioCoreRow::new(report) {
+                for (timestamp, _) in summary_row.mos_over_time {
+                    if !timestamp_columns.contains(&timestamp) {
+                        timestamp_columns.push(timestamp);
+                    }
+                }
+            }
+        }
+
+        timestamp_columns.sort();
+        if timestamp_columns.is_empty() {
+            return None;
+        }
+
+        let mut buf = String::new();
+
+        buf.push_str("<div class=\"p-3 row\">\n");
+        buf.push_str("<div class=\"col-md-12\">\n");
+        buf.push_str("<h5>Average MOS Over Time</h5>\n");
+
+        buf.push_str("<table class=\"table table-hover table-bordered\">\n");
+        buf.push_str("<thead>\n");
+        buf.push_str("<tr>\n");
+        buf.push_str("<th style=\"width: 16%\">Name</th>\n");
+        for timestamp in &timestamp_columns {
+            let _ = writeln!(buf, "<th>{:.1}</th>", *timestamp as f32 / 10.0);
+        }
+        buf.push_str("</tr>\n");
+        buf.push_str("</thead>\n");
+
+        buf.push_str("<tbody>\n");
+
+        let mut summary_rows: Vec<SummaryCallAudioCoreRow> = vec![];
+        let mut aggregate_summary_row: Option<SummaryCallAudioCoreRow> = None;
+        let mut iteration_count_for_group = 0;
+
+        for result in reports {
+            match result {
+                Ok(report) => {
+                    if let Some(mut current_summary_row) = SummaryCallAudioCoreRow::new(report) {
+                        if report.iterations > 1 {
+                            if !summary_rows.is_empty() {
+                                if let Some(aggregate) = &mut aggregate_summary_row {
+                                    aggregate.update(&current_summary_row, summary_rows.len() + 1);
+                                    current_summary_row.set_aggregate_item(summary_rows.len() + 1);
+                                    summary_rows.push(current_summary_row);
+
+                                    if summary_rows.len() == report.iterations as usize {
+                                        buf.push_str(&self.summary_call_audio_core_row(
+                                            group_config,
+                                            report,
+                                            aggregate,
+                                            iteration_count_for_group,
+                                            &timestamp_columns,
+                                        ));
+
+                                        summary_rows.iter().for_each(|summary_line| {
+                                            buf.push_str(&self.summary_call_audio_core_row(
+                                                group_config,
+                                                report,
+                                                summary_line,
+                                                iteration_count_for_group,
+                                                &timestamp_columns,
+                                            ));
+                                        });
+
+                                        summary_rows.clear();
+                                        aggregate_summary_row = None;
+                                        iteration_count_for_group += 1;
+                                    }
+                                } else {
+                                    summary_rows.clear();
+                                    aggregate_summary_row = None;
+                                    iteration_count_for_group += 1;
+                                }
+                            } else {
+                                aggregate_summary_row =
+                                    SummaryCallAudioCoreRow::new_aggregate(report);
+                                current_summary_row.set_aggregate_item(1);
+                                summary_rows.push(current_summary_row);
+                            }
+                        } else {
+                            buf.push_str(&self.summary_call_audio_core_row(
+                                group_config,
+                                report,
+                                &current_summary_row,
+                                iteration_count_for_group,
+                                &timestamp_columns,
+                            ));
+                        }
+                    } else if !summary_rows.is_empty() {
+                        summary_rows.clear();
+                        aggregate_summary_row = None;
+                        iteration_count_for_group += 1;
+                    }
+                }
+                Err(err) => {
+                    let column_count = timestamp_columns.len() + 1;
+                    buf.push_str("<tr class=\"table-dark\">\n");
+                    let _ = writeln!(buf, "<td colspan=\"{}\">{:?}</td>", column_count, err);
+                    buf.push_str("</tr>\n");
+                }
+            }
+        }
+
+        buf.push_str("</tbody>\n");
+        buf.push_str("</table>\n");
+        buf.push_str("</div>\n");
+        buf.push_str("</div>\n");
+
+        Some(buf)
+    }
+
+    pub fn summary_sounds_item_body(&self, sounds: &HashMap<String, Sound>) -> String {
+        let mut buf = String::new();
+
+        buf.push_str("<table class=\"table\">\n");
+        buf.push_str("<thead>\n");
+        buf.push_str("<tr>\n");
+        buf.push_str("<th>Sound</th>\n");
+        buf.push_str("<th>MOS</th>\n");
+        buf.push_str("</tr>\n");
+        buf.push_str("</thead>\n");
+        buf.push_str("<tbody>\n");
+
+        for (name, sound) in sounds {
+            if let Some(mos) = sound.reference_mos {
+                buf.push_str("<tr>\n");
+                let _ = writeln!(buf, "<td>{}</td>", name);
+                let _ = writeln!(buf, "<td>{:.3}</td>", mos);
+                buf.push_str("</tr>\n");
+            }
+        }
+
+        buf.push_str("</tbody>\n");
+        buf.push_str("</table>\n");
+
+        buf
+    }
+}
+
+fn average(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = values.iter().sum();
+    sum / values.len() as f32
+}

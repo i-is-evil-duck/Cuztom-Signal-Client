@@ -1,0 +1,11 @@
+platform :ios, '15.0'
+
+use_frameworks!
+
+target 'SignalRingRTC' do
+  pod 'WebRTCForTesting', path: '../../../out/'
+end
+
+target 'SignalRingRTCTests' do
+  pod 'Nimble', '~> 13.7.1'
+end

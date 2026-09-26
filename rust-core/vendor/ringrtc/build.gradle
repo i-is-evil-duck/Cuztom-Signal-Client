@@ -1,0 +1,33 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+def versionProperties = new Properties()
+file("config/version.properties").withInputStream { versionProperties.load(it) }
+
+if (!project.hasProperty("ringrtcVersion")) {
+    ext.ringrtcVersion =
+        "${versionProperties.getProperty("ringrtc.version.major")}." +
+        "${versionProperties.getProperty("ringrtc.version.minor")}." +
+        "${versionProperties.getProperty("ringrtc.version.revision")}"
+}
+ext.isReleaseVersion = ringrtcVersion.indexOf("-") == -1;
+
+ext.webrtc_version = "${versionProperties.getProperty("webrtc.version")}"
+
+group = "org.signal"
+version = ringrtcVersion
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
+
+allprojects {
+    tasks.withType(JavaCompile) {
+        options.compilerArgs << "-Xlint" << "-Xlint:-serial"
+    }
+}

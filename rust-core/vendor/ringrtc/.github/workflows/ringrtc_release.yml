@@ -1,0 +1,112 @@
+name: RingRTC Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "When true, don't publish artifacts"
+        default: true
+        required: false
+        type: boolean
+      build_desktop:
+        description: "When true, build desktop"
+        default: true
+        required: false
+        type: boolean
+      build_ios:
+        description: "When true, build iOS"
+        default: true
+        required: false
+        type: boolean
+      build_android:
+        description: "When true, build Android"
+        default: true
+        required: false
+        type: boolean
+      runner_linux:
+        description: "Linux runner:"
+        default: 'ubuntu-latest-4-cores'
+        required: true
+        type: string
+      runner_linux_arm64:
+        description: "ARM64 Linux runner:"
+        default: 'ubuntu-22.04-arm64-4-cores'
+        required: true
+        type: string
+      runner_windows:
+        description: "Windows runner:"
+        default: 'windows-2025-4-cores'
+        required: true
+        type: string
+      runner_mac:
+        description: "Mac runner:"
+        default: 'macos-15'
+        required: true
+        type: string
+      runner_ios:
+        description: "Mac iOS runner:"
+        default: 'macos-15'
+        required: true
+        type: string
+      runner_android:
+        description: "Linux android runner:"
+        default: 'ubuntu-24.04-4-cores'
+        required: true
+        type: string
+
+jobs:
+  slow_tests:
+    name: Run Slow Tests
+    uses: ./.github/workflows/slow_tests.yml
+    permissions:
+      # createCommitComment is supposed to only need the default 'read' permissions...
+      # ...but maybe it's different for private repositories.
+      contents: write
+      issues: write
+      # Needed for google-github-actions/auth.
+      id-token: 'write'
+
+  build_desktop:
+    name: Build Desktop
+    needs: [slow_tests]
+    if: ${{ inputs.build_desktop && needs.slow_tests.result == 'success' }}
+    uses: ./.github/workflows/desktop_artifacts.yml
+    with:
+      dry_run: ${{ inputs.dry_run }}
+      runner_linux: ${{ inputs.runner_linux }}
+      runner_linux_arm64: ${{ inputs.runner_linux_arm64 }}
+      runner_windows: ${{ inputs.runner_windows }}
+      runner_mac: ${{ inputs.runner_mac }}
+    secrets: inherit
+    permissions:
+      contents: 'read'
+      # Needed for google-github-actions/auth.
+      id-token: 'write'
+
+  build_ios:
+    name: Build iOS
+    needs: [slow_tests]
+    if: ${{ inputs.build_ios && needs.slow_tests.result == 'success' }}
+    uses: ./.github/workflows/ios_artifacts.yml
+    with:
+      dry_run: ${{ inputs.dry_run }}
+      runner: ${{ inputs.runner_ios }}
+    secrets: inherit
+    permissions:
+      contents: 'read'
+      # Needed for google-github-actions/auth.
+      id-token: 'write'
+
+  build_android:
+    name: Build Android
+    needs: [slow_tests]
+    if: ${{ inputs.build_android && needs.slow_tests.result == 'success' }}
+    uses: ./.github/workflows/android_artifacts.yml
+    with:
+      dry_run: ${{ inputs.dry_run }}
+      runner: ${{ inputs.runner_android }}
+    secrets: inherit
+    permissions:
+      contents: 'read'
+      # Needed for google-github-actions/auth.
+      id-token: 'write'

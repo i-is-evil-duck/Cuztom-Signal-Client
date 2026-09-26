@@ -290,15 +290,16 @@ pub fn wrap_group_call_signal(
 
 /// Build the message that announces a group call to the group.
 ///
-/// **This is the ring, and nothing else sends it.** `signaling::CallMessage` has
-/// no "call started" field — only `group_call_message`, `ring_intention` and
-/// `ring_response` — and the `group_call_message` RingRTC emits is the media
-/// key, which it can only build *after* joining the SFU and learning the other
-/// members' demux ids. With nobody in the conference yet there is nobody to
-/// address, so it sends nothing, so no other device is ever told a call began.
-/// The announcement is the host's job.
+/// **Not sent by the host, and not the ring.** The host no longer composes group
+/// call messages: RingRTC sends both the ring and the media-key messages, and
+/// the ring specifically has to carry an `era_id` the host cannot know. What this
+/// remains for is describing the shape RingRTC's own `group_call_message` takes —
+/// a `DeviceToDevice` with only a `group_id` — so the receive path can be tested
+/// against something that matches the wire, rather than against a shape invented
+/// here. Kept because the receive path reads that field and the test is the only
+/// thing proving the two agree.
 ///
-/// A `group_call_message` carrying only `group_id` is the whole of it, and the
+/// A `group_call_message` carrying only `group_id` is the shape, and it is the
 /// same structure the receive path reads a group id out of — so a peer that
 /// understands this one understands a media key from the same field, and needs no
 /// separate case.
@@ -715,51 +716,20 @@ pub fn group_ring_from_signal(payload: &[u8]) -> Option<GroupRing> {
     })
 }
 
-/// Build the message that rings a group.
+/// RingRTC builds and sends the group ring itself.
 ///
-/// **This, not [`wrap_group_call_announce`], is what makes a device ring.**
-/// RingRTC's `start_group_ring` is private and `CallManager` exposes no way to
-/// send one, so the host sends the `ring_intention` itself. It has to be sent
-/// before anyone joins the SFU: the media key RingRTC can produce is only
-/// available once it knows the other members' demux ids, which is exactly the
-/// chicken-and-egg that left a connected call ringing nobody.
+/// **There is deliberately no `wrap_group_ring` here.** An earlier version
+/// composed the `ring_intention` by hand and it was wrong in two ways that only
+/// showed up against real clients: the `ring_id` has to be the SFU's `era_id`
+/// (a value that never leaves RingRTC, since `Joined.era_id` is private), and
+/// whether this client may ring at all is the SFU's decision via `joined.creator`.
+/// Getting either wrong left RingRTC's `outgoing_ring_state` claiming someone
+/// else had started the call, which it logs as "ringing is not permitted".
 ///
-/// `ring_id` is echoed in the response and in any cancellation, so the same value
-/// must be used throughout one ring. It is signed because it is stored in an
-/// integer column.
-pub fn wrap_group_ring(group_id: &[u8], ring_id: i64) -> Result<Vec<u8>, GroupCallError> {
-    use presage::libsignal_service::proto::{
-        call_message::Opaque as ProtoOpaque, CallMessage as ProtoCallMessage,
-    };
-    use ringrtc::protobuf::signaling::{
-        call_message::{RingIntention, ring_intention::Type as IntentionType},
-        CallMessage as SignalCallMessage,
-    };
-    use prost::Message as _;
-
-    if group_id.len() != GROUP_CALL_GROUP_ID_LEN {
-        return Err(GroupCallError::InvalidGroupIdLength(group_id.len()));
-    }
-    let signal = SignalCallMessage {
-        ring_intention: Some(RingIntention {
-            group_id: Some(group_id.to_vec()),
-            r#type: Some(IntentionType::Ring as i32),
-            ring_id: Some(ring_id),
-        }),
-        ..Default::default()
-    };
-    Ok(ProtoCallMessage {
-        opaque: Some(ProtoOpaque {
-            data: Some(signal.encode_to_vec()),
-            // Handled immediately, not droppable. A ring is the one message whose
-            // whole purpose is to interrupt, and a device that is briefly offline
-            // is the case a ring has to survive.
-            urgency: Some(1),
-        }),
-        ..Default::default()
-    }
-    .encode_to_vec())
-}
+/// The ring is now requested through `CallManager::ring_group` — a small addition
+/// to the vendored ringrtc — so it goes through RingRTC's own state machine. This
+/// function does not exist so the mistake cannot be made again by someone reading
+/// the file and concluding a ring is just a message to assemble.
 
 /// The ZK group identifier for a hex-encoded group master key.
 ///
@@ -929,16 +899,43 @@ mod tests {
             .contains("no field set"));
     }
 
+    /// A ring *received* must be readable, and the two halves must agree.
+    ///
+    /// The receive half is still ours: RingRTC owns sending, but the host has to
+    /// turn an inbound `ring_intention` into a group id before it can show a
+    /// banner, and it has to name the same group the sender did. This is built
+    /// here by hand because it is a *test fixture* — the production path is
+    /// RingRTC's own `ring_inner`, and composing a ring in production code is
+    /// exactly the mistake this fixture is not.
     #[test]
-    fn a_group_ring_round_trips_and_names_its_group() {
+    fn a_group_ring_is_readable_and_names_its_group() {
         use prost::Message as _;
         use ringrtc::protobuf::signaling::{
             call_message::{RingIntention, ring_intention::Type as IntentionType},
             CallMessage as SignalCallMessage,
         };
+        use presage::libsignal_service::proto::{
+            call_message::Opaque as ProtoOpaque, CallMessage as ProtoCallMessage,
+        };
 
         let group_id = [0x7Bu8; GROUP_CALL_GROUP_ID_LEN];
-        let bytes = wrap_group_ring(&group_id, -4242).expect("rings");
+        let fixture = SignalCallMessage {
+            ring_intention: Some(RingIntention {
+                group_id: Some(group_id.to_vec()),
+                r#type: Some(IntentionType::Ring as i32),
+                ring_id: Some(-4242),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let bytes = ProtoCallMessage {
+            opaque: Some(ProtoOpaque {
+                data: Some(fixture.clone()),
+                urgency: Some(1),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
 
         // A ring is `ring_intention`, not `group_call_message`. That was the bug:
         // the group id was read only from `group_call_message`, so a payload that
@@ -949,10 +946,6 @@ mod tests {
 
         let inner = SignalCallMessage::decode(payload.as_slice()).expect("decodes");
         assert!(inner.group_call_message.is_none(), "a ring is not a group call message");
-        let ring = inner.ring_intention.expect("is a ring intention");
-        assert_eq!(ring.group_id.as_deref(), Some(&group_id[..]));
-        assert_eq!(ring.r#type, Some(IntentionType::Ring as i32));
-        assert_eq!(ring.ring_id, Some(-4242));
 
         // Readable by the same function the receive path uses, and as a ring.
         assert_eq!(

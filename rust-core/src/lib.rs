@@ -164,12 +164,6 @@ enum Command {
     GroupIdMap {
         reply: oneshot::Sender<Result<String, String>>,
     },
-    /// Ring a group, so other members' devices ring.
-    GroupCallRing {
-        group_id: Vec<u8>,
-        ring_id: i64,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
     /// Perform one of the SFU's own HTTP requests.
     ///
     /// Native because the SFU's certificate comes from Signal's own authority
@@ -470,16 +464,6 @@ enum LoopCtrl {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Announce a group call to the group, so other members' devices ring.
-    ///
-    /// Routed through the loop because that is where the live manager lives, and
-    /// a group message can only be sent from it. This is the whole of the ring:
-    /// nothing else sends one, because RingRTC's only group-bound message is the
-    /// media key and it cannot build that until it has joined the SFU.
-    GroupCallRing {
-        group_id: Vec<u8>,
-        ring_id: i64,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
     /// Perform one of the SFU's own HTTP requests.
     ///
     /// Routed through the loop, because that is where the live manager lives: the
@@ -897,10 +881,6 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                             let result = cmd_group_id_map(&state).await;
                             let _ = reply.send(result);
                         }
-                        Command::GroupCallRing { group_id, ring_id, reply } => {
-                            let result = cmd_group_call_ring(&state, &group_id, ring_id).await;
-                            let _ = reply.send(result);
-                        }
                         Command::SfuHttpRequest {
                             method,
                             url,
@@ -1037,20 +1017,26 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                             let _ = reply.send(result);
                         }
                         Command::GroupCallStart { group_id, sfu_url, reply } => {
-                            // Ring before creating the client. The ring is the only
-                            // thing that tells anyone a call started, and it has to
-                            // go out whether or not the SFU join then succeeds - a
-                            // call that rings and fails to connect is far better
-                            // than one that silently never rings.
-                            let ring_id = call::new_ring_id();
-                            let rang = cmd_group_call_ring(&state, &group_id, ring_id).await;
+                            // Create the client, then ask it to ring, then let the
+                            // host join. The order matters: RingRTC records "wants
+                            // to ring" until the SFU join completes, because only
+                            // then does it know the era id the ring must carry and
+                            // whether this client created the call. Asking before
+                            // the client exists is a no-op, and asking after the
+                            // join is too late.
                             let result = match call::start_group_call(group_id, sfu_url) {
-                                Ok(client_id) => Ok(u64::from(client_id) + 1),
+                                Ok(client_id) => {
+                                    if let Err(e) = call::ring_group(client_id) {
+                                        // The call still starts. A call that rings
+                                        // and then fails to connect beats one that
+                                        // never rings at all, and a failed ring
+                                        // request is not a failed call.
+                                        eprintln!("[core] group call start: ring failed: {e}");
+                                    }
+                                    Ok(u64::from(client_id) + 1)
+                                }
                                 Err(e) => Err(e),
                             };
-                            if let Err(e) = rang {
-                                eprintln!("[core] group call start: ring failed: {e}");
-                            }
                             let _ = reply.send(result);
                         }
                         Command::GroupCallJoin { client_id, reply } => {
@@ -1507,16 +1493,6 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 }
                                 Some(LoopCtrl::GroupIdMap { reply }) => {
                                     let r = groups::group_id_map(&mut manager).await;
-                                    let _ = reply.send(r);
-                                }
-                                Some(LoopCtrl::GroupCallRing { group_id, ring_id, reply }) => {
-                                    // The ring. Logged with its outcome because a
-                                    // call that nobody is told about looks
-                                    // identical to a call that connected.
-                                    let r = call::ring_group(&mut manager, &group_id, ring_id).await;
-                                    if let Err(e) = &r {
-                                        eprintln!("[core] group ring failed: {e}");
-                                    }
                                     let _ = reply.send(r);
                                 }
                                 Some(LoopCtrl::SfuHttpRequest {
@@ -2256,44 +2232,6 @@ async fn cmd_group_call_redeem_proof(
     )
     .await?;
     reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
-}
-
-/// Ring a group, so other members' devices ring.
-///
-/// Routed through the loop, for the same reason as the redemption: a group
-/// message can only be sent from the live manager.
-///
-/// Reported as a failure rather than swallowed. A call that reaches the SFU but
-/// never rings anyone is a call nobody is told about, and it is
-/// indistinguishable from one that worked when reading the log afterwards.
-async fn cmd_group_call_ring(
-    state: &WorkerState,
-    group_id: &[u8],
-    ring_id: i64,
-) -> Result<(), String> {
-    if group_id.is_empty() {
-        return Err("a group ring needs a group id".to_string());
-    }
-    let sender = match state {
-        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
-            Some(sender) => sender,
-            None => return Err("sync loop is not running".to_string()),
-        },
-        _ => return Err("not linked".to_string()),
-    };
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    send_sync_ctrl_wait(
-        sender,
-        LoopCtrl::GroupCallRing {
-            group_id: group_id.to_vec(),
-            ring_id,
-            reply: reply_tx,
-        },
-    )
-    .await?;
-    reply_rx
-        .await
-        .map_err(|_| "sync loop dropped the request".to_string())?
 }
 
 /// Perform one of the SFU's own HTTP requests.

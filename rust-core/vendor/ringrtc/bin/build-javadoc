@@ -1,0 +1,16 @@
+#!/bin/sh
+
+#
+# Copyright 2019-2021 Signal Messenger, LLC
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+set -e
+
+# shellcheck source=bin/env.sh
+. "$(dirname "$0")"/env.sh
+
+cd "${PROJECT_ROOT}"
+./gradlew javadoc \
+    -PwebrtcJar="${OUTPUT_DIR}/release/libs/libwebrtc.jar" \
+    -PdocsDir="${OUTPUT_DIR}"

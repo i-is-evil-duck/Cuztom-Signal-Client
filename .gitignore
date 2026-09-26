@@ -35,3 +35,9 @@ Application\ Support/
 # Notarization / releases
 *.dmg
 *.pkg
+
+# Vendored ringrtc build output (gitignored upstream, not vendored either).
+rust-core/vendor/ringrtc/out/
+rust-core/vendor/ringrtc/out-arm/
+rust-core/vendor/ringrtc/target/
+rust-core/vendor/ringrtc/.gradle/

@@ -1,0 +1,539 @@
+name: Build RingRTC Desktop Artifacts
+run-name: Build RingRTC Desktop Artifacts (${{ github.ref_name }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "When true, don't upload to GCS or publish to npm"
+        default: false
+        required: false
+        type: boolean
+      runner_linux:
+        description: "Linux runner:"
+        default: 'ubuntu-latest-4-cores'
+        required: true
+        type: string
+      runner_linux_arm64:
+        description: "ARM64 Linux runner:"
+        default: 'ubuntu-22.04-arm64-4-cores'
+        required: true
+        type: string
+      runner_windows:
+        description: "Windows runner:"
+        default: 'windows-2025-8-cores'
+        required: true
+        type: string
+      runner_mac:
+        description: "Mac runner:"
+        default: 'macos-15'
+        required: true
+        type: string
+
+  workflow_call:
+    inputs:
+      dry_run:
+        description: "When true, don't upload to GCS or publish to npm"
+        default: true
+        required: true
+        type: boolean
+      runner_linux:
+        description: "Linux runner:"
+        default: 'ubuntu-latest-4-cores'
+        required: true
+        type: string
+      runner_linux_arm64:
+        description: "ARM64 Linux runner:"
+        default: 'ubuntu-22.04-arm64-4-cores'
+        required: true
+        type: string
+      runner_windows:
+        description: "Windows runner:"
+        default: 'windows-2025-8-cores'
+        required: true
+        type: string
+      runner_mac:
+        description: "Mac runner:"
+        default: 'macos-14'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_linux:
+    name: Build Linux
+
+    runs-on: ${{ inputs.runner_linux }}
+
+    container:
+      image: ubuntu:20.04
+
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install dependencies
+      run: |
+        apt-get update && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        protobuf-compiler libpulse-dev \
+        curl build-essential git
+
+    - name: Install CMake
+      run: |
+        curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-linux-x86_64.tar.gz | tar -xz && \
+        mv cmake-3.22.1-linux-x86_64 $HOME/.cmake && \
+        echo "$HOME/.cmake/bin" >> $GITHUB_PATH
+
+    - name: Install Rust
+      run: |
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH && \
+        echo "CARGO_HOME=$HOME/.cargo" >> $GITHUB_ENV && \
+        . $HOME/.cargo/env && \
+        cargo install dump_syms --locked
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version-file: 'src/node/.nvmrc'
+
+    - run: ./bin/fetch-artifact --platform linux-x64 --release
+    - run: ./bin/build-desktop --ringrtc-only --release
+
+    - name: Generate x64 attestation
+      uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+      with:
+        subject-path: src/node/build/linux/libringrtc-x64.node
+
+    - name: Upload Desktop Artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-linux
+        path: src/node/build/
+        retention-days: 2
+
+    - name: Upload Desktop x64 Debug Info
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-linux-debuginfo-x64
+        path: out/release/libringrtc-*-linux-x64-debuginfo.sym
+        retention-days: 2
+
+    - name: Upload WebRTC Acknowledgments
+      uses: actions/upload-artifact@v7
+      with:
+        name: webrtc-acknowledgments-linux
+        path: out/release/LICENSE.md
+
+  build_linux_arm:
+    name: Build Linux ARM64
+
+    runs-on: ${{ inputs.runner_linux_arm64 }}
+
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libpulse-dev
+
+    - run: cargo install dump_syms --locked
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version-file: 'src/node/.nvmrc'
+
+    - run: ./bin/fetch-artifact --platform linux-arm64 --release
+    - run: TARGET_ARCH=arm64 ./bin/build-desktop --ringrtc-only --release
+
+    - name: Generate arm64 attestation
+      uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+      with:
+        subject-path: src/node/build/linux/libringrtc-arm64.node
+
+    - name: Upload Desktop Artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-linux-arm64
+        path: src/node/build/
+        retention-days: 2
+
+    - name: Upload Desktop arm64 Debug Info
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-linux-debuginfo-arm64
+        path: out/release/libringrtc-*-linux-arm64-debuginfo.sym
+        retention-days: 2
+
+    - name: Upload WebRTC Acknowledgments
+      uses: actions/upload-artifact@v7
+      with:
+        name: webrtc-acknowledgments-linux-arm64
+        path: out/release/LICENSE.md
+
+  build_windows:
+    name: Build Windows
+
+    runs-on: ${{ inputs.runner_windows }}
+
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --target aarch64-pc-windows-msvc
+
+    - name: Install Protoc
+      uses: ./.github/actions/install-protoc
+
+    - run: cargo install dump_syms --locked
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version-file: 'src/node/.nvmrc'
+
+    - run: sh ./bin/fetch-artifact --platform windows-x64 --release
+    - run: sh ./bin/build-desktop --ringrtc-only --release
+
+    - run: sh ./bin/fetch-artifact --platform windows-arm64 --release -o out-arm
+    - run: echo "TARGET_ARCH=arm64" >> $env:GITHUB_ENV
+    - run: echo "OUTPUT_DIR=out-arm" >> $env:GITHUB_ENV
+    - run: sh ./bin/build-desktop --ringrtc-only --release
+
+    - name: Upload Desktop Artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-windows
+        path: src/node/build/
+        retention-days: 2
+
+    - name: Generate x64 attestation
+      uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+      with:
+        subject-path: src/node/build/win32/libringrtc-x64.node
+
+    - name: Generate arm64 attestation
+      uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+      with:
+        subject-path: src/node/build/win32/libringrtc-arm64.node
+
+    - name: Upload Desktop x64 Debug Info
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-win32-debuginfo-x64
+        path: out/release/libringrtc-*-win32-x64-debuginfo.sym
+        retention-days: 2
+
+    - name: Upload Desktop arm64 Debug Info
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-win32-debuginfo-arm64
+        path: out-arm/release/libringrtc-*-win32-arm64-debuginfo.sym
+        retention-days: 2
+
+    - name: Upload WebRTC Acknowledgments
+      uses: actions/upload-artifact@v7
+      with:
+        name: webrtc-acknowledgments-windows
+        path: |
+          out/release/LICENSE.md
+          out-arm/release/LICENSE.md
+
+  build_mac:
+    name: Build macOS
+
+    runs-on: ${{ inputs.runner_mac }}
+
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - run: brew install protobuf coreutils # for grealpath
+
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --target x86_64-apple-darwin,aarch64-apple-darwin
+
+    - run: cargo install dump_syms --locked
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version-file: 'src/node/.nvmrc'
+
+    - run: ./bin/fetch-artifact --platform mac-x64 --release
+    - run: TARGET_ARCH=x64 OUTPUT_DIR=out ./bin/build-desktop --ringrtc-only --release
+
+    - run: ./bin/fetch-artifact --platform mac-arm64 --release -o out-arm
+    - run: TARGET_ARCH=arm64 OUTPUT_DIR=out-arm ./bin/build-desktop --ringrtc-only --release
+
+    - name: Generate x64 attestation
+      uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+      with:
+        subject-path: src/node/build/darwin/libringrtc-x64.node
+
+    - name: Generate arm64 attestation
+      uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+      with:
+        subject-path: src/node/build/darwin/libringrtc-arm64.node
+
+    - name: Upload Desktop Artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-mac
+        path: src/node/build/
+        retention-days: 2
+
+    - name: Upload Desktop x64 Debug Info
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-darwin-debuginfo-x64
+        path: out/release/libringrtc-*-darwin-x64-debuginfo.sym
+        retention-days: 2
+
+    - name: Upload Desktop arm64 Debug Info
+      uses: actions/upload-artifact@v7
+      with:
+        name: ringrtc-desktop-darwin-debuginfo-arm64
+        path: out-arm/release/libringrtc-*-darwin-arm64-debuginfo.sym
+        retention-days: 2
+
+    - name: Upload WebRTC Acknowledgments
+      uses: actions/upload-artifact@v7
+      with:
+        name: webrtc-acknowledgments-mac
+        path: |
+          out/release/LICENSE.md
+          out-arm/release/LICENSE.md
+
+
+  aggregate_desktop:
+    name: Aggregate Desktop
+
+    permissions:
+      # Needed to clone the repo
+      contents: read
+      # Needed for google-github-actions/auth and OIDC.
+      id-token: write
+
+    runs-on: ubuntu-latest-4-cores
+
+    needs: [build_windows, build_mac, build_linux, build_linux_arm]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download Desktop Windows Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-windows
+          path: src/node/build/
+
+      - name: Download Desktop Windows x64 Symbols
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-win32-debuginfo-x64
+          path: symbols/
+
+      - name: Download Desktop Windows arm64 Symbols
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-win32-debuginfo-arm64
+          path: symbols/
+
+      - name: Download Desktop macOS Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-mac
+          path: src/node/build/
+
+      - name: Download Desktop macOS x64 Symbols
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-darwin-debuginfo-x64
+          path: symbols/
+
+      - name: Download Desktop macOS arm64 Symbols
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-darwin-debuginfo-arm64
+          path: symbols/
+
+      - name: Download Desktop Linux Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-linux
+          path: src/node/build/
+
+      - name: Download Desktop Linux Artifacts ARM64
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-linux-arm64
+          path: src/node/build/
+
+      - name: Download Desktop Linux x64 Symbols
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-linux-debuginfo-x64
+          path: symbols/
+
+      - name: Download Desktop Linux arm64 Symbols
+        uses: actions/download-artifact@v8
+        with:
+          name: ringrtc-desktop-linux-debuginfo-arm64
+          path: symbols/
+
+      - name: Determine Version
+        id: determine-version
+        run: |
+          printf 'version=%s\n' "$(jq --raw-output .version package.json)" >> $GITHUB_OUTPUT
+        working-directory: src/node/
+
+      - name: Create Archive
+        run: tar czf "ringrtc-desktop-build-v$VERSION.tar.gz" build
+        working-directory: src/node/
+        env:
+          VERSION: ${{ steps.determine-version.outputs.version }}
+
+      - name: Output Artifact Checksum
+        id: artifact-checksum
+        run: |
+          shaAndFilename="$(sha256sum ringrtc-desktop-build-v*.tar.gz | tee -a $GITHUB_STEP_SUMMARY)"
+          printf 'sha256=%s\n' "$(echo $shaAndFilename | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
+        working-directory: src/node/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: 'src/node/.nvmrc'
+          registry-url: 'https://registry.npmjs.org/'
+
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: 'projects/741367068918/locations/global/workloadIdentityPools/github/providers/github-actions'
+          service_account: 'github-actions@signal-build-artifacts.iam.gserviceaccount.com'
+
+      - uses: google-github-actions/upload-cloud-storage@v3
+        if: ${{ !inputs.dry_run }}
+        with:
+          path: 'src/node'
+          destination: build-artifacts.signal.org/libraries
+          glob: 'ringrtc-desktop-build-v*.tar.gz'
+          parent: false
+          process_gcloudignore: false
+
+      - name: Set up directory structure for symbols
+        run: |
+          mkdir -p "$VERSION"/win32/x64/
+          mv libringrtc-*-win32-x64-debuginfo.sym "$VERSION"/win32/x64/symbols.sym
+          mkdir -p "$VERSION"/win32/arm64/
+          mv libringrtc-*-win32-arm64-debuginfo.sym "$VERSION"/win32/arm64/symbols.sym
+          mkdir -p "$VERSION"/darwin/x64/
+          mv libringrtc-*-darwin-x64-debuginfo.sym "$VERSION"/darwin/x64/symbols.sym
+          mkdir -p "$VERSION"/darwin/arm64/
+          mv libringrtc-*-darwin-arm64-debuginfo.sym "$VERSION"/darwin/arm64/symbols.sym
+          mkdir -p "$VERSION"/linux/x64/
+          mv libringrtc-*-linux-x64-debuginfo.sym "$VERSION"/linux/x64/symbols.sym
+          mkdir -p "$VERSION"/linux/arm64/
+          mv libringrtc-*-linux-arm64-debuginfo.sym "$VERSION"/linux/arm64/symbols.sym
+        working-directory: symbols/
+        env:
+          VERSION: ${{ steps.determine-version.outputs.version }}
+
+      - uses: google-github-actions/upload-cloud-storage@v3
+        if: ${{ !inputs.dry_run }}
+        with:
+          path: 'symbols'
+          destination: build-artifacts.signal.org/ringrtc-symbols
+          glob: '**/*.sym'
+          parent: false
+          process_gcloudignore: false
+
+      # Put the SHA-256 of the archive into prebuildChecksum in package.json
+      - run: sed -i "/prebuildChecksum/ s/\"\"/\"${ARTIFACT_CHECKSUM}\"/" package.json
+        # Skip this for dry runs because the `npm ci` step won't be able to
+        # download the prebuild.
+        if: ${{ !inputs.dry_run }}
+        working-directory: src/node/
+        env:
+          ARTIFACT_CHECKSUM: ${{ steps.artifact-checksum.outputs.sha256 }}
+
+      # Test download by deleting `build/` and running npm ci and npm test again.
+      - run: rm -rf build/
+        # Skip this for dry runs because the `npm ci` step won't be able to
+        # download the prebuild.
+        if: ${{ !inputs.dry_run }}
+        working-directory: src/node/
+
+      - run: npm ci
+        working-directory: src/node/
+
+      - run: npm run build
+        working-directory: src/node/
+
+      - run: sudo apt-get update && sudo apt-get install -y libpulse0
+
+      - run: xvfb-run --auto-servernum npm test -- --no-sandbox
+        working-directory: src/node/
+
+      # Collect RingRTC and WebRTC acknowledgments into one file.
+      - name: Download Windows Acknowledgments
+        uses: actions/download-artifact@v8
+        with:
+          name: webrtc-acknowledgments-windows
+          path: acknowledgments/webrtc-windows/
+
+      - name: Download macOS Acknowledgments
+        uses: actions/download-artifact@v8
+        with:
+          name: webrtc-acknowledgments-mac
+          path: acknowledgments/webrtc-mac/
+
+      - name: Download Linux Acknowledgments
+        uses: actions/download-artifact@v8
+        with:
+          name: webrtc-acknowledgments-linux
+          path: acknowledgments/webrtc-linux/
+
+      - name: Download Linux Acknowledgments ARM64
+        uses: actions/download-artifact@v8
+        with:
+          name: webrtc-acknowledgments-linux-arm64
+          path: acknowledgments/webrtc-linux/
+
+      - run: cp acknowledgments/acknowledgments.md src/node/dist
+      - run: bin/convert_webrtc_acknowledgments.py --format md acknowledgments/webrtc-*/*/*/LICENSE.md >> src/node/dist/acknowledgments.md
+
+      # Finally, publish to NPM. Or upload a pack, for a dry run.
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - run: npm publish --access public
+        if: ${{ !inputs.dry_run }}
+        working-directory: src/node/
+
+      - run: npm pack
+        if: ${{ inputs.dry_run }}
+        working-directory: src/node/
+
+      - name: Upload Package Archive
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: src/node/signalapp-ringrtc-*.tgz
+          retention-days: 7

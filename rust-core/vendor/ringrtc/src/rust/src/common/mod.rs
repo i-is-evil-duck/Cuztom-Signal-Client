@@ -1,0 +1,975 @@
+//
+// Copyright 2019-2021 Signal Messenger, LLC
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+
+//! Common types used throughout the library.
+
+pub mod actor;
+pub mod slice;
+pub mod time;
+pub mod units;
+mod versioning;
+
+use std::{fmt, time::Duration};
+
+use sha2::{Digest, Sha256};
+pub use versioning::SemanticVersion;
+
+use crate::webrtc::{
+    media::{AudioDecoderConfig, AudioEncoderConfig},
+    peer_connection_factory::{AudioConfig, AudioJitterBufferConfig},
+};
+
+/// Common Result type, using `anyhow::Error` for Error.
+pub type Result<T> = std::result::Result<T, anyhow::Error>;
+
+/// How long to wait for an FSM to quiesce before tearing down anyway.
+pub const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded capacity of each FSM event channel.
+pub const EVENT_QUEUE_SIZE: usize = 256;
+
+/// Unique call identification number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CallId {
+    id: u64,
+}
+
+impl CallId {
+    pub fn as_u64(self) -> u64 {
+        self.id
+    }
+}
+
+impl fmt::Display for CallId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "0x{:x}", self.id)
+    }
+}
+
+impl From<CallId> for u64 {
+    fn from(item: CallId) -> Self {
+        item.id
+    }
+}
+
+impl CallId {
+    pub fn new(id: u64) -> Self {
+        Self { id }
+    }
+
+    pub fn random() -> Self {
+        Self::new(rand::random())
+    }
+
+    pub fn format(self, device_id: DeviceId) -> String {
+        format!("0x{:x}-{}", self.id, device_id)
+    }
+
+    pub fn call_summary_hash(&self) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"CALL_SUMMARY_CALL_ID");
+        hasher.update(self.id.to_be_bytes());
+        hasher.finalize().to_vec()
+    }
+}
+
+impl From<i64> for CallId {
+    fn from(item: i64) -> Self {
+        CallId::new(item as u64)
+    }
+}
+
+impl From<u64> for CallId {
+    fn from(item: u64) -> Self {
+        CallId::new(item)
+    }
+}
+
+/// Unique remote device identification number.
+pub type DeviceId = u32;
+
+/// Tracks the state of a call:
+/// NotYetStarted
+///      |
+///      | start
+///      V
+/// WaitingToProceed -------------------------------->|
+///      |                                            |
+///      | proceed                                    |
+///      V                                            |
+/// ConnectingBeforeAccepted------------------------->|
+///   |                        |                      |
+///   | connected              | accepted             |
+///   V                        |                      |
+/// ConnectedBeforeAccepted--- V   ------------------>|
+///   |                      ConnectingAfterAccepted->| terminate
+///   |                        |                      |
+///   | accepted               | connected            |
+///   V                        V                      |
+/// ConnectedAndAccepted           ------------------>|
+///      |               ^                            |
+///      | disconnected  | connected                  |
+///      V               |                            |
+/// ReconnectingAfterAccepted------------------------>|
+///                                                   V
+/// Terminating<---------------------------------------
+///      |
+///      | terminated
+///      V
+/// Terminated
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
+pub enum CallState {
+    /// The call has been created, but not yet started.
+    NotYetStarted,
+
+    /// The call has been started (via start_call() or handle_received_offer())
+    /// but is waiting for the app to call proceed().
+    /// Should transition to ConnectingBeforeAccepted when the app calls proceed().
+    WaitingToProceed,
+
+    /// Call is connecting (signaling and ICE) with the remote peer.
+    /// We don't ring until we're connected with ICE to send an
+    /// "accepted" message.
+    ConnectingBeforeAccepted,
+
+    /// The callee accepted before the caller is connected.
+    /// This can happen, for example, if a remote callee gets ICE connected
+    /// and accepts before the local caller gets ICE connected.
+    ConnectingAfterAccepted,
+
+    /// ICE is connected,
+    /// But the callee has not yet accepted.
+    ConnectedBeforeAccepted,
+
+    /// ICE is connected and the callee has accepted.
+    ConnectedAndAccepted,
+
+    /// After ConnectedAndAccepted, has gone disconnected temporarily and is trying to reconnect.
+    ReconnectingAfterAccepted,
+
+    /// The call is in the process of terminating (hanging up).
+    Terminating,
+
+    /// The call is completely terminated.
+    Terminated,
+}
+
+impl fmt::Display for CallState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+// Note: The code below in both CallState and ConnectionState doesn't use "matches!" or "==" or
+// default matching or similar because we want think about each state, especially for when
+// we add more states in the future.
+
+impl CallState {
+    pub fn can_receive_ice_candidates(self) -> bool {
+        match self {
+            // Can't use ICE candidates because nothing has been started.
+            CallState::NotYetStarted => false,
+
+            // Can use ICE candidates before proceeding because they are stored until proceeding.
+            CallState::WaitingToProceed => true,
+            // Can use ICE candidates because connectivity is in progress.
+            CallState::ConnectingBeforeAccepted => true,
+            CallState::ConnectingAfterAccepted => true,
+            CallState::ConnectedBeforeAccepted => true,
+            CallState::ConnectedAndAccepted => true,
+            CallState::ReconnectingAfterAccepted => true,
+
+            // No point in ICE candidates any more.
+            CallState::Terminating => false,
+            CallState::Terminated => false,
+        }
+    }
+
+    pub fn connected_or_reconnecting(self) -> bool {
+        match self {
+            CallState::NotYetStarted => false,
+            CallState::WaitingToProceed => false,
+            CallState::ConnectingBeforeAccepted => false,
+            CallState::ConnectingAfterAccepted => false,
+
+            CallState::ConnectedBeforeAccepted => true,
+            CallState::ConnectedAndAccepted => true,
+            CallState::ReconnectingAfterAccepted => true,
+
+            CallState::Terminating => false,
+            CallState::Terminated => false,
+        }
+    }
+
+    pub fn can_be_accepted_locally(self) -> bool {
+        match self {
+            // Not even started/proceeding yet, so can't be accepted yet.
+            CallState::NotYetStarted => false,
+            CallState::WaitingToProceed => false,
+            CallState::ConnectingBeforeAccepted => false,
+            // We don't support accepting before connected yet, but we could in the future.
+            CallState::ConnectingAfterAccepted => false,
+
+            CallState::ConnectedBeforeAccepted => true,
+
+            // Already accepted, so can't be accepted again.
+            CallState::ConnectedAndAccepted => false,
+            CallState::ReconnectingAfterAccepted => false,
+            // Terminating, so can't be accepted any more.
+            CallState::Terminating => false,
+            CallState::Terminated => false,
+        }
+    }
+
+    // AKA ConnectedAndAccepted or ReconnectingAfterAccepted
+    pub fn active(self) -> bool {
+        match self {
+            CallState::NotYetStarted => false,
+            CallState::WaitingToProceed => false,
+            CallState::ConnectingBeforeAccepted => false,
+            CallState::ConnectingAfterAccepted => false,
+            CallState::ConnectedBeforeAccepted => false,
+
+            CallState::ConnectedAndAccepted => true,
+            CallState::ReconnectingAfterAccepted => true,
+
+            CallState::Terminating => false,
+            CallState::Terminated => false,
+        }
+    }
+
+    pub fn accepted(self) -> bool {
+        match self {
+            CallState::NotYetStarted => false,
+
+            CallState::WaitingToProceed => false,
+            CallState::ConnectingBeforeAccepted => false,
+            CallState::ConnectedBeforeAccepted => false,
+
+            CallState::ConnectingAfterAccepted => true,
+            CallState::ConnectedAndAccepted => true,
+            CallState::ReconnectingAfterAccepted => true,
+
+            CallState::Terminating => false,
+            CallState::Terminated => false,
+        }
+    }
+
+    pub fn can_send_hangup_via_rtp(self) -> bool {
+        match self {
+            CallState::NotYetStarted => false,
+
+            // Not sure why these are true, but they preserve logic during refactoring.
+            // Since the message won't go anywhere, we should consider removing it.
+            CallState::WaitingToProceed => true,
+            CallState::ConnectingBeforeAccepted => true,
+            CallState::ConnectingAfterAccepted => true,
+
+            CallState::ConnectedBeforeAccepted => true,
+            CallState::ConnectedAndAccepted => true,
+            CallState::ReconnectingAfterAccepted => true,
+            CallState::Terminating => true,
+
+            // Not sure why this is true, but it preserves logic during refactoring.
+            // Since the message won't go anywhere, we should consider removing it.
+            CallState::Terminated => true,
+        }
+    }
+
+    pub fn should_propagate_hangup(self) -> bool {
+        match self {
+            CallState::NotYetStarted => false,
+
+            CallState::WaitingToProceed => true,
+            CallState::ConnectingBeforeAccepted => true,
+            CallState::ConnectedBeforeAccepted => true,
+
+            // Don't propagate if we're already accepted because a
+            // Hangup/Accepted has been sent to the other callees.
+            CallState::ConnectingAfterAccepted => false,
+            CallState::ConnectedAndAccepted => false,
+            CallState::ReconnectingAfterAccepted => false,
+            // Don't propagate if we're already terminating/terminated because
+            // we already sent out a Hangup to the other callees.
+            CallState::Terminating => false,
+            CallState::Terminated => false,
+        }
+    }
+
+    pub fn can_be_terminated_remotely(self) -> bool {
+        match self {
+            // Can't be terminated if it hasn't started yet.
+            CallState::NotYetStarted => false,
+
+            CallState::WaitingToProceed => true,
+            CallState::ConnectingBeforeAccepted => true,
+            CallState::ConnectingAfterAccepted => true,
+            CallState::ConnectedBeforeAccepted => true,
+            CallState::ConnectedAndAccepted => true,
+            CallState::ReconnectingAfterAccepted => true,
+
+            // Already terminating or terminated, so can't be terminated again.
+            CallState::Terminating => false,
+            CallState::Terminated => false,
+        }
+    }
+
+    pub fn terminating_or_terminated(self) -> bool {
+        match self {
+            CallState::NotYetStarted => false,
+            CallState::WaitingToProceed => false,
+            CallState::ConnectingBeforeAccepted => false,
+            CallState::ConnectingAfterAccepted => false,
+            CallState::ConnectedBeforeAccepted => false,
+            CallState::ConnectedAndAccepted => false,
+            CallState::ReconnectingAfterAccepted => false,
+
+            CallState::Terminating => true,
+            CallState::Terminated => true,
+        }
+    }
+}
+
+/// An enum representing the call end reasons.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum_macros::Display)]
+pub enum CallEndReason {
+    /// The call ended because of a local hangup. For direct calls.
+    LocalHangup,
+
+    /// The call ended because of a remote hangup. For direct calls.
+    RemoteHangup,
+
+    /// The call ended because the remote needs permission. For direct calls.
+    RemoteHangupNeedPermission,
+
+    /// The call ended because the call was accepted by a different device. For direct calls.
+    RemoteHangupAccepted,
+
+    /// The call ended because the call was declined by a different device. For direct calls.
+    RemoteHangupDeclined,
+
+    /// The call ended because the call was declared busy by a different device. For direct calls.
+    RemoteHangupBusy,
+
+    /// The call ended because of a remote busy message from a callee. For direct calls.
+    RemoteBusy,
+
+    /// The call ended because of glare, receiving an offer from the same remote
+    /// while calling them. For direct calls.
+    RemoteGlare,
+
+    /// The call ended because of recall, receiving an offer from the same remote
+    /// while still in an existing call with them. For direct calls.
+    RemoteReCall,
+
+    /// The call ended because it timed out during setup. For direct calls.
+    Timeout,
+
+    /// The call ended because of an internal error condition. For direct calls.
+    InternalFailure,
+
+    /// The call ended because a signaling message couldn't be sent. For direct calls.
+    SignalingFailure,
+
+    /// The call ended because the connection setup failed. For direct calls.
+    ConnectionFailure,
+
+    /// The call ended because the application wanted to drop the call. For direct calls.
+    AppDroppedCall,
+
+    /// The client disconnected by calling the disconnect() API. For group calls.
+    DeviceExplicitlyDisconnected,
+
+    /// The server disconnected due to policy or some other controlled reason. For group calls.
+    ServerExplicitlyDisconnected,
+
+    /// An admin denied your request to join the call. For group calls.
+    DeniedRequestToJoinCall,
+
+    /// An admin removed you from the call. For group calls.
+    RemovedFromCall,
+
+    /// Another direct call or group call is currently in progress and using media resources.
+    /// For group calls.
+    CallManagerIsBusy,
+
+    /// Could not join the group call. For group calls.
+    SfuClientFailedToJoin,
+
+    /// Could not create a usable peer connection factory for media. For group calls.
+    FailedToCreatePeerConnectionFactory,
+
+    /// Could not negotiate SRTP keys with a DHE. For group calls.
+    FailedToNegotiatedSrtpKeys,
+
+    /// Could not create a peer connection for media. For group calls.
+    FailedToCreatePeerConnection,
+
+    /// Could not start the peer connection for media. For group calls.
+    FailedToStartPeerConnection,
+
+    /// Could not update the peer connection for media. For group calls.
+    FailedToUpdatePeerConnection,
+
+    /// Could not set the requested bitrate for media. For group calls.
+    FailedToSetMaxSendBitrate,
+
+    /// Could not connect successfully. For group calls.
+    IceFailedWhileConnecting,
+
+    /// Lost a connection and retries were unsuccessful. For group calls.
+    IceFailedAfterConnected,
+
+    /// Unexpected change in demuxId requiring a new group call. For group calls.
+    ServerChangedDemuxId,
+
+    /// The SFU reported that the group call is full. For group calls.
+    HasMaxDevices,
+}
+
+/// An enum representing the status notification types sent to the
+/// client application.
+///
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum_macros::Display)]
+pub enum ApplicationEvent {
+    /// Inbound call only: The call signaling (ICE) is complete.
+    LocalRinging,
+
+    /// Outbound call only: The call signaling (ICE) is complete.
+    RemoteRinging,
+
+    /// The local side has accepted the call.
+    LocalAccepted,
+
+    /// The remote side has accepted the call.
+    RemoteAccepted,
+
+    /// The remote side has enabled audio.
+    RemoteAudioEnable,
+
+    /// The remote side has disabled audio.
+    RemoteAudioDisable,
+
+    /// The remote side has enabled video.
+    RemoteVideoEnable,
+
+    /// The remote side has disabled video.
+    RemoteVideoDisable,
+
+    /// The remote side has enabled screen sharing.
+    RemoteSharingScreenEnable,
+
+    /// The remote side has disabled screen sharing.
+    RemoteSharingScreenDisable,
+
+    /// The call dropped while connected and is now reconnecting.
+    Reconnecting,
+
+    /// The call dropped while connected and is now reconnected.
+    Reconnected,
+
+    /// The call ended because there was a failure during glare handling.
+    GlareHandlingFailure,
+
+    /// The received offer is expired.
+    ///
+    /// This event should not be sent directly. Instead, use [`on_offer_expired`][],
+    /// which preserves the age of the offer for platforms that need it.
+    ///
+    /// [`on_offer_expired`]: crate::core::platform::Platform::on_offer_expired
+    ReceivedOfferExpired,
+
+    /// Received an offer while already handling an active call.
+    ReceivedOfferWhileActive,
+
+    /// Received an offer while already handling an active call and glare
+    /// was detected.
+    ReceivedOfferWithGlare,
+}
+
+/// Tracks the state of a connection:
+/// NotYetStarted
+///      |
+///      | start
+///      V
+/// Starting----------------------------------------------->|
+///      |                              |                   |
+///      | (outgoing child or incoming) | (outgoing parent) |
+///      |                              V                   |
+///      V                           IceGathering---------->|
+/// ConnectingBeforeAccepted------------------------------->|
+///   |                        |                      |
+///   | connected              | accepted             |
+///   V                        |                      |
+/// ConnectedBeforeAccepted--- V   ------------------>|
+///   |                      ConnectingAfterAccepted->| terminate
+///   |                        |                      |
+///   | accepted               | connected            |
+///   V                        V                      |
+/// ConnectedAndAccepted           ------------------>|
+///      |               ^                            |
+///      | disconnected  | connected                  |
+///      V               |                            |
+/// ReconnectingAfterAccepted------------------------>|
+///                                                   V
+/// Terminating<---------------------------------------
+///      |                                            ^
+///      | terminated                                 |
+///      V                                            |
+/// Terminated                                        |
+///                                                   |
+/// (this should go above, but it's hard to draw)     |
+/// ConnectingBeforeAccepted|ConnectingAfterAccepted  |
+///         |                                         |
+///         | ICE failed                              |
+///         V                                         |
+/// IceFailed --------------------------------------->|
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConnectionState {
+    /// The connection has been created but not started
+    /// (via start_outgoing_parent, start_outgoing_child, or start_incoming)
+    NotYetStarted,
+
+    /// The connection has been started, but the start method has not completed.
+    /// After a connection is started, it will transition to either
+    /// IceGathering (in the case of outgoing parent)
+    /// or ConnectingBeforeAccepted (in the case of outgoing child or incoming)
+    Starting,
+
+    /// The connection is gathering and sending ICE candidates
+    /// (only for outgoing parent).
+    /// It has a local description but not a remote description.
+    /// This can only transition to Terminating/Closed
+    IceGathering,
+
+    /// ICE is attempting to connect, but has not yet.
+    /// It has both the local and remote descriptions.
+    /// This can transition to ConnectedBeforeAccepted or IceFailed
+    ConnectingBeforeAccepted,
+
+    /// The call has been accepted, but ICE hasn't connected yet.
+    ConnectingAfterAccepted,
+
+    /// ICE has connected, but the call hasn't been accepted yet.
+    ConnectedBeforeAccepted,
+
+    /// ICE failed to connect.
+    IceFailed,
+
+    /// The callee has accepted the call and the call is connected.
+    ConnectedAndAccepted,
+
+    /// ICE is disconnected/reconnecting after the call is accepted.
+    ReconnectingAfterAccepted,
+
+    /// The connection is in the process of terminating
+    Terminating,
+
+    /// The connection is completely terminated
+    Terminated,
+}
+
+impl fmt::Display for ConnectionState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl ConnectionState {
+    pub fn can_send_ice_candidates(self) -> bool {
+        match self {
+            ConnectionState::NotYetStarted => false,
+
+            ConnectionState::Starting => true,
+            ConnectionState::IceGathering => true,
+            ConnectionState::ConnectingBeforeAccepted => true,
+            ConnectionState::ConnectingAfterAccepted => true,
+            ConnectionState::ConnectedBeforeAccepted => true,
+            ConnectionState::ConnectedAndAccepted => true,
+            ConnectionState::ReconnectingAfterAccepted => true,
+            // Not sure why this is true, but it preserves logic while refactoring
+            // Consider changing it to false because it won't do anything.
+            ConnectionState::IceFailed => true,
+
+            ConnectionState::Terminating => false,
+            ConnectionState::Terminated => false,
+        }
+    }
+
+    pub fn can_receive_ice_candidates(self) -> bool {
+        match self {
+            ConnectionState::NotYetStarted => false,
+            ConnectionState::Starting => false,
+            ConnectionState::IceGathering => false,
+
+            ConnectionState::ConnectingBeforeAccepted => true,
+            ConnectionState::ConnectingAfterAccepted => true,
+            ConnectionState::ConnectedBeforeAccepted => true,
+            ConnectionState::ConnectedAndAccepted => true,
+            ConnectionState::ReconnectingAfterAccepted => true,
+
+            ConnectionState::IceFailed => false,
+            ConnectionState::Terminating => false,
+            ConnectionState::Terminated => false,
+        }
+    }
+
+    pub fn connecting_or_connected(self) -> bool {
+        match self {
+            ConnectionState::NotYetStarted => false,
+            ConnectionState::Starting => false,
+            ConnectionState::IceGathering => false,
+
+            ConnectionState::ConnectingBeforeAccepted => true,
+            ConnectionState::ConnectingAfterAccepted => true,
+            ConnectionState::ConnectedBeforeAccepted => true,
+            ConnectionState::ConnectedAndAccepted => true,
+            ConnectionState::ReconnectingAfterAccepted => true,
+
+            ConnectionState::IceFailed => false,
+            ConnectionState::Terminating => false,
+            ConnectionState::Terminated => false,
+        }
+    }
+
+    pub fn connected_or_reconnecting(self) -> bool {
+        match self {
+            ConnectionState::NotYetStarted => false,
+            ConnectionState::Starting => false,
+            ConnectionState::IceGathering => false,
+            ConnectionState::ConnectingBeforeAccepted => false,
+            ConnectionState::ConnectingAfterAccepted => false,
+
+            ConnectionState::ConnectedBeforeAccepted => true,
+            ConnectionState::ConnectedAndAccepted => true,
+            ConnectionState::ReconnectingAfterAccepted => true,
+
+            ConnectionState::IceFailed => false,
+            ConnectionState::Terminating => false,
+            ConnectionState::Terminated => false,
+        }
+    }
+
+    pub fn can_be_accepted_locally(self) -> bool {
+        match self {
+            ConnectionState::NotYetStarted => false,
+            ConnectionState::Starting => false,
+            ConnectionState::IceGathering => false,
+
+            // Not sure why this is true, but it preserves logic while refactoring.
+            // We should consider changing it because we don't support
+            // accepting locally before ICE is connected.
+            ConnectionState::ConnectingBeforeAccepted => true,
+
+            ConnectionState::ConnectingAfterAccepted => false,
+
+            ConnectionState::ConnectedBeforeAccepted => true,
+
+            ConnectionState::ConnectedAndAccepted => false,
+
+            // Not sure why this is true, but it preserves logic while refactoring.
+            // We should consider changing it because it doesn't
+            // make sense to accept after accepting
+            ConnectionState::ReconnectingAfterAccepted => true,
+
+            ConnectionState::IceFailed => false,
+            ConnectionState::Terminating => false,
+            ConnectionState::Terminated => false,
+        }
+    }
+
+    pub fn active(self) -> bool {
+        match self {
+            ConnectionState::NotYetStarted => false,
+            ConnectionState::Starting => false,
+            ConnectionState::IceGathering => false,
+            ConnectionState::ConnectingBeforeAccepted => false,
+            ConnectionState::ConnectingAfterAccepted => false,
+            ConnectionState::ConnectedBeforeAccepted => false,
+
+            ConnectionState::ConnectedAndAccepted => true,
+            ConnectionState::ReconnectingAfterAccepted => true,
+
+            ConnectionState::IceFailed => false,
+            ConnectionState::Terminating => false,
+            ConnectionState::Terminated => false,
+        }
+    }
+
+    pub fn can_send_hangup_via_rtp(self) -> bool {
+        match self {
+            ConnectionState::NotYetStarted => false,
+
+            // Not sure why these are true, but they preserve logic during refactoring.
+            // We should consider making them false because the messages
+            // can't go anywhere.
+            ConnectionState::Starting => true,
+            ConnectionState::IceGathering => true,
+            ConnectionState::ConnectingBeforeAccepted => true,
+            ConnectionState::ConnectingAfterAccepted => true,
+
+            ConnectionState::ConnectedBeforeAccepted => true,
+            ConnectionState::ConnectedAndAccepted => true,
+            ConnectionState::ReconnectingAfterAccepted => true,
+
+            // Not sure why these are true, but they preserve logic during refactoring.
+            // We should consider making them false because the messages
+            // can't go anywhere.
+            ConnectionState::IceFailed => true,
+            ConnectionState::Terminating => true,
+            ConnectionState::Terminated => true,
+        }
+    }
+
+    pub fn terminating_or_terminated(self) -> bool {
+        match self {
+            ConnectionState::NotYetStarted => false,
+            ConnectionState::Starting => false,
+            ConnectionState::IceGathering => false,
+            ConnectionState::ConnectingBeforeAccepted => false,
+            ConnectionState::ConnectingAfterAccepted => false,
+            ConnectionState::ConnectedBeforeAccepted => false,
+            ConnectionState::ConnectedAndAccepted => false,
+            ConnectionState::ReconnectingAfterAccepted => false,
+            ConnectionState::IceFailed => false,
+
+            ConnectionState::Terminating => true,
+            ConnectionState::Terminated => true,
+        }
+    }
+}
+
+/// The call direction.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallDirection {
+    /// Incoming call.
+    Incoming = 0,
+
+    /// Outgoing call.
+    Outgoing,
+}
+
+impl fmt::Display for CallDirection {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl CallDirection {
+    pub fn from_i32(value: i32) -> Self {
+        match value {
+            0 => CallDirection::Incoming,
+            1 => CallDirection::Outgoing,
+            _ => panic!("Unknown value: {}", value),
+        }
+    }
+}
+
+/// Type of media for a call at time of origination.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallMediaType {
+    /// Call should start as audio only.
+    Audio = 0,
+
+    /// Call should start as audio/video.
+    Video,
+}
+
+impl fmt::Display for CallMediaType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl CallMediaType {
+    pub fn from_i32(value: i32) -> Self {
+        match value {
+            0 => CallMediaType::Audio,
+            1 => CallMediaType::Video,
+            _ => panic!("Unknown value: {}", value),
+        }
+    }
+}
+
+/// The data mode allows the client to limit the media bandwidth used.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DataMode {
+    /// Intended for low bitrate video calls. Useful to reduce
+    /// bandwidth costs, especially on mobile data networks.
+    Low = 0,
+    /// (Default) No specific constraints, but keep a relatively
+    /// high bitrate to ensure good quality.
+    Normal,
+    /// Customizable configuration for testing.
+    Custom {
+        max_bitrate: units::DataRate,
+        max_group_call_receive_rate: units::DataRate,
+    },
+}
+
+impl fmt::Display for DataMode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl DataMode {
+    pub fn from_i32(value: i32) -> Self {
+        match value {
+            0 => DataMode::Low,
+            1 => DataMode::Normal,
+            _ => {
+                // Log but otherwise assume normal if not valid.
+                warn!("Invalid DataMode: {}", value);
+                DataMode::Normal
+            }
+        }
+    }
+
+    /// Return the maximum bitrate (for all media) allowed for the mode.
+    pub fn max_bitrate(&self) -> units::DataRate {
+        match self {
+            DataMode::Low => units::DataRate::from_kbps(300),
+            DataMode::Normal => units::DataRate::from_kbps(2_000),
+            &DataMode::Custom { max_bitrate, .. } => max_bitrate,
+        }
+    }
+}
+
+/// Low-level media configuration.
+#[derive(Clone, Debug)]
+pub struct CallConfig {
+    /// The DataMode at the time of call initialization.
+    pub data_mode: DataMode,
+    pub stats_interval_secs: u16,
+    pub stats_initial_offset_secs: u16,
+    pub call_summary_time_limit_secs: u16,
+
+    pub audio_config: AudioConfig,
+    pub audio_encoder_config: AudioEncoderConfig,
+    pub audio_decoder_config: AudioDecoderConfig,
+    pub enable_tcc_audio: bool,
+    pub audio_jitter_buffer_config: AudioJitterBufferConfig,
+    pub audio_rtcp_report_interval_ms: i32,
+
+    pub enable_vp9_encode: bool,
+    pub enable_vp9_decode: bool,
+}
+
+impl Default for CallConfig {
+    fn default() -> Self {
+        Self {
+            data_mode: DataMode::Normal,
+            stats_interval_secs: 10,
+            stats_initial_offset_secs: 2,
+            call_summary_time_limit_secs: 300,
+            audio_config: Default::default(),
+            audio_encoder_config: Default::default(),
+            audio_decoder_config: Default::default(),
+            enable_tcc_audio: false,
+            audio_jitter_buffer_config: Default::default(),
+            audio_rtcp_report_interval_ms: 5000,
+            enable_vp9_encode: true,
+            enable_vp9_decode: true,
+        }
+    }
+}
+
+impl CallConfig {
+    pub fn with_data_mode(mut self, data_mode: DataMode) -> Self {
+        self.data_mode = data_mode;
+        self
+    }
+    pub fn with_enable_vp9_encode(mut self, enable_vp9_encode: bool) -> Self {
+        self.enable_vp9_encode = enable_vp9_encode;
+        self
+    }
+
+    pub fn with_enable_vp9_decode(mut self, enable_vp9_decode: bool) -> Self {
+        self.enable_vp9_decode = enable_vp9_decode;
+        self
+    }
+
+    pub fn with_dred_duration(mut self, dred_duration: u8) -> Self {
+        self.audio_encoder_config.dred_duration = dred_duration;
+        self
+    }
+
+    pub fn with_stats_interval_secs(mut self, stats_interval_secs: u16) -> Self {
+        self.stats_interval_secs = stats_interval_secs;
+        // if stats_interval_secs <= stats_initial_offset_secs, then stats break
+        // guarantee that is not the case
+        self.stats_initial_offset_secs = core::cmp::min(
+            self.stats_initial_offset_secs,
+            stats_interval_secs.saturating_sub(1),
+        );
+        self
+    }
+}
+
+// Benchmarking component list.
+pub enum RingBench {
+    App,
+    Cm,
+    Call,
+    Conn,
+    WebRtc,
+    Network,
+}
+
+impl fmt::Display for RingBench {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                RingBench::App => "app",
+                RingBench::Cm => "cm",
+                RingBench::Call => "call",
+                RingBench::Conn => "conn",
+                RingBench::WebRtc => "rtc",
+                RingBench::Network => "net",
+            }
+        )
+    }
+}
+
+#[macro_export]
+macro_rules! ringbench {
+    ($source:expr, $destination:expr, $operation:expr) => {
+        info!(
+            "ringrtc!\t{}\t{} -> {}: {}",
+            match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(v) => v.as_millis(),
+                Err(_) => 0,
+            },
+            $source,
+            $destination,
+            $operation
+        );
+    };
+}
+
+#[macro_export]
+macro_rules! ringbenchx {
+    ($source:expr, $destination:expr, $operation:expr) => {
+        info!(
+            "ringrtc!\t{}\t{} -x {}: {}",
+            match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(v) => v.as_millis(),
+                Err(_) => 0,
+            },
+            $source,
+            $destination,
+            $operation
+        );
+    };
+}
