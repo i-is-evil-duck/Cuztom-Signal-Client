@@ -989,6 +989,87 @@ struct GroupCallControllerTests {
         #expect(update.ringUpdate == "Requested")
     }
 
+    /// A ring you cannot answer is still not inbound working.
+    ///
+    /// Answering resolves the group from the ring — the only place a group is
+    /// named before anyone has joined — and then runs the ordinary join: a client,
+    /// a membership proof, and the SFU admitting it. The ring is cleared first so
+    /// a failed join does not leave a banner offering a call that has already been
+    /// tried and failed.
+    @Test @MainActor func answeringARingJoinsTheCall() async throws {
+        let bridge = FakeBridge()
+        // The roster must know the group: a ring names a group by its ZK
+        // identifier, and resolving that to a master key is the first thing
+        // answering does. Without it the call is not answerable at all.
+        var roster = FakeRoster()
+        roster.knownGroupIdHex = Self.groupIdHex
+        let controller = makeController(bridge: bridge, roster: roster)
+
+        let ring = GroupCallController.GroupCallRing(
+            groupIdHex: Self.groupIdHex,
+            ringId: 7,
+            senderIdHex: "aabb",
+            title: "Test Group"
+        )
+        let state = await controller.answer(ring)
+
+        #expect(state != nil, "answering a ring must produce a call")
+        #expect(state?.isOutgoing == false, "an answered call is not outgoing")
+        #expect(state?.groupIdHex == Self.groupIdHex)
+        #expect(bridge.steps.contains("start"))
+        #expect(bridge.steps.contains("join"))
+        #expect(controller.incoming == nil, "the ring is cleared once answered")
+        // It is a normal call from here: the proof is fetched and presented in a
+        // tracked task, so it needs the same settle an outgoing call gets.
+        await settle(controller)
+        #expect(bridge.steps.contains("presentProof(2 bytes)"))
+    }
+
+    /// A ring for a group this device is not in must not be answerable.
+    @Test @MainActor func aRingForAnUnknownGroupIsNotAnswered() async throws {
+        let bridge = FakeBridge()
+        // The fake roster knows a different group id, so this one is unresolvable.
+        var roster = FakeRoster()
+        roster.knownGroupIdHex = Self.groupIdHex
+        let controller = makeController(bridge: bridge, roster: roster)
+
+        let ring = GroupCallController.GroupCallRing(
+            groupIdHex: String(repeating: "ef", count: 32),
+            ringId: 8,
+            senderIdHex: "aabb",
+            title: nil
+        )
+        let state = await controller.answer(ring)
+
+        #expect(state == nil, "a group we are not in cannot be joined")
+        #expect(!bridge.steps.contains("start"), "no client is created for it")
+        #expect(controller.incoming == nil, "an unanswerable ring is cleared")
+    }
+
+    /// Declining is local and must not start anything.
+    @Test @MainActor func decliningARingStartsNothing() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+
+        // Raised by driving a real ring through, so the test exercises the
+        // same path a caller's ring takes rather than reaching past it.
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .groupCallRing,
+                clientId: 0,
+                groupIdHex: Self.groupIdHex,
+                ringId: 9,
+                ringUpdate: "Requested"
+            )
+        )
+        await settle(controller)
+        let ring = try #require(controller.incoming)
+        controller.decline(ring)
+
+        #expect(controller.incoming == nil)
+        #expect(!bridge.steps.contains("start"), "declining is not joining")
+    }
+
     // MARK: - Inbound
 
     @Test @MainActor func anInboundCallForAKnownGroupIsJoined() async throws {

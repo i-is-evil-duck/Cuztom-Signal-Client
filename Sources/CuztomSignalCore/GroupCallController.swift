@@ -206,11 +206,18 @@ public final class GroupCallController: ObservableObject {
     }
 
     /// Somebody is calling a group and the user has not answered yet.
+    ///
+    /// The title is resolved by the controller when the ring arrives, because the
+    /// controller owns the roster and a view cannot await while building a body.
+    /// It may be `nil` when the group cannot be resolved — a ring for a group this
+    /// device is not in is not answerable anyway, and naming it wrongly would be
+    /// worse than saying "Group call".
     public struct GroupCallRing: Sendable, Equatable {
         public let groupIdHex: String
         public let ringId: Int64?
         /// The ringer's service id, raw hex.
         public let senderIdHex: String?
+        public var title: String?
     }
 
     /// One in-flight group call's private bookkeeping.
@@ -801,7 +808,98 @@ public final class GroupCallController: ObservableObject {
         // Surfaced as an incoming call. The client is not created here: joining
         // needs a membership proof, and creating one on a ring would start an SFU
         // session for a call the user may never accept.
-        incoming = GroupCallRing(groupIdHex: groupIdHex, ringId: update.ringId, senderIdHex: update.senderIdHex)
+        incoming = GroupCallRing(
+            groupIdHex: groupIdHex,
+            ringId: update.ringId,
+            senderIdHex: update.senderIdHex,
+            title: nil
+        )
+        // The title is resolved after the banner appears rather than delaying it:
+        // the roster lookup is async, and a ring that shows up a moment later with
+        // the right name is better than one that waits on a lookup.
+        let groupId = groupIdHex
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let masterKey = await self.roster.masterKeyHex(forGroupIdHex: groupId),
+                  self.incoming?.groupIdHex == groupId
+            else { return }
+            self.incoming?.title = self.roster.title(masterKeyHex: masterKey)
+        }
+    }
+
+    /// The master key for a group named by identifier.
+    ///
+    /// A ring names a group by its ZK identifier, which is not what a thread is
+    /// keyed on, so anything that wants to label the call — a title, a
+    /// conversation — has to go through this rather than build an id itself.
+    public func masterKeyHex(forGroupIdHex groupIdHex: String) async -> String? {
+        await roster.masterKeyHex(forGroupIdHex: groupIdHex)
+    }
+
+    /// Answer an incoming group call by joining it.
+    ///
+    /// The group id comes from the ring, which is the only notification that
+    /// names a call before anyone has joined — so this is the one path where the
+    /// group is known without the user having picked anything. The rest of the
+    /// join is the ordinary one: a client is created, a membership proof is
+    /// fetched and redeemed, and the SFU admits it.
+    ///
+    /// The ring is cleared first, whether or not the join succeeds, so a failed
+    /// join does not leave a banner offering a call that has already been tried
+    /// and failed.
+    public func answer(_ ring: GroupCallRing) async -> GroupCallState? {
+        guard let bridge else { return nil }
+        guard let masterKeyHex = await roster.masterKeyHex(forGroupIdHex: ring.groupIdHex) else {
+            // Either this device is not in the group, or the id map could not be
+            // read. The ring is not answerable in that case, and is not guessed
+            // around.
+            Log.error("[group-call] ring named a group this device is not in; cannot answer")
+            incoming = nil
+            return nil
+        }
+        incoming = nil
+        Log.info("[group-call] answering ring for \(Self.short(ring.groupIdHex))")
+        do {
+            let handle = try await bridge.startGroupCall(
+                groupIdHex: ring.groupIdHex,
+                sfuURL: sfuURL
+            )
+            let stateID = UUID()
+            let members = roster.members(masterKeyHex: masterKeyHex)
+            let title = roster.title(masterKeyHex: masterKeyHex)
+            session = Session(
+                stateID: stateID,
+                handle: handle,
+                masterKeyHex: masterKeyHex,
+                memberACIs: members,
+                title: title,
+                isOutgoing: false
+            )
+            current = GroupCallState(
+                id: stateID,
+                groupIdHex: ring.groupIdHex,
+                masterKeyHex: masterKeyHex,
+                title: title,
+                phase: .connecting,
+                isOutgoing: false
+            )
+            try await bridge.joinGroupCall(handle)
+            Log.info("[group-call] step=join-requested client=\(handle.clientId) (answered)")
+            return current
+        } catch {
+            fail("Could not join the call: \(Self.describe(error))")
+            return nil
+        }
+    }
+
+    /// Dismiss an incoming call without answering it.
+    ///
+    /// The ring stays in the caller's hands: this is a local decision not to
+    /// answer, not a cancellation, and a cancellation would need the ringer's
+    /// `ring_id` echoed back in a message this client does not send.
+    public func decline(_ ring: GroupCallRing) {
+        Log.info("[group-call] declined ring for \(Self.short(ring.groupIdHex))")
+        if incoming?.ringId == ring.ringId { incoming = nil }
     }
 
     /// A group id, shortened for a log line. Full length is stable, so the

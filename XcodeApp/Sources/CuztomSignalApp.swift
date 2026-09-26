@@ -653,6 +653,28 @@ func sendTyping(started: Bool) async {
         sync()
     }
 
+    /// The group call somebody is ringing us for, if any.
+    ///
+    /// Read from the controller rather than mirrored into a stored property, so
+    /// there is exactly one source of truth. A ring arrives with no client behind
+    /// it, so it cannot travel through the ordinary `groupCall` state.
+    var incomingGroupCall: GroupCallController.GroupCallRing? {
+        groupCallController?.incoming
+    }
+
+    /// Answer an incoming group call.
+    func answerGroupCall(_ ring: GroupCallController.GroupCallRing) async {
+        guard let groupCalls = groupCallController else { return }
+        groupCall = await groupCalls.answer(ring)
+        sync()
+    }
+
+    /// Dismiss an incoming group call without answering it.
+    func declineGroupCall(_ ring: GroupCallController.GroupCallRing) {
+        groupCallController?.decline(ring)
+        sync()
+    }
+
     /// Place a group call to a specific conversation, from its list row.
     func startGroupCall(conversationId: String) async {
         selectedId = conversationId

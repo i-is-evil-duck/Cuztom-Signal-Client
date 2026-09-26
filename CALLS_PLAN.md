@@ -269,7 +269,11 @@ re-apply it after an upstream update.
     ring can never pass, because a ring has no client behind it.
   Only `Requested` becomes an incoming call; busy, expired, and accepted-elsewhere
   are outcomes, and showing one as an incoming call would be a call that does not
-  exist.
+  exist. A ring that *is* requested now shows a banner with Join and Decline, and
+  answering resolves the group from the ring — the only place a group is named
+  before anyone has joined — and then runs the ordinary join. Declining is local:
+  a cancellation has to echo the ringer's `ring_id` back in a message this client
+  does not send, so declining does not pretend to cancel anything.
 - **The sync loop does not reconnect.** When the message stream ends, the loop
   `break`s, `set_sync_ctrl(None)` runs, and the loop is gone for good until the
   account is relinked. Everything routed through it then fails with "sync loop is

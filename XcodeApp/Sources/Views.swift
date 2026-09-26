@@ -219,6 +219,18 @@ struct MessageListView: View {
                         }
                     }
                 }
+                // An incoming group call, shown only while no call is in progress.
+                // A ring arrives before anybody has joined, so there is no call
+                // state for it - it is its own thing, and without a way to answer
+                // it an incoming group call is indistinguishable from no incoming
+                // group call at all.
+                if let ring = vm.incomingGroupCall, vm.groupCall == nil {
+                    IncomingGroupCallBanner(
+                        title: ring.title ?? "Group call",
+                        onAnswer: { Task { await vm.answerGroupCall(ring) } },
+                        onDecline: { vm.declineGroupCall(ring) }
+                    )
+                }
                 // Typing indicator
                 if let id = vm.selectedId,
                    let users = vm.typingUsers[id],
@@ -1539,10 +1551,46 @@ struct LinkPreviewRow: View {
 /// get a membership proof cannot connect, and that is not something to hide
 /// behind a spinner that never resolves: showing "connecting" forever would be a
 /// claim this build has not verified.
+/// Somebody is calling a group and the user has not answered.
+///
+/// Distinct from `GroupCallBanner`, which shows a call already in progress: a
+/// ring arrives before anyone has joined, so there is no client, no connection
+/// state, and nothing to end. Answering joins it; declining is local and sends
+/// nothing, because a cancellation has to echo the ringer's `ring_id` back and
+/// that message is not one this client sends.
+@MainActor
+struct IncomingGroupCallBanner: View {
+    /// Resolved by the caller, because it needs an await and this is a view.
+    let title: String
+    let onAnswer: () -> Void
+    let onDecline: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                Text("Incoming group call")
+                    .font(.caption)
+                    .foregroundStyle(Color.secondary)
+            }
+            Spacer()
+            Button("Decline", action: onDecline)
+                .buttonStyle(.plain)
+            Button("Join", action: onAnswer)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+}
+
 struct GroupCallBanner: View {
     let call: GroupCallState
     let onEnd: () -> Void
-
     private var statusText: String {
         switch call.phase {
         case .connecting:
