@@ -476,7 +476,18 @@ impl<S: Store> Manager<S, Registered> {
             )));
         }
         let body = String::from_utf8_lossy(&bytes).to_string();
-        eprintln!("[core] group token responded HTTP {status}, {} bytes", body.len());
+        if !status.is_success() {
+            // A rejection body is the service's reason for refusing, and the
+            // status alone does not distinguish "malformed authorization" from
+            // "presentation no longer valid" from "unknown route". The proof
+            // travels in the `Authorization` header, not here, so a 4xx body
+            // cannot echo it. Bounded, and only for a rejection: a success body
+            // holds the token and is never written.
+            let shown: String = body.chars().take(400).collect();
+            eprintln!("[core] group token rejected HTTP {status}: {shown}");
+        } else {
+            eprintln!("[core] group token responded HTTP {status}, {} bytes", body.len());
+        }
         Ok((status.as_u16(), body))
     }
 
