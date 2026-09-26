@@ -164,6 +164,11 @@ enum Command {
     GroupIdMap {
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Announce a group call to the group, so other members' devices ring.
+    GroupCallAnnounce {
+        group_id: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Perform one of the SFU's own HTTP requests.
     ///
     /// Native because the SFU's certificate comes from Signal's own authority
@@ -462,6 +467,16 @@ enum LoopCtrl {
     /// Every ZK group id this device belongs to, mapped to its master key.
     GroupIdMap {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Announce a group call to the group, so other members' devices ring.
+    ///
+    /// Routed through the loop because that is where the live manager lives, and
+    /// a group message can only be sent from it. This is the whole of the ring:
+    /// nothing else sends one, because RingRTC's only group-bound message is the
+    /// media key and it cannot build that until it has joined the SFU.
+    GroupCallAnnounce {
+        group_id: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// Perform one of the SFU's own HTTP requests.
     ///
@@ -880,6 +895,10 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                             let result = cmd_group_id_map(&state).await;
                             let _ = reply.send(result);
                         }
+                        Command::GroupCallAnnounce { group_id, reply } => {
+                            let result = cmd_group_call_announce(&state, &group_id).await;
+                            let _ = reply.send(result);
+                        }
                         Command::SfuHttpRequest {
                             method,
                             url,
@@ -1016,10 +1035,19 @@ fn spawn_worker() -> tmpsc::Sender<Command> {
                             let _ = reply.send(result);
                         }
                         Command::GroupCallStart { group_id, sfu_url, reply } => {
+                            // Announce before creating the client. The ring is the
+                            // only thing that tells anyone a call started, and it
+                            // has to go out whether or not the SFU join then
+                            // succeeds - a call that rings and fails to connect is
+                            // far better than one that silently never rings.
+                            let announced = cmd_group_call_announce(&state, &group_id).await;
                             let result = match call::start_group_call(group_id, sfu_url) {
                                 Ok(client_id) => Ok(u64::from(client_id) + 1),
                                 Err(e) => Err(e),
                             };
+                            if let Err(e) = announced {
+                                eprintln!("[core] group call start: announcement failed: {e}");
+                            }
                             let _ = reply.send(result);
                         }
                         Command::GroupCallJoin { client_id, reply } => {
@@ -1477,6 +1505,21 @@ async fn cmd_start_sync(state: &mut WorkerState) -> Result<(), String> {
                                 Some(LoopCtrl::GroupIdMap { reply }) => {
                                     let r = groups::group_id_map(&mut manager).await;
                                     let _ = reply.send(r);
+                                }
+                                Some(LoopCtrl::GroupCallAnnounce { group_id, reply }) => {
+                                    // The ring. Logged with its outcome because a
+                                    // call that nobody is told about looks
+                                    // identical to a call that connected.
+                                    match call::announce_group_call(&mut manager, &group_id).await
+                                    {
+                                        Ok(()) => eprintln!(
+                                            "[core] group call announced to {} ({} bytes)",
+                                            hex::encode(&group_id),
+                                            group_id.len()
+                                        ),
+                                        Err(e) => eprintln!("[core] group call announce failed: {e}"),
+                                    }
+                                    let _ = reply.send(Ok(()));
                                 }
                                 Some(LoopCtrl::SfuHttpRequest {
                                     method,
@@ -2215,6 +2258,42 @@ async fn cmd_group_call_redeem_proof(
     )
     .await?;
     reply_rx.await.map_err(|_| "sync loop dropped the request".to_string())?
+}
+
+/// Announce a group call to the group.
+///
+/// Routed through the loop, for the same reason as the redemption: a group
+/// message can only be sent from the live manager.
+///
+/// Reported as a failure rather than swallowed. A call that reaches the SFU but
+/// is never announced to the group is a call nobody is told about, and it is
+/// indistinguishable from one that worked when reading the log afterwards.
+async fn cmd_group_call_announce(
+    state: &WorkerState,
+    group_id: &[u8],
+) -> Result<(), String> {
+    if group_id.is_empty() {
+        return Err("a group call announcement needs a group id".to_string());
+    }
+    let sender = match state {
+        WorkerState::Linked(linked) => match linked.ctrl.as_ref() {
+            Some(sender) => sender,
+            None => return Err("sync loop is not running".to_string()),
+        },
+        _ => return Err("not linked".to_string()),
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    send_sync_ctrl_wait(
+        sender,
+        LoopCtrl::GroupCallAnnounce {
+            group_id: group_id.to_vec(),
+            reply: reply_tx,
+        },
+    )
+    .await?;
+    reply_rx
+        .await
+        .map_err(|_| "sync loop dropped the request".to_string())?
 }
 
 /// Perform one of the SFU's own HTTP requests.

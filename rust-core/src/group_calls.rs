@@ -64,6 +64,9 @@ pub enum GroupCallError {
     /// wrong place, and that otherwise surfaces only as an unexplained
     /// verification failure.
     ImplausibleRedemptionTime(u64),
+    /// A group id of the wrong length. A ZK group identifier is 32 bytes, and a
+    /// message built from any other length would name a room that cannot exist.
+    InvalidGroupIdLength(usize),
 }
 
 impl std::fmt::Display for GroupCallError {
@@ -71,6 +74,10 @@ impl std::fmt::Display for GroupCallError {
         match self {
             GroupCallError::InvalidMasterKey => write!(f, "group master key must be 32 bytes"),
             GroupCallError::InvalidServiceId(id) => write!(f, "invalid service id: {id}"),
+            GroupCallError::InvalidGroupIdLength(len) => write!(
+                f,
+                "group id was {len} bytes, expected {GROUP_CALL_GROUP_ID_LEN}"
+            ),
             GroupCallError::Serialization(what) => write!(f, "failed to serialize {what}"),
             GroupCallError::EmptyGroupPublicParams => {
                 write!(f, "group public params serialized to an empty buffer")
@@ -279,6 +286,57 @@ pub fn wrap_group_call_signal(
         ..Default::default()
     };
     Ok(proto.encode_to_vec())
+}
+
+/// Build the message that announces a group call to the group.
+///
+/// **This is the ring, and nothing else sends it.** `signaling::CallMessage` has
+/// no "call started" field — only `group_call_message`, `ring_intention` and
+/// `ring_response` — and the `group_call_message` RingRTC emits is the media
+/// key, which it can only build *after* joining the SFU and learning the other
+/// members' demux ids. With nobody in the conference yet there is nobody to
+/// address, so it sends nothing, so no other device is ever told a call began.
+/// The announcement is the host's job.
+///
+/// A `group_call_message` carrying only `group_id` is the whole of it, and the
+/// same structure the receive path reads a group id out of — so a peer that
+/// understands this one understands a media key from the same field, and needs no
+/// separate case.
+///
+/// Wrapped in `CallMessage.opaque` because that is the only carrier
+/// `CallMessage` has: `offer`, `answer`, `iceUpdate`, `busy`, `hangup`,
+/// `destinationDeviceId` and `opaque` are the complete set. The opaque payload
+/// is RingRTC's own `signaling::CallMessage`, so a real client reads it with the
+/// same parser this code does.
+pub fn wrap_group_call_announce(group_id: &[u8]) -> Result<Vec<u8>, GroupCallError> {
+    use presage::libsignal_service::proto::{
+        call_message::Opaque as ProtoOpaque, CallMessage as ProtoCallMessage,
+    };
+    use ringrtc::protobuf::{
+        group_call::DeviceToDevice, signaling::CallMessage as SignalCallMessage,
+    };
+    use prost::Message as _;
+
+    if group_id.len() != GROUP_CALL_GROUP_ID_LEN {
+        return Err(GroupCallError::InvalidGroupIdLength(group_id.len()));
+    }
+    let signal = SignalCallMessage {
+        group_call_message: Some(DeviceToDevice {
+            group_id: Some(group_id.to_vec()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    Ok(ProtoCallMessage {
+        opaque: Some(ProtoOpaque {
+            data: Some(signal.encode_to_vec()),
+            // Droppable, matching the media key: a device that is not listening
+            // for this call should not be woken for it.
+            urgency: Some(0),
+        }),
+        ..Default::default()
+    }
+    .encode_to_vec())
 }
 
 /// Pull RingRTC's payload back out of a Signal `CallMessage`.
@@ -584,6 +642,68 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_call_announcement_names_the_group_and_carries_nothing_else() {
+        use presage::libsignal_service::proto::CallMessage as ProtoCallMessage;
+        use prost::Message as _;
+
+        let group_id = [0x5Au8; GROUP_CALL_GROUP_ID_LEN];
+        let bytes = wrap_group_call_announce(&group_id).expect("a 32 byte group id announces");
+
+        // The carrier is `CallMessage.opaque`, which is the only field
+        // `CallMessage` has for this: the rest are offer/answer/ice/busy/hangup.
+        let outer = ProtoCallMessage::decode(bytes.as_slice()).expect("decodes as a CallMessage");
+        assert!(
+            outer.offer.is_none()
+                && outer.answer.is_none()
+                && outer.ice_update.is_empty()
+                && outer.busy.is_none()
+                && outer.hangup.is_none(),
+            "an announcement must not look like a 1:1 call message"
+        );
+        let opaque = outer.opaque.expect("carried in opaque");
+        assert_eq!(
+            opaque.urgency.unwrap_or(0),
+            0,
+            "droppable, like the media key"
+        );
+
+        // The payload is RingRTC's own signaling message, and the group id is
+        // readable out of it by the same function the receive path uses. That
+        // round trip is the point: what we send, we must be able to read back.
+        let (payload, immediate) =
+            unwrap_group_call_signal(bytes.as_slice()).expect("reads back as a group signal");
+        assert!(!immediate);
+        assert_eq!(
+            group_id_hex_from_ringrtc_signal(&payload).as_deref(),
+            Some(hex_encode(&group_id).as_str()),
+            "the announce path and the receive path must agree on the group id"
+        );
+
+        // A media key is deliberately absent: this is the announcement, not the
+        // key exchange, and a key would imply an SFU join that has not happened.
+        let inner = ringrtc::protobuf::signaling::CallMessage::decode(payload.as_slice())
+            .expect("inner is a signaling CallMessage");
+        let d2d = inner.group_call_message.expect("carries a group_call_message");
+        assert!(d2d.media_key.is_none(), "no media key before the SFU join");
+        assert!(d2d.heartbeat.is_none());
+        assert!(d2d.leaving.is_none());
+    }
+
+    #[test]
+    fn a_group_call_announcement_refuses_a_group_id_of_the_wrong_length() {
+        // A group id that is not 32 bytes names a room that cannot exist, and
+        // would be sent to every member of the group regardless.
+        assert!(matches!(
+            wrap_group_call_announce(&[0x5A; 16]),
+            Err(GroupCallError::InvalidGroupIdLength(16))
+        ));
+        assert!(matches!(
+            wrap_group_call_announce(&[]),
+            Err(GroupCallError::InvalidGroupIdLength(0))
+        ));
+    }
 
     fn master_key(byte: u8) -> Vec<u8> {
         vec![byte; GROUP_MASTER_KEY_LEN]

@@ -1808,6 +1808,45 @@ pub async fn sfu_http_request(
         .map_err(|e| format!("sfu request failed: {e}"))
 }
 
+/// Announce a group call to the group, so other members' devices ring.
+///
+/// Without this nobody is ever told a call started. RingRTC's only group-bound
+/// message is the media key, which it can only build after joining the SFU and
+/// learning the other members' demux ids — so with an empty conference it sends
+/// nothing at all. See [`crate::group_calls::wrap_group_call_announce`].
+///
+/// Sent to the whole group rather than to a recipient list: Signal group call
+/// signaling is group-wide, the group is the addressing, and the roster of
+/// members is not necessarily the roster of devices that should ring.
+pub async fn announce_group_call(
+    manager: &mut StoredManager,
+    group_id: &[u8],
+) -> Result<(), String> {
+    let master_key = crate::sync::group_master_key_for_id(manager, group_id)
+        .await
+        .map_err(|e| format!("announce: {e}"))?;
+    if master_key.len() != 32 {
+        return Err(format!(
+            "announce: group master key was {} bytes, expected 32",
+            master_key.len()
+        ));
+    }
+    let bytes = crate::group_calls::wrap_group_call_announce(group_id)
+        .map_err(|e| format!("announce: {e}"))?;
+    let message: presage::libsignal_service::proto::CallMessage =
+        prost::Message::decode(bytes.as_slice())
+            .map_err(|e| format!("announce: protobuf: {e}"))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    manager
+        .send_message_to_group(&master_key, ContentBody::CallMessage(message), timestamp)
+        .await
+        .map_err(|e| format!("announce: {e}"))?;
+    Ok(())
+}
+
 /// Send a group call signal to every member of the group.
 async fn send_group_call_signal(
     manager: &mut StoredManager,

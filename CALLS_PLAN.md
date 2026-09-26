@@ -248,6 +248,25 @@ re-apply it after an upstream update.
 
 ## Known call limitations and follow-ups
 
+- **A group call is now announced to the group, so members' devices ring.** Until
+  this, nothing did, which is why a call could reach the SFU and still ring
+  nobody. `signaling::CallMessage` has no "call started" field — only
+  `group_call_message`, `ring_intention` and `ring_response` — and the
+  `group_call_message` RingRTC emits is the *media key*, which it can only build
+  after joining the SFU and learning the other members' demux ids. With an empty
+  conference it sends nothing at all, so the announcement is the host's job. It is
+  a `group_call_message` carrying only `group_id`, in the same `CallMessage.opaque`
+  carrier everything else uses, and the receive path reads a group id out of
+  exactly that structure. Round-trip tested
+  (`a_group_call_announcement_names_the_group_and_carries_nothing_else`), so what
+  we send we can read back.
+- **The sync loop does not reconnect.** When the message stream ends, the loop
+  `break`s, `set_sync_ctrl(None)` runs, and the loop is gone for good until the
+  account is relinked. Everything routed through it then fails with "sync loop is
+  gone" — including **every SFU request**, because the SFU path uses the live
+  manager by way of the same control channel. Observed killing a live call 12
+  seconds in. A linked client that never reconnects is not really linked, and this
+  is the next thing to fix.
 - ICE currently uses public STUN servers. Signal's authenticated TURN relay
   list is not fetched yet, which is a real limit on 1:1 connectivity between
   restrictive networks. **This does not apply to group calls** — RingRTC's group
