@@ -393,6 +393,26 @@ is logged so a mismatch names itself.
   (`everyGroupCallAsksForTheMicrophoneFirst`,
   `aDeniedMicrophoneStopsTheCallInsteadOfJoiningSilently`)
 
+- **A group call's media keys are sent to the named recipients.** This was why
+  there was no audio, and the symptom is the interesting part: the peer reported
+  "can't receive audio and video" **only once somebody spoke**. RingRTC sends a
+  group's media keys to specific recipients and only uses the group-wide route
+  when there is more than one of them:
+
+  ```rust
+  (SignalGroup, _) if recipients.len() > 1 => send_signaling_message_to_group(…)  // supported
+  _ => for recipient in recipients { send_signaling_message(recipient, …) }       // was refused
+  ```
+
+  A two-person call has exactly one recipient, so it took the second branch — and
+  `send_call_message` returned `Err("targeted group call send is not supported")`.
+  The peer therefore never received the key needed to decrypt this client's audio.
+  Nothing is wrong while nobody talks, because there are no frames to decrypt, so
+  the fault is invisible until the first word. The refusal was deliberate ("safer
+  than guessing a recipient") and wrong: the recipient is supplied, not guessed.
+  (`a_targeted_group_signal_is_carried_in_the_same_opaque_envelope`,
+  `a_ringrtc_recipient_id_becomes_the_thread_it_is_addressed_by`)
+
 ## Where the group-call join actually stands
 **A group call connects.** Verified 2026-09-25 against the real SFU,
 `sfu.voip.signal.org`:

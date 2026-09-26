@@ -1024,6 +1024,66 @@ mod tests {
     }
 
     #[test]
+    fn a_ringrtc_recipient_id_becomes_the_thread_it_is_addressed_by() {
+        // A `UserId` is 16 fixed-width bytes and a thread is that uuid in text.
+        // Getting the byte order wrong addresses the wrong person, and a message
+        // to the wrong person fails silently - so this is pinned rather than
+        // assumed.
+        let uuid = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("uuid");
+        let bytes = uuid.as_bytes().to_vec();
+        assert_eq!(
+            crate::call::recipient_uuid_text_for_test(&bytes).as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        // And the inverse, which is what a wrong order would produce.
+        assert_eq!(
+            crate::call::recipient_uuid_text_for_test(
+                uuid.as_bytes().iter().rev().copied().collect::<Vec<u8>>().as_slice()
+            )
+            .as_deref(),
+            Some("55555555-5555-4444-3333-222211111111"),
+            "reversed bytes must not produce the same thread"
+        );
+        // Any other length is refused rather than padded into some address.
+        assert!(crate::call::recipient_uuid_text_for_test(&[]).is_none());
+        assert!(crate::call::recipient_uuid_text_for_test(&[0u8; 8]).is_none());
+        assert!(crate::call::recipient_uuid_text_for_test(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn a_targeted_group_signal_is_carried_in_the_same_opaque_envelope() {
+        use prost::Message as _;
+        use ringrtc::protobuf::{
+            group_call::DeviceToDevice,
+            signaling::CallMessage as SignalCallMessage,
+        };
+
+        let group_id = [0x91u8; GROUP_CALL_GROUP_ID_LEN];
+        // A media key, which is what actually travels this way.
+        let media = SignalCallMessage {
+            group_call_message: Some(DeviceToDevice {
+                group_id: Some(group_id.to_vec()),
+                media_key: Some(ringrtc::protobuf::group_call::device_to_device::MediaKey {
+                    ratchet_counter: Some(1),
+                    secret: Some(vec![0u8; 32]),
+                    demux_id: Some(9),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let bytes =
+            wrap_group_call_signal(&media, false).expect("a targeted signal wraps the same way");
+        let (payload, immediate) = unwrap_group_call_signal(bytes.as_slice()).expect("reads back");
+        assert!(!immediate, "a media key is droppable, not an interruption");
+        // Byte-identical: the recipient is the addressing, and the group id inside
+        // is the receiver's routing key, not something to rewrite.
+        assert_eq!(payload, media, "the payload must survive the envelope unchanged");
+    }
+
+    #[test]
     fn a_group_call_announcement_refuses_a_group_id_of_the_wrong_length() {
         // A group id that is not 32 bytes names a room that cannot exist, and
         // would be sent to every member of the group regardless.

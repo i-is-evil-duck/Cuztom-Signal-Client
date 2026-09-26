@@ -78,13 +78,31 @@ pub enum PendingCallSignal {
         group_id: Vec<u8>,
         proto: Vec<u8>,
     },
+    /// A group call message addressed to one recipient rather than the group.
+    ///
+    /// Distinct from [`Contact`](Self::Contact) because there is no 1:1 call to
+    /// report a failure against, and from [`Group`](Self::Group) because the
+    /// group is not the addressing — the recipient is.
+    ///
+    /// This is not a rare path. RingRTC sends a group's media keys to *specific*
+    /// recipients, and takes the group-wide route only when there is more than
+    /// one of them. In a two-person call there is exactly one, so the targeted
+    /// path is the normal one, and refusing it means the peer never receives the
+    /// key needed to decrypt this client's audio — which is invisible until
+    /// somebody speaks, and then looks like a broken client.
+    Targeted {
+        session_generation: u64,
+        thread: String,
+        proto: Vec<u8>,
+    },
 }
 
 impl PendingCallSignal {
     pub fn session_generation(&self) -> u64 {
         match self {
-            PendingCallSignal::Contact { session_generation, .. } => *session_generation,
-            PendingCallSignal::Group { session_generation, .. } => *session_generation,
+            PendingCallSignal::Contact { session_generation, .. }
+            | PendingCallSignal::Group { session_generation, .. }
+            | PendingCallSignal::Targeted { session_generation, .. } => *session_generation,
         }
     }
 
@@ -93,7 +111,7 @@ impl PendingCallSignal {
     pub fn call_id(&self) -> Option<u64> {
         match self {
             PendingCallSignal::Contact { call_id, .. } => Some(*call_id),
-            PendingCallSignal::Group { .. } => None,
+            PendingCallSignal::Group { .. } | PendingCallSignal::Targeted { .. } => None,
         }
     }
 }
@@ -287,16 +305,59 @@ impl SignalingSender for CuztomSignalingSender {
         .map_err(Into::into)
     }
 
+    /// Send a group call message to one named recipient.
+    ///
+    /// **This is the media-key path, and refusing it is why there was no audio.**
+    /// RingRTC sends a group's media keys to specific recipients and only uses the
+    /// group-wide route when there is more than one of them:
+    ///
+    /// ```text
+    /// (SignalGroup, _) if recipients.len() > 1 => send_signaling_message_to_group(…)
+    /// _ => for recipient in recipients { send_signaling_message(recipient, …) }
+    /// ```
+    ///
+    /// A two-person call has exactly one recipient, so it takes the second branch.
+    /// The peer therefore never received the key needed to decrypt this client's
+    /// audio — invisible while nobody spoke, and reported by the peer as "can't
+    /// receive audio and video from this client" the moment somebody did.
+    ///
+    /// The payload is RingRTC's own `signaling::CallMessage`, carried in the same
+    /// `CallMessage.opaque` as every other group signal, and it is sent as an
+    /// ordinary encrypted message to that recipient's thread. The group is not the
+    /// addressing here; the recipient is.
     fn send_call_message(
         &self,
-        _recipient_id: Vec<u8>,
-        _message: Vec<u8>,
-        _urgency: SignalingMessageUrgency,
+        recipient_id: Vec<u8>,
+        message: Vec<u8>,
+        urgency: SignalingMessageUrgency,
     ) -> ringrtc::common::Result<()> {
-        // 1:1 signaling is produced by the offer/answer/ice mapping above, so
-        // a group call reaching this method means RingRTC wanted a targeted
-        // send we do not perform. Refusing is safer than guessing a recipient.
-        Err(std::io::Error::other("targeted group call send is not supported").into())
+        // A `UserId` is 16 fixed-width bytes; a thread is that uuid in text.
+        let thread = recipient_uuid_text(&recipient_id).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "targeted group call send had a {} byte recipient, expected 16",
+                recipient_id.len()
+            ))
+        })?;
+        let proto = crate::group_calls::wrap_group_call_signal(
+            &message,
+            matches!(urgency, SignalingMessageUrgency::HandleImmediately),
+        )
+        .map_err(|e| std::io::Error::other(format!("targeted group call send: {e}")))?;
+        let Some(tx) = signal_tx() else {
+            return Err(std::io::Error::other("call signaling is not initialized").into());
+        };
+        tx.try_send(PendingCallSignal::Targeted {
+            session_generation: session_generation(),
+            thread,
+            proto,
+        })
+        .map_err(|error| {
+            std::io::Error::other(match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => "call signaling queue is full",
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => "call signaling receiver is closed",
+            })
+        })
+        .map_err(Into::into)
     }
 
     /// Send a group call signaling message to every member of the group.
@@ -1622,8 +1683,9 @@ pub async fn send_call_signal(
 
 pub async fn transmit(manager: &mut StoredManager, pending: PendingCallSignal) -> Result<(), String> {
     let generation = match &pending {
-        PendingCallSignal::Contact { session_generation, .. } => *session_generation,
-        PendingCallSignal::Group { session_generation, .. } => *session_generation,
+        PendingCallSignal::Contact { session_generation, .. }
+        | PendingCallSignal::Group { session_generation, .. }
+        | PendingCallSignal::Targeted { session_generation, .. } => *session_generation,
     };
     if generation != session_generation() {
         return Err("stale call session".to_string());
@@ -1635,6 +1697,14 @@ pub async fn transmit(manager: &mut StoredManager, pending: PendingCallSignal) -
         }
         PendingCallSignal::Group { group_id, proto, .. } => {
             send_group_call_signal(manager, &group_id, proto).await
+        }
+        // A group call's media key, addressed to one person. It travels as an
+        // ordinary encrypted message to that person's thread, because the
+        // recipient is the addressing — the group is not.
+        PendingCallSignal::Targeted { thread, proto, .. } => {
+            send_call_signal(manager, &thread, &base64::engine::general_purpose::STANDARD.encode(proto))
+                .await
+                .map_err(|e| format!("targeted group signal: {e}"))
         }
     }
 }
@@ -1821,6 +1891,29 @@ pub async fn sfu_http_request(
         .sfu_http_request(method, url, headers, body)
         .await
         .map_err(|e| format!("sfu request failed: {e}"))
+}
+
+/// A RingRTC `UserId` as the uuid text a thread is keyed on.
+///
+/// A `UserId` is 16 fixed-width bytes — the same form a service id takes in
+/// binary — and a conversation thread is that uuid in text. Guessing at the byte
+/// order would address the wrong person, and a wrong recipient fails silently, so
+/// the length is checked and the bytes are read as big-endian hex, which is how
+/// `uuid` lays a uuid out in memory.
+fn recipient_uuid_text(recipient: &[u8]) -> Option<String> {
+    if recipient.len() != 16 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(recipient);
+    let uuid = uuid::Uuid::from_bytes(bytes);
+    Some(uuid.to_string())
+}
+
+/// Exposed for tests: the byte order of a recipient address is a silent-failure
+/// risk, so it is pinned rather than assumed.
+pub(crate) fn recipient_uuid_text_for_test(recipient: &[u8]) -> Option<String> {
+    recipient_uuid_text(recipient)
 }
 
 /// Ring a group, as the creator of the call.
