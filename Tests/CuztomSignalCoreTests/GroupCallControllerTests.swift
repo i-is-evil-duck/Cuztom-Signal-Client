@@ -1131,6 +1131,54 @@ struct GroupCallControllerTests {
         #expect(answered.loads == 1, "answering a ring primes the roster too")
     }
 
+    /// A change to the incoming ring must be announced, not just stored.
+    ///
+    /// The ring arrived, `incoming` was set, and no banner appeared. The
+    /// controller is a Combine `ObservableObject` and the host model is Swift
+    /// `@Observable`; a computed property reading `incoming` across that boundary
+    /// registers no observation dependency, so the view was never told to re-read.
+    /// The property was correct and the value was correct and the UI still never
+    /// updated — which is only fixable if the change is announced.
+    @Test @MainActor func aChangeToTheIncomingRingIsAnnounced() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        var announced: [GroupCallController.GroupCallRing?] = []
+        controller.onIncomingRingChanged = { announced.append($0) }
+
+        func ring(_ outcome: String, id: Int64) -> RustCoreService.GroupCallUpdate {
+            RustCoreService.GroupCallUpdate(
+                kind: .groupCallRing,
+                clientId: 0,
+                groupIdHex: Self.groupIdHex,
+                ringId: id,
+                senderIdHex: "aabb",
+                ringUpdate: outcome
+            )
+        }
+
+        bridge.onGroupCallUpdate?(ring("Requested", id: 1))
+        await settle(controller)
+        #expect(announced.count == 1, "a ring must be announced, not only stored")
+        #expect(announced.first??.ringId == 1)
+
+        // Clearing is announced too: a banner that outlives its call is a lie.
+        controller.decline(GroupCallController.GroupCallRing(
+            groupIdHex: Self.groupIdHex,
+            ringId: 1,
+            senderIdHex: "aabb",
+            title: nil
+        ))
+        #expect(announced.count == 2)
+        // Indexed, not `.last`: `announced.last` is an optional of an optional,
+        // and `.some(nil) != nil` in Swift, which makes that comparison useless.
+        #expect(announced[1] == nil, "the clear is announced")
+
+        // An outcome that is not a call changes nothing, and announces nothing.
+        bridge.onGroupCallUpdate?(ring("BusyLocally", id: 2))
+        await settle(controller)
+        #expect(announced.count == 2, "a busy outcome is not an incoming call")
+    }
+
     // MARK: - Inbound
 
     @Test @MainActor func anInboundCallForAKnownGroupIsJoined() async throws {

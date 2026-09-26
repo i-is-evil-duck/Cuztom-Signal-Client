@@ -274,6 +274,14 @@ re-apply it after an upstream update.
   before anyone has joined — and then runs the ordinary join. Declining is local:
   a cancellation has to echo the ringer's `ring_id` back in a message this client
   does not send, so declining does not pretend to cancel anything.
+- **An incoming ring must be announced, not merely stored.** The controller is a
+  Combine `ObservableObject`; the host model is Swift `@Observable`. A computed
+  property reading `incoming` across that boundary registers no observation
+  dependency, so the ring arrived, `incoming` was set, and the banner never
+  appeared — the view was never told to re-read. Both halves were correct and the
+  UI still never updated, which is only fixable if the change is announced.
+  `setIncoming` is now the single place it changes and notifies
+  (`aChangeToTheIncomingRingIsAnnounced`).
 - **Every call path primes its own roster.** The roster is the member map the SFU
   needs in order to attribute this client and to encrypt media towards anyone.
   It used to be primed by the host before calling in, which meant the

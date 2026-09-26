@@ -251,6 +251,23 @@ public final class GroupCallController: ObservableObject {
     /// An incoming group call awaiting the user. Published so the UI can show it,
     /// and distinct from `current`, which is a call we are already in.
     @Published public private(set) var incoming: GroupCallRing?
+
+    /// Called whenever `incoming` changes, including when it clears.
+    ///
+    /// Exists because this controller is a Combine `ObservableObject` while the
+    /// view model is Swift `@Observable`, and a computed property reading
+    /// `incoming` through the controller registers no observation dependency at
+    /// all. The ring arrived, `incoming` was set, and the banner never appeared —
+    /// the view was never told to re-read. A host that mirrors this into its own
+    /// observable state gets the update; one that reads it as a property does not.
+    public var onIncomingRingChanged: ((GroupCallRing?) -> Void)?
+
+    /// The single place `incoming` changes, so the change cannot be missed.
+    private func setIncoming(_ ring: GroupCallRing?) {
+        guard incoming != ring else { return }
+        incoming = ring
+        onIncomingRingChanged?(ring)
+    }
     /// Invalidates callbacks and in-flight work across configure/reset so a late
     /// callback from a retired bridge cannot mutate a new call's state.
     private var lifecycleGeneration = 0
@@ -798,11 +815,13 @@ public final class GroupCallController: ObservableObject {
         // Surfaced as an incoming call. The client is not created here: joining
         // needs a membership proof, and creating one on a ring would start an SFU
         // session for a call the user may never accept.
-        incoming = GroupCallRing(
-            groupIdHex: groupIdHex,
-            ringId: update.ringId,
-            senderIdHex: update.senderIdHex,
-            title: nil
+        setIncoming(
+            GroupCallRing(
+                groupIdHex: groupIdHex,
+                ringId: update.ringId,
+                senderIdHex: update.senderIdHex,
+                title: nil
+            )
         )
         // The title is resolved after the banner appears rather than delaying it:
         // the roster lookup is async, and a ring that shows up a moment later with
@@ -813,7 +832,10 @@ public final class GroupCallController: ObservableObject {
                   let masterKey = await self.roster.masterKeyHex(forGroupIdHex: groupId),
                   self.incoming?.groupIdHex == groupId
             else { return }
-            self.incoming?.title = self.roster.title(masterKeyHex: masterKey)
+            if var ring = self.incoming {
+                ring.title = self.roster.title(masterKeyHex: masterKey)
+                self.setIncoming(ring)
+            }
         }
     }
 
@@ -872,10 +894,10 @@ public final class GroupCallController: ObservableObject {
             // read. The ring is not answerable in that case, and is not guessed
             // around.
             Log.error("[group-call] ring named a group this device is not in; cannot answer")
-            incoming = nil
+            setIncoming(nil)
             return nil
         }
-        incoming = nil
+        setIncoming(nil)
         // Primed here for the same reason the outgoing path primes it: without a
         // loaded roster the SFU is given no member map, so it cannot attribute
         // this client or encrypt anything towards it. That is not a cosmetic
@@ -923,7 +945,7 @@ public final class GroupCallController: ObservableObject {
     /// `ring_id` echoed back in a message this client does not send.
     public func decline(_ ring: GroupCallRing) {
         Log.info("[group-call] declined ring for \(Self.short(ring.groupIdHex))")
-        if incoming?.ringId == ring.ringId { incoming = nil }
+        if incoming?.ringId == ring.ringId { setIncoming(nil) }
     }
 
     /// A group id, shortened for a log line. Full length is stable, so the

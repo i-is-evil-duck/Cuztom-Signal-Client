@@ -331,6 +331,17 @@ final class ChatViewModel {
             redeemer: NativeGroupCallRedeemer(service: live)
         )
         groupCallController = groupCalls
+        // The controller is a Combine object and this model is `@Observable`, so
+        // nothing would re-render on a ring without being told. The banner is the
+        // only way an incoming call becomes visible, so it cannot depend on the
+        // view happening to read through to the controller.
+        groupCalls.onIncomingRingChanged = { [weak self] ring in
+            Task { @MainActor in
+                guard let self else { return }
+                self.incomingGroupCall = ring
+                self.sync()
+            }
+        }
         groupCalls.configure(with: live)
         // An inbound group call names a group by identifier, and one for a group
         // this device is not in cannot be joined, so the map is what decides
@@ -654,12 +665,13 @@ func sendTyping(started: Bool) async {
 
     /// The group call somebody is ringing us for, if any.
     ///
-    /// Read from the controller rather than mirrored into a stored property, so
-    /// there is exactly one source of truth. A ring arrives with no client behind
-    /// it, so it cannot travel through the ordinary `groupCall` state.
-    var incomingGroupCall: GroupCallController.GroupCallRing? {
-        groupCallController?.incoming
-    }
+    /// Mirrored here rather than read through the controller, because the
+    /// controller is a Combine `ObservableObject` and this is a Swift
+    /// `@Observable` model: a computed property reading across the two registers
+    /// no observation dependency, so the view is never told to re-read and the
+    /// banner never appears even though the ring arrived. Mirrored, reading it is
+    /// a real dependency.
+    private(set) var incomingGroupCall: GroupCallController.GroupCallRing?
 
     /// Answer an incoming group call.
     func answerGroupCall(_ ring: GroupCallController.GroupCallRing) async {
@@ -914,6 +926,7 @@ func sendTyping(started: Bool) async {
         groupRoster?.reset()
         groupRoster = nil
         groupCall = nil
+        incomingGroupCall = nil
         notifiedCallIDs.removeAll()
         NotificationManager.shared.cancelAll()
 
