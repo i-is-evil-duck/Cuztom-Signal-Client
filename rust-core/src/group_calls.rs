@@ -558,6 +558,81 @@ fn proof_randomness() -> RandomnessBytes {
     randomness
 }
 
+/// Why a group call signal did not yield a group id.
+///
+/// A `None` with no explanation is the whole reason inbound group calls were
+/// invisible: the payload arrives, it is a group call message, and nothing says
+/// which part of it was unusable. Group call traffic flows constantly in an
+/// active group, so "we could not identify this" is a normal observation rather
+/// than an error, and it is only actionable if it says what it saw.
+///
+/// **Field names only, never values.** A `media_key` carries an ratcheted
+/// secret; its *presence* is diagnostic and its contents are not.
+pub fn describe_group_call_signal(payload: &[u8]) -> String {
+    use ringrtc::protobuf::signaling::CallMessage as SignalCallMessage;
+    use prost::Message as _;
+
+    let message = match SignalCallMessage::decode(payload) {
+        Ok(message) => message,
+        Err(e) => return format!("not a signaling CallMessage ({e})"),
+    };
+    let mut present: Vec<&str> = Vec::new();
+    if message.group_call_message.is_some() {
+        present.push("group_call_message");
+    }
+    if message.ring_intention.is_some() {
+        present.push("ring_intention");
+    }
+    if message.ring_response.is_some() {
+        present.push("ring_response");
+    }
+    if present.is_empty() {
+        return "a signaling CallMessage with no field set".to_string();
+    }
+    let Some(device) = message.group_call_message.as_ref() else {
+        // A ring intention names its group in its own field, so say that rather
+        // than implying nothing was identified.
+        if let Some(ring) = message.ring_intention.as_ref() {
+            return match ring.group_id.as_ref() {
+                None => "a ring_intention with no group_id".to_string(),
+                Some(id) => format!(
+                    "a ring_intention for a {} byte group id{}",
+                    id.len(),
+                    match ring.r#type {
+                        Some(1) => " (cancelled)",
+                        _ => " (ring)",
+                    }
+                ),
+            };
+        }
+        return format!("a signaling CallMessage with {present:?} and no group_call_message");
+    };
+    let mut inner: Vec<&str> = Vec::new();
+    if device.media_key.is_some() {
+        inner.push("media_key");
+    }
+    if device.heartbeat.is_some() {
+        inner.push("heartbeat");
+    }
+    if device.leaving.is_some() {
+        inner.push("leaving");
+    }
+    if device.reaction.is_some() {
+        inner.push("reaction");
+    }
+    if device.remote_mute_request.is_some() {
+        inner.push("remote_mute_request");
+    }
+    match device.group_id.as_ref() {
+        None => format!("a group_call_message with no group_id (fields: {inner:?})"),
+        Some(id) if id.len() != GROUP_CALL_GROUP_ID_LEN => format!(
+            "a group_id of {} bytes, expected {GROUP_CALL_GROUP_ID_LEN} (fields: {inner:?})",
+            id.len()
+        ),
+        Some(_) => format!("a group_call_message with {inner:?}"),
+    }
+}
+
 /// The ZK group identifier carried inside a RingRTC group call signal, as hex.
 ///
 /// RingRTC does not create a group client when signaling arrives: it routes a
@@ -567,17 +642,123 @@ fn proof_randomness() -> RandomnessBytes {
 /// it in `signaling::CallMessage.group_call_message.group_id`.
 ///
 /// `None` for a payload that is not group call signaling, or whose group id is
-/// not the expected length.
+/// not the expected length. [`describe_group_call_signal`] says which of those it
+/// was.
 pub fn group_id_hex_from_ringrtc_signal(payload: &[u8]) -> Option<String> {
-    use ringrtc::protobuf::{group_call::DeviceToDevice, signaling::CallMessage as SignalCallMessage};
+    use ringrtc::protobuf::signaling::CallMessage as SignalCallMessage;
     use prost::Message as _;
 
     let message = SignalCallMessage::decode(payload).ok()?;
-    let group_id = message.group_call_message?.group_id?;
+    // Three different fields can name a group, and reading only the first is why
+    // inbound ring intentions were invisible: a `ring_intention` carries no
+    // `group_call_message` at all, so a payload that names a group perfectly well
+    // read as carrying none. Verified against RingRTC, which routes each of these
+    // to a different handler.
+    let candidate = message
+        .group_call_message
+        .as_ref()
+        .and_then(|m| m.group_id.as_deref())
+        .or_else(|| {
+            message
+                .ring_intention
+                .as_ref()
+                .and_then(|r| r.group_id.as_deref())
+        })
+        .or_else(|| {
+            message
+                .ring_response
+                .as_ref()
+                .and_then(|r| r.group_id.as_deref())
+        })?;
+    if candidate.len() != GROUP_CALL_GROUP_ID_LEN {
+        return None;
+    }
+    Some(hex_encode(candidate))
+}
+
+/// A group ring request carried in a `ring_intention`.
+///
+/// This is Signal's group *ring*: a lightweight "someone is calling this group"
+/// that arrives before anybody has joined the SFU, which is why it is the only
+/// notification that can ring a device. Distinct from a group call signal, and
+/// handled by RingRTC through `start_group_ring` rather than by a call client.
+pub struct GroupRing {
+    pub group_id_hex: String,
+    /// `RING` or `CANCELLED`.
+    pub cancelled: bool,
+    /// Correlates the ring with its response and any later cancellation, so a
+    /// stale ring cannot cancel a newer one.
+    pub ring_id: i64,
+}
+
+/// Read a group ring out of a payload, if it is one.
+pub fn group_ring_from_signal(payload: &[u8]) -> Option<GroupRing> {
+    use ringrtc::protobuf::signaling::{call_message::RingIntention, CallMessage as SignalCallMessage};
+    use prost::Message as _;
+
+    let message = SignalCallMessage::decode(payload).ok()?;
+    let ring = message.ring_intention?;
+    let group_id = ring.group_id?;
+    let ring_id = ring.ring_id?;
     if group_id.len() != GROUP_CALL_GROUP_ID_LEN {
         return None;
     }
-    Some(hex_encode(&group_id))
+    use ringrtc::protobuf::signaling::call_message::ring_intention::Type as IntentionType;
+    let cancelled = ring
+        .r#type
+        .and_then(|t| IntentionType::try_from(t).ok())
+        == Some(IntentionType::Cancelled);
+    Some(GroupRing {
+        group_id_hex: hex_encode(&group_id),
+        cancelled,
+        ring_id,
+    })
+}
+
+/// Build the message that rings a group.
+///
+/// **This, not [`wrap_group_call_announce`], is what makes a device ring.**
+/// RingRTC's `start_group_ring` is private and `CallManager` exposes no way to
+/// send one, so the host sends the `ring_intention` itself. It has to be sent
+/// before anyone joins the SFU: the media key RingRTC can produce is only
+/// available once it knows the other members' demux ids, which is exactly the
+/// chicken-and-egg that left a connected call ringing nobody.
+///
+/// `ring_id` is echoed in the response and in any cancellation, so the same value
+/// must be used throughout one ring. It is signed because it is stored in an
+/// integer column.
+pub fn wrap_group_ring(group_id: &[u8], ring_id: i64) -> Result<Vec<u8>, GroupCallError> {
+    use presage::libsignal_service::proto::{
+        call_message::Opaque as ProtoOpaque, CallMessage as ProtoCallMessage,
+    };
+    use ringrtc::protobuf::signaling::{
+        call_message::{RingIntention, ring_intention::Type as IntentionType},
+        CallMessage as SignalCallMessage,
+    };
+    use prost::Message as _;
+
+    if group_id.len() != GROUP_CALL_GROUP_ID_LEN {
+        return Err(GroupCallError::InvalidGroupIdLength(group_id.len()));
+    }
+    let signal = SignalCallMessage {
+        ring_intention: Some(RingIntention {
+            group_id: Some(group_id.to_vec()),
+            r#type: Some(IntentionType::Ring as i32),
+            ring_id: Some(ring_id),
+        }),
+        ..Default::default()
+    };
+    Ok(ProtoCallMessage {
+        opaque: Some(ProtoOpaque {
+            data: Some(signal.encode_to_vec()),
+            // Handled immediately, not droppable. A ring is the one message whose
+            // whole purpose is to interrupt, and a device that is briefly offline
+            // is the case a ring has to survive.
+            urgency: Some(1),
+        }),
+        ..Default::default()
+    }
+    .encode_to_vec())
 }
 
 /// The ZK group identifier for a hex-encoded group master key.
@@ -689,6 +870,164 @@ mod tests {
         assert!(d2d.media_key.is_none(), "no media key before the SFU join");
         assert!(d2d.heartbeat.is_none());
         assert!(d2d.leaving.is_none());
+    }
+
+    #[test]
+    fn an_unidentifiable_group_call_signal_says_what_it_was() {
+        use prost::Message as _;
+        use ringrtc::protobuf::{
+            group_call::{DeviceToDevice, device_to_device::MediaKey},
+            signaling::CallMessage as SignalCallMessage,
+        };
+
+        let group_id = [0x11u8; GROUP_CALL_GROUP_ID_LEN];
+
+        // A well-formed announcement is identified, and the description agrees.
+        let announce = wrap_group_call_announce(&group_id).expect("announce");
+        let (payload, _) = unwrap_group_call_signal(announce.as_slice()).expect("opaque");
+        assert_eq!(
+            group_id_hex_from_ringrtc_signal(&payload).as_deref(),
+            Some(hex_encode(&group_id).as_str())
+        );
+        assert!(describe_group_call_signal(&payload).contains("group_call_message"));
+
+        // A media key with no group id: the shape that produced "inbound signal
+        // had no group id" with no further explanation.
+        let no_group = SignalCallMessage {
+            group_call_message: Some(DeviceToDevice {
+                media_key: Some(MediaKey {
+                    ratchet_counter: Some(3),
+                    secret: Some(vec![0u8; 32]),
+                    demux_id: Some(1),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(group_id_hex_from_ringrtc_signal(&no_group).is_none());
+        let described = describe_group_call_signal(&no_group);
+        assert!(described.contains("no group_id"), "{described}");
+        assert!(described.contains("media_key"), "{described}");
+        // Field names, never the secret it carries.
+        assert!(!described.contains("secret"), "{described}");
+
+        // A group id of the wrong length names its length rather than just failing.
+        let short = SignalCallMessage {
+            group_call_message: Some(DeviceToDevice {
+                group_id: Some(vec![0u8; 16]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(describe_group_call_signal(&short).contains("16 bytes"));
+
+        // Something that is not this message at all, and an empty one.
+        assert!(describe_group_call_signal(&[0xff, 0xff, 0xff]).contains("not a signaling"));
+        assert!(describe_group_call_signal(&[])
+            .contains("no field set"));
+    }
+
+    #[test]
+    fn a_group_ring_round_trips_and_names_its_group() {
+        use prost::Message as _;
+        use ringrtc::protobuf::signaling::{
+            call_message::{RingIntention, ring_intention::Type as IntentionType},
+            CallMessage as SignalCallMessage,
+        };
+
+        let group_id = [0x7Bu8; GROUP_CALL_GROUP_ID_LEN];
+        let bytes = wrap_group_ring(&group_id, -4242).expect("rings");
+
+        // A ring is `ring_intention`, not `group_call_message`. That was the bug:
+        // the group id was read only from `group_call_message`, so a payload that
+        // named its group perfectly well read as naming none.
+        let (payload, immediate) =
+            unwrap_group_call_signal(bytes.as_slice()).expect("carried in opaque");
+        assert!(immediate, "a ring must interrupt, not be dropped");
+
+        let inner = SignalCallMessage::decode(payload.as_slice()).expect("decodes");
+        assert!(inner.group_call_message.is_none(), "a ring is not a group call message");
+        let ring = inner.ring_intention.expect("is a ring intention");
+        assert_eq!(ring.group_id.as_deref(), Some(&group_id[..]));
+        assert_eq!(ring.r#type, Some(IntentionType::Ring as i32));
+        assert_eq!(ring.ring_id, Some(-4242));
+
+        // Readable by the same function the receive path uses, and as a ring.
+        assert_eq!(
+            group_id_hex_from_ringrtc_signal(&payload).as_deref(),
+            Some(hex_encode(&group_id).as_str())
+        );
+        let read = group_ring_from_signal(&payload).expect("reads as a ring");
+        assert_eq!(read.group_id_hex, hex_encode(&group_id));
+        assert!(!read.cancelled);
+        assert_eq!(read.ring_id, -4242);
+    }
+
+    #[test]
+    fn a_cancelled_ring_is_distinguished_from_a_requested_one() {
+        use prost::Message as _;
+        use ringrtc::protobuf::signaling::{
+            call_message::{RingIntention, ring_intention::Type as IntentionType},
+            CallMessage as SignalCallMessage,
+        };
+
+        let group_id = [0x22u8; GROUP_CALL_GROUP_ID_LEN];
+        let cancelled = SignalCallMessage {
+            ring_intention: Some(RingIntention {
+                group_id: Some(group_id.to_vec()),
+                r#type: Some(IntentionType::Cancelled as i32),
+                ring_id: Some(9),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let read = group_ring_from_signal(&cancelled).expect("reads as a ring");
+        assert!(read.cancelled, "a cancellation must not look like a call");
+        // Still routable: the group id is there, so a cancellation can end the
+        // right call.
+        assert_eq!(read.group_id_hex, hex_encode(&group_id));
+    }
+
+    #[test]
+    fn something_that_is_not_a_ring_is_not_read_as_one() {
+        use prost::Message as _;
+        use ringrtc::protobuf::{
+            group_call::DeviceToDevice,
+            signaling::CallMessage as SignalCallMessage,
+        };
+
+        // A group call signal names a group but is not a ring.
+        let call = SignalCallMessage {
+            group_call_message: Some(DeviceToDevice {
+                group_id: Some(vec![0x33u8; GROUP_CALL_GROUP_ID_LEN]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(group_ring_from_signal(&call).is_none());
+        // But it is still identified, which is the other half of the fix.
+        assert_eq!(
+            group_id_hex_from_ringrtc_signal(&call).as_deref(),
+            Some(hex_encode(&[0x33u8; GROUP_CALL_GROUP_ID_LEN]).as_str())
+        );
+
+        // A ring with no ring id cannot be correlated, so it is not a ring.
+        let incomplete = SignalCallMessage {
+            ring_intention: Some(ringrtc::protobuf::signaling::call_message::RingIntention {
+                group_id: Some(vec![0x44u8; GROUP_CALL_GROUP_ID_LEN]),
+                r#type: Some(0),
+                ring_id: None,
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(group_ring_from_signal(&incomplete).is_none());
+
+        assert!(group_ring_from_signal(&[]).is_none());
     }
 
     #[test]

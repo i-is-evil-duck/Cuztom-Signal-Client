@@ -900,6 +900,95 @@ struct GroupCallControllerTests {
         )
     }
 
+    /// An incoming group ring must be shown, and only a real request.
+    ///
+    /// A ring is the only notification that can make a device ring at all: the
+    /// media key RingRTC produces on its own needs the other members' demux ids,
+    /// which only exist once a call is under way. RingRTC validates the ring and
+    /// reports the outcome, and the outcome is the difference between somebody
+    /// calling and a busy device — so only `Requested` may become an incoming
+    /// call, and the rest must not.
+    @Test @MainActor func onlyARequestedRingBecomesAnIncomingCall() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+
+        func ring(_ outcome: String) -> RustCoreService.GroupCallUpdate {
+            RustCoreService.GroupCallUpdate(
+                kind: .groupCallRing,
+                clientId: 0,
+                groupIdHex: Self.groupIdHex,
+                ringId: 99,
+                senderIdHex: "aabb",
+                ringUpdate: outcome
+            )
+        }
+
+        bridge.onGroupCallUpdate?(ring("BusyLocally"))
+        await settle(controller)
+        #expect(controller.incoming == nil, "a busy outcome is not somebody calling")
+
+        bridge.onGroupCallUpdate?(ring("ExpiredRequest"))
+        await settle(controller)
+        #expect(controller.incoming == nil, "an expired request is not an incoming call")
+
+        bridge.onGroupCallUpdate?(ring("Requested"))
+        await settle(controller)
+        #expect(controller.incoming?.groupIdHex == Self.groupIdHex)
+        #expect(controller.incoming?.ringId == 99)
+
+        // A ring with no group cannot be shown against the wrong group.
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .groupCallRing,
+                clientId: 0,
+                groupIdHex: nil,
+                ringUpdate: "Requested"
+            )
+        )
+        await settle(controller)
+        #expect(controller.incoming?.groupIdHex == Self.groupIdHex, "an unnamed ring changes nothing")
+    }
+
+    /// A ring for the call already in progress must not disturb it.
+    @Test @MainActor func aRingForTheLiveCallDoesNotReplaceIt() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        let live = try #require(controller.current)
+
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .groupCallRing,
+                clientId: 0,
+                groupIdHex: Self.groupIdHex,
+                ringId: 1,
+                ringUpdate: "Requested"
+            )
+        )
+        await settle(controller)
+
+        #expect(controller.current?.id == live.id, "the live call survives a ring")
+        #expect(controller.incoming == nil, "a ring for a call we are in is not incoming")
+    }
+
+    /// The native ring event must survive the wire format it actually travels on.
+    @Test func aRingUpdateDecodesFromTheNativeEvent() throws {
+        let json = """
+            {"type":"group_update","update":"group_call_ring","client_id":0,\
+            "group_id":"316053a130672bdb","ring_id":-77,"sender_id":"aabbcc",\
+            "ring_update":"Requested"}
+            """.data(using: .utf8)!
+        let update = try #require(
+            RustCoreService.decodeGroupCallUpdateForTesting(json)
+        )
+        #expect(update.kind == .groupCallRing)
+        #expect(update.groupIdHex == "316053a130672bdb")
+        #expect(update.ringId == -77)
+        #expect(update.senderIdHex == "aabbcc")
+        #expect(update.ringUpdate == "Requested")
+    }
+
     // MARK: - Inbound
 
     @Test @MainActor func anInboundCallForAKnownGroupIsJoined() async throws {

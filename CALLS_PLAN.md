@@ -248,18 +248,28 @@ re-apply it after an upstream update.
 
 ## Known call limitations and follow-ups
 
-- **A group call is now announced to the group, so members' devices ring.** Until
-  this, nothing did, which is why a call could reach the SFU and still ring
-  nobody. `signaling::CallMessage` has no "call started" field — only
-  `group_call_message`, `ring_intention` and `ring_response` — and the
-  `group_call_message` RingRTC emits is the *media key*, which it can only build
-  after joining the SFU and learning the other members' demux ids. With an empty
-  conference it sends nothing at all, so the announcement is the host's job. It is
-  a `group_call_message` carrying only `group_id`, in the same `CallMessage.opaque`
-  carrier everything else uses, and the receive path reads a group id out of
-  exactly that structure. Round-trip tested
-  (`a_group_call_announcement_names_the_group_and_carries_nothing_else`), so what
-  we send we can read back.
+- **A group call rings.** The ring is a `ring_intention`, and it is the *only*
+  thing that can ring a device — the media key RingRTC produces on its own needs
+  the other members' demux ids, which only exist once a call is under way, so it
+  cannot be what starts one. RingRTC's `start_group_ring` is private and
+  `CallManager` exposes no way to send one, so the host sends it. Three things
+  were wrong and all three had to be fixed:
+  - The ring was never sent. Now `ring_group` sends a `ring_intention` (plus the
+    `group_call_message` announcement, which is a different signal: the ring is
+    what a device acts on, the announcement is what a client already in the call
+    routes).
+  - The group id was read only from `group_call_message`, so a `ring_intention` —
+    which names its group in its own field and has no `group_call_message` at
+    all — read as naming none. That is why inbound was silent while the payloads
+    were arriving. All three carriers are read now.
+  - `GroupUpdate::Ring` fell into the handler's catch-all and was dropped.
+    RingRTC validates the ring, tracks it, and reports the outcome; that outcome
+    was being discarded one layer above the host. And on the Swift side the ring
+    was handled *after* the "does this controller own this client" guard, which a
+    ring can never pass, because a ring has no client behind it.
+  Only `Requested` becomes an incoming call; busy, expired, and accepted-elsewhere
+  are outcomes, and showing one as an incoming call would be a call that does not
+  exist.
 - **The sync loop does not reconnect.** When the message stream ends, the loop
   `break`s, `set_sync_ctrl(None)` runs, and the loop is gone for good until the
   account is relinked. Everything routed through it then fails with "sync loop is

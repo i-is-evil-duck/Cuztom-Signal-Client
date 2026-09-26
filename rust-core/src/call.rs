@@ -512,6 +512,21 @@ impl GroupUpdateHandler for CuztomGroupHandler {
                 "update": "request_group_members",
                 "client_id": *client_id,
             }),
+            // The group *ring*. RingRTC validates the ring, tracks it, and hands
+            // the outcome here — and it was falling into the catch-all below,
+            // which is why an incoming group call produced no ring at all even
+            // though it arrived and was understood one layer below.
+            GroupUpdate::Ring { group_id, ring_id, sender_id, update } => serde_json::json!({
+                "type": "group_update",
+                "update": "group_call_ring",
+                // No client behind a ring: it arrives before anyone has joined,
+                // so there is no client id and 0 means "none", never "client 0".
+                "client_id": 0u32,
+                "group_id": hex::encode(group_id),
+                "ring_id": i64::from(*ring_id),
+                "sender_id": hex::encode(sender_id),
+                "ring_update": format!("{update:?}"),
+            }),
             GroupUpdate::ConnectionStateChanged(client_id, state) => serde_json::json!({
                 "type": "group_update",
                 "update": "connection_state_changed",
@@ -1808,42 +1823,75 @@ pub async fn sfu_http_request(
         .map_err(|e| format!("sfu request failed: {e}"))
 }
 
-/// Announce a group call to the group, so other members' devices ring.
+/// A fresh ring identifier.
 ///
-/// Without this nobody is ever told a call started. RingRTC's only group-bound
-/// message is the media key, which it can only build after joining the SFU and
-/// learning the other members' demux ids — so with an empty conference it sends
-/// nothing at all. See [`crate::group_calls::wrap_group_call_announce`].
+/// Signed 64-bit, because the receiving side stores it in an integer column, and
+/// random, because a ring that collides with a concurrent one would let a
+/// cancellation for one call silence another. `OsRng` panicking on a failure to
+/// get entropy is the correct outcome: a predictable ring id would let a stale
+/// ring cancel a live one.
+pub fn new_ring_id() -> i64 {
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    i64::from_le_bytes(bytes)
+}
+
+/// Ring a group, so other members' devices actually ring.
 ///
-/// Sent to the whole group rather than to a recipient list: Signal group call
-/// signaling is group-wide, the group is the addressing, and the roster of
-/// members is not necessarily the roster of devices that should ring.
-pub async fn announce_group_call(
+/// **The ring is a `ring_intention`, not a `group_call_message`.** RingRTC's
+/// `start_group_ring` is private and `CallManager` exposes no way to send one,
+/// so the host sends it. It has to go out *before* the SFU join: the only
+/// group-bound message RingRTC produces on its own is the media key, and it
+/// cannot build that until it has joined and learned the other members' demux
+/// ids — so a call that waits for RingRTC to announce itself announces nothing,
+/// because the conference is empty. That is the whole reason a call could reach
+/// the SFU and ring nobody.
+///
+/// `ring_id` is echoed in the response and in any cancellation, so the same value
+/// has to accompany one ring throughout. The announcement is sent alongside the
+/// ring because they are different signals: the ring is what a device acts on,
+/// and the announcement is what a client that is already in the call routes.
+///
+/// Sent to the whole group: the group is the addressing, and the member roster is
+/// not the roster of devices that should ring.
+pub async fn ring_group(
     manager: &mut StoredManager,
     group_id: &[u8],
+    ring_id: i64,
 ) -> Result<(), String> {
     let master_key = crate::sync::group_master_key_for_id(manager, group_id)
         .await
-        .map_err(|e| format!("announce: {e}"))?;
+        .map_err(|e| format!("ring: {e}"))?;
     if master_key.len() != 32 {
         return Err(format!(
-            "announce: group master key was {} bytes, expected 32",
+            "ring: group master key was {} bytes, expected 32",
             master_key.len()
         ));
     }
-    let bytes = crate::group_calls::wrap_group_call_announce(group_id)
-        .map_err(|e| format!("announce: {e}"))?;
-    let message: presage::libsignal_service::proto::CallMessage =
-        prost::Message::decode(bytes.as_slice())
-            .map_err(|e| format!("announce: protobuf: {e}"))?;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    manager
-        .send_message_to_group(&master_key, ContentBody::CallMessage(message), timestamp)
-        .await
-        .map_err(|e| format!("announce: {e}"))?;
+    let mut sent = Vec::new();
+    for (what, bytes) in [
+        ("ring", crate::group_calls::wrap_group_ring(group_id, ring_id)),
+        (
+            "announce",
+            crate::group_calls::wrap_group_call_announce(group_id),
+        ),
+    ] {
+        let bytes = bytes.map_err(|e| format!("ring: {what}: {e}"))?;
+        let message: presage::libsignal_service::proto::CallMessage =
+            prost::Message::decode(bytes.as_slice())
+                .map_err(|e| format!("ring: {what}: protobuf: {e}"))?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        manager
+            .send_message_to_group(&master_key, ContentBody::CallMessage(message), timestamp)
+            .await
+            .map_err(|e| format!("ring: {what}: {e}"))?;
+        sent.push(what);
+    }
+    eprintln!("[core] group ring sent: {sent:?} ring_id={ring_id}");
     Ok(())
 }
 

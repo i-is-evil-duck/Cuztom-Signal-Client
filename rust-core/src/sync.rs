@@ -1037,13 +1037,25 @@ pub fn call_signal_part(
         // the message to an existing client for that group and drops it
         // otherwise. The host therefore has to be told which group this is in
         // order to create a client to receive on.
+        let group_id = crate::group_calls::group_id_hex_from_ringrtc_signal(data);
+        // A payload with no readable group id is ordinary group call traffic
+        // that cannot be routed, not a failure, and it flows constantly in an
+        // active group. It is described rather than silently dropped, because
+        // "inbound group call messages we cannot identify" is the difference
+        // between a group that is quiet and a group whose calls we never see.
+        if group_id.is_none() {
+            eprintln!(
+                "[core] inbound group call signal carries no group id: {}",
+                crate::group_calls::describe_group_call_signal(data)
+            );
+        }
         return Some(serde_json::json!({
             "type": "group_call_signal",
             "sender": sender,
             "sender_device_id": sender_device_id,
             "message_b64": b64(data),
             "immediate": opaque.urgency.unwrap_or(0) == 1,
-            "group_id": crate::group_calls::group_id_hex_from_ringrtc_signal(data),
+            "group_id": group_id,
             "ts": ts,
         }));
     }

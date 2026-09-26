@@ -1317,10 +1317,20 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let clientId: UInt32
         let state: String?
         let reason: String?
+        // Present only on `group_call_ring`, which is the one update with no
+        // client behind it: a ring arrives before there is a call to join.
+        let groupId: String?
+        let ringId: Int64?
+        let senderId: String?
+        let ringUpdate: String?
 
         enum CodingKeys: String, CodingKey {
             case update, state, reason
             case clientId = "client_id"
+            case groupId = "group_id"
+            case ringId = "ring_id"
+            case senderId = "sender_id"
+            case ringUpdate = "ring_update"
         }
 
         /// An unknown update is dropped rather than guessed at, so a newer core
@@ -1331,7 +1341,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 kind: kind,
                 clientId: clientId,
                 state: state,
-                reason: reason
+                reason: reason,
+                groupIdHex: groupId,
+                ringId: ringId,
+                senderIdHex: senderId,
+                ringUpdate: ringUpdate
             )
         }
     }
@@ -1439,23 +1453,46 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             case speechEvent = "speech_event"
             case remoteMute = "remote_mute"
             case observedRemoteMute = "observed_remote_mute"
+            /// A group **ring**: somebody is calling this group. Not a call
+            /// client, and not the same thing as a group call signal — a ring
+            /// arrives before anybody has joined the SFU, which is the only way a
+            /// device can be made to ring at all.
+            case groupCallRing = "group_call_ring"
         }
 
         public let kind: Kind
         public let clientId: UInt32
         public let state: String?
         public let reason: String?
+        /// For `groupCallRing`: the group being ringed, hex.
+        public let groupIdHex: String?
+        /// For `groupCallRing`: correlates the ring with its response and any
+        /// cancellation, so a stale ring cannot act on a newer call.
+        public let ringId: Int64?
+        /// For `groupCallRing`: who is ringing, raw service id hex.
+        public let senderIdHex: String?
+        /// For `groupCallRing`: RingRTC's verdict. Only `Requested` means somebody
+        /// is actually calling; the rest are outcomes.
+        public let ringUpdate: String?
 
         public init(
             kind: Kind,
             clientId: UInt32,
             state: String? = nil,
-            reason: String? = nil
+            reason: String? = nil,
+            groupIdHex: String? = nil,
+            ringId: Int64? = nil,
+            senderIdHex: String? = nil,
+            ringUpdate: String? = nil
         ) {
             self.kind = kind
             self.clientId = clientId
             self.state = state
             self.reason = reason
+            self.groupIdHex = groupIdHex
+            self.ringId = ringId
+            self.senderIdHex = senderIdHex
+            self.ringUpdate = ringUpdate
         }
     }
 

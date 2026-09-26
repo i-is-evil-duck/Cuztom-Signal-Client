@@ -205,6 +205,14 @@ public final class GroupCallController: ObservableObject {
         }
     }
 
+    /// Somebody is calling a group and the user has not answered yet.
+    public struct GroupCallRing: Sendable, Equatable {
+        public let groupIdHex: String
+        public let ringId: Int64?
+        /// The ringer's service id, raw hex.
+        public let senderIdHex: String?
+    }
+
     /// One in-flight group call's private bookkeeping.
     private struct Session {
         let stateID: UUID
@@ -233,6 +241,9 @@ public final class GroupCallController: ObservableObject {
 
     private var session: Session?
     private var trackedTasks: [String: Task<Void, Never>] = [:]
+    /// An incoming group call awaiting the user. Published so the UI can show it,
+    /// and distinct from `current`, which is a call we are already in.
+    @Published public private(set) var incoming: GroupCallRing?
     /// Invalidates callbacks and in-flight work across configure/reset so a late
     /// callback from a retired bridge cannot mutate a new call's state.
     private var lifecycleGeneration = 0
@@ -446,7 +457,12 @@ public final class GroupCallController: ObservableObject {
             if session != nil {
                 Log.info("[group-call] inbound signal carried no group id; the live call already has it")
             } else {
-                Log.error("[group-call] inbound signal had no group id; nothing to join")
+                // The native side logs *what* the payload was. Without that, this
+                // line was identical for a group call we could not identify and
+                // for anything else — and the shape of the group call traffic is
+                // the only evidence of whether other members' devices are
+                // signalling us at all.
+                Log.info("[group-call] inbound signal carried no group id; it is unroutable (see the native shape log)")
             }
             return
         }
@@ -535,12 +551,23 @@ public final class GroupCallController: ObservableObject {
     // MARK: - Native callbacks
 
     private func receive(_ update: RustCoreService.GroupCallUpdate) {
+        // A ring belongs to no client, because it arrives before anybody has
+        // joined. Handled ahead of the session guard below, which would otherwise
+        // discard every ring as a client this controller does not own - and a ring
+        // is the one update that legitimately has no client behind it.
+        if update.kind == .groupCallRing {
+            handleRing(update)
+            return
+        }
         guard var session, session.handle.clientId == update.clientId else {
             // A client this controller does not own. Retiring one leaves the
             // native side to tear it down, so this is not an error.
             return
         }
         switch update.kind {
+        case .groupCallRing:
+            // Handled above the session guard, which a ring cannot pass.
+            break
         case .requestMembershipProof:
             if session.proofPresented {
                 // RingRTC asked again after a proof was presented. Answering
@@ -739,6 +766,48 @@ public final class GroupCallController: ObservableObject {
             )
             fail("Call service request failed: \(Self.describe(error))")
         }
+    }
+
+    /// An incoming group **ring**.
+    ///
+    /// Not a call and not a call signal: a ring is somebody calling a group, and
+    /// it arrives before anyone has joined the SFU. It is the only notification
+    /// that can make a device ring at all, because the media key RingRTC produces
+    /// on its own needs the other members' demux ids, which only exist once the
+    /// call is under way.
+    ///
+    /// Only `Requested` means somebody is actually calling. The rest are outcomes
+    /// — expired, busy, accepted on another device — and showing one of those as
+    /// an incoming call would be a call that does not exist.
+    private func handleRing(_ update: RustCoreService.GroupCallUpdate) {
+        guard let groupIdHex = update.groupIdHex, !groupIdHex.isEmpty else {
+            Log.error("[group-call] ring named no group; nothing to show")
+            return
+        }
+        let outcome = update.ringUpdate ?? "unknown"
+        guard outcome == "Requested" else {
+            Log.info("[group-call] ring for \(Self.short(groupIdHex)) was \(outcome); not an incoming call")
+            return
+        }
+        if session != nil {
+            // Already in a call for this group. A second ring is not a second
+            // call, and replacing a live one would tear it down.
+            Log.info("[group-call] ring for the call already in progress; ignored")
+            return
+        }
+        Log.info(
+            "[group-call] ring received group=\(Self.short(groupIdHex)) sender=\(update.senderIdHex ?? "?") ringId=\(update.ringId.map(String.init) ?? "?")"
+        )
+        // Surfaced as an incoming call. The client is not created here: joining
+        // needs a membership proof, and creating one on a ring would start an SFU
+        // session for a call the user may never accept.
+        incoming = GroupCallRing(groupIdHex: groupIdHex, ringId: update.ringId, senderIdHex: update.senderIdHex)
+    }
+
+    /// A group id, shortened for a log line. Full length is stable, so the
+    /// prefix identifies the group without carrying 64 characters per line.
+    static func short(_ groupIdHex: String, keep: Int = 8) -> String {
+        groupIdHex.count <= keep ? groupIdHex : "\(groupIdHex.prefix(keep))…"
     }
 
     /// A 404 from the SFU's participants poll means the conference is gone, which
