@@ -272,12 +272,18 @@ actually happening, and what identifies it next time:
 | `400` with an **nginx HTML body**, no JSON | nginx rejected the request before the app. Duplicate `Authorization` headers are the known cause: `RequestBuilder::header` appends, so a proof added on top of the account's own `Authorization` yields two, and nginx 400s regardless of total size | `HttpAuthOverride::Unidentified` in `group_call_token` |
 | `401 Credentials are required…` (plain text) | reached the app; the credential was not accepted. This is the *normal* response to a placeholder or malformed proof, and the control every other observation is compared against | — |
 | `400` with a JSON body | the app parsed the request and rejected a parameter | the body, which is logged for non-2xx |
+| `200` that will not decode | the credential *was* issued; only the response envelope is unexpected. `Content-Type` and the first four body bytes are logged, which separates protobuf (`0a ..`) from JSON (`7b 22 ..`) from gzip (`1f 8b`) | `decoded as protobuf` / `decoded as JSON, keys=[..]` / `matched neither` |
 
 The distinction that cost the most time: a bare nginx `400` HTML page is not the
 application saying the parameters are wrong. It says the request never got
 there. `group_auth_credentials_raw` worked at the same moment `group_call_token`
 did not, from the same client, on the same day — the difference was that only the
 latter added a second `Authorization` header.
+
+The same reasoning applies to a `2xx` that will not decode. A `200` is not
+evidence that the body is the message expected, and it is not evidence that a
+token was issued. Both are claimed only once the body is parsed, and the format
+is logged so a mismatch names itself.
 
 Measurement used to establish this, against
 `storage.signal.org/v2/groups/token` directly:

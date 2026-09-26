@@ -1709,7 +1709,7 @@ pub async fn redeem_group_call_proof(
         // The body can echo the request material, so it is not surfaced.
         return Err(format!("the call service returned HTTP {status}"));
     }
-    let token = decode_group_credential_token(body.as_bytes())
+    let token = decode_group_credential_token(&body)
         .ok_or("the call service did not return a group call credential".to_string())?;
     if token.is_empty() {
         return Err("the call service returned an empty group call credential".to_string());
@@ -1720,28 +1720,62 @@ pub async fn redeem_group_call_proof(
 
 /// `ExternalGroupCredential { string token = 1 }`.
 ///
+/// The same message Signal Desktop decodes, declared here so the decoder and its
+/// tests share one definition. Using the generated type rather than a hand-rolled
+/// reader means a field added upstream is a compile error rather than a silently
+/// dropped byte.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ExternalGroupCredential {
+    #[prost(string, tag = "1")]
+    token: ::prost::alloc::string::String,
+}
+
+/// `ExternalGroupCredential { string token = 1 }`.
+///
 /// Hand-decoded to match the strictness of the rest of this file: an unexpected
 /// wire type or a truncated field is a refusal, not a partial read. A token that
 /// is wrong would be rejected by the SFU with a diagnostic that points nowhere
 /// near the cause.
+///
+/// A JSON body is accepted as well, and the format that matched is logged. The
+/// endpoint answers `200` with a token, and a decode failure there is
+/// indistinguishable from an absent token unless the format is named - which is
+/// the only thing that distinguishes "the service sent a shape we do not know"
+/// from "the service sent no token". Signal Desktop asks for protobuf and decodes
+/// protobuf, so JSON is the unexpected branch, not the expected one; it is
+/// accepted rather than refused because a credential the service did issue
+/// should not be discarded over its envelope.
+///
+/// The token is never logged, and neither is any other part of the body. Only the
+/// format name and the key names of a JSON object, which are field names.
 fn decode_group_credential_token(body: &[u8]) -> Option<Vec<u8>> {
     use prost::Message as _;
-    // Reuse the SignalService-defined message rather than a hand-rolled reader.
-    // It is the same wire shape, and using the generated type means a field added
-    // upstream is a compile error rather than a silently dropped byte.
-    #[derive(Clone, PartialEq, prost::Message)]
-    struct ExternalGroupCredential {
-        #[prost(string, tag = "1")]
-        token: ::prost::alloc::string::String,
+    if let Ok(decoded) = ExternalGroupCredential::decode(body) {
+        // Absent and present-but-empty are the same thing here: a credential with
+        // no token is not a credential, and reporting success with an empty value
+        // would push that distinction onto every caller.
+        if !decoded.token.is_empty() {
+            eprintln!("[core] group credential decoded as protobuf, token field 1");
+            return Some(decoded.token.into_bytes());
+        }
     }
-    let decoded = ExternalGroupCredential::decode(body).ok()?;
-    // Absent and present-but-empty are the same thing here: a credential with no
-    // token is not a credential, and reporting success with an empty value would
-    // push that distinction onto every caller.
-    if decoded.token.is_empty() {
-        return None;
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) => {
+            let keys: Vec<String> = value
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            let token = value
+                .get("token")
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.is_empty());
+            eprintln!("[core] group credential decoded as JSON, keys={keys:?}");
+            return token.map(|t| t.as_bytes().to_vec());
+        }
+        Err(_) => {}
     }
-    Some(decoded.token.into_bytes())
+    eprintln!("[core] group credential matched neither protobuf nor JSON");
+    None
 }
 
 /// Send a group call signal to every member of the group.
@@ -1792,11 +1826,6 @@ fn a_group_credential_token_decodes_only_from_a_well_formed_body() {
     // The CDN's `ExternalGroupCredential { string token = 1 }`. A token that
     // is misread here is rejected by the SFU with a diagnostic that points
     // nowhere near the cause, so anything unexpected is refused.
-    #[derive(Clone, PartialEq, prost::Message)]
-    struct ExternalGroupCredential {
-        #[prost(string, tag = "1")]
-        token: String,
-    }
     let body = ExternalGroupCredential { token: "secret-token".to_string() }
         .encode_to_vec();
     assert_eq!(
@@ -1807,6 +1836,50 @@ fn a_group_credential_token_decodes_only_from_a_well_formed_body() {
     assert_eq!(decode_group_credential_token(&[]), None);
     // Garbage is not partially read into a token.
     assert_eq!(decode_group_credential_token(&[0xff, 0xff, 0xff]), None);
+}
+
+/// A `200` carrying a token in the shape the service actually used must decode.
+///
+/// The endpoint answered `200` with 170 bytes and the protobuf-only decoder
+/// returned nothing, so which format it sent was unknown. Rather than guess one
+/// way, both are accepted and the one that matched is logged. This covers the
+/// JSON branch, which is the unexpected one and therefore the one that would
+/// otherwise have no coverage at all.
+#[test]
+fn a_group_credential_token_decodes_from_json_as_well_as_protobuf() {
+    assert_eq!(
+        decode_group_credential_token(br#"{"token":"secret-token"}"#),
+        Some(b"secret-token".to_vec())
+    );
+    // A JSON object with no token, or with an empty one, is not a credential.
+    assert_eq!(decode_group_credential_token(br#"{"other":"x"}"#), None);
+    assert_eq!(decode_group_credential_token(br#"{"token":""}"#), None);
+    // Valid JSON that is not an object carries no token either.
+    assert_eq!(decode_group_credential_token(br#"["token"]"#), None);
+}
+
+/// The response body must reach the decoder byte-for-byte.
+///
+/// The vendored request used to return the body as a `String`, which meant a
+/// `from_utf8_lossy` round trip: every byte outside UTF-8 became U+FFFD, three
+/// bytes of replacement for one, and the message no longer parsed. A protobuf
+/// `string` field is valid UTF-8 by definition, so the token itself is safe - but
+/// nothing says the rest of the body is, and a field this decoder does not know
+/// may carry anything. This appends one and asserts the token still decodes,
+/// which a `String` in that request signature would have broken.
+#[test]
+fn a_group_credential_token_survives_bytes_that_are_not_utf8() {
+    use prost::Message as _;
+    let token = "secret-token".to_string();
+    let mut body = ExternalGroupCredential { token: token.clone() }.encode_to_vec();
+    // Field 2, wire type 2, three bytes that are not valid UTF-8.
+    body.extend_from_slice(&[0x12, 0x03, 0xff, 0xfe, 0x80]);
+    // Confirm the premise: a `String` round trip would have rewritten this body.
+    assert!(std::str::from_utf8(&body).is_err());
+    assert_eq!(
+        decode_group_credential_token(&body),
+        Some(token.into_bytes())
+    );
 }
 
 /// Pins the HTTP-level reason `group_call_token` must not send the account's

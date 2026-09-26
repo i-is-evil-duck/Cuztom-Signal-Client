@@ -68,7 +68,7 @@ Design notes:
 pub async fn group_call_token(
     &self,
     authorization: &str,
-) -> Result<(u16, String), Error<S::Error>>
+) -> Result<(u16, Vec<u8>), Error<S::Error>>
 ```
 
 Redeems a group membership proof for a call token.
@@ -136,6 +136,25 @@ does not declare instead of inventing a host for it. A host therefore only
 appears here if the service declared it. This is a read of the configuration,
 not a guess.
 
+### Further notes on `group_call_token`
+
+**The body is returned as `Vec<u8>`, not `String`.** The response is a protobuf
+and has to reach the decoder exactly as received. A `String` forces a
+`from_utf8_lossy` round trip, and every byte outside UTF-8 becomes three bytes of
+U+FFFD, so the message stops parsing. A protobuf `string` field is valid UTF-8 by
+definition so the token itself is safe, but an unrecognised field elsewhere in the
+body may carry anything, and the whole body has to survive.
+
+**`Content-Type` and the first four body bytes are logged on success.** Neither is
+secret — one is the server's declared format, the other is a tag-and-length pair
+or an opening brace — and together they distinguish protobuf, JSON and compressed
+without writing any part of the credential. This matters because the endpoint
+answered `200` with a 170-byte body that the protobuf decoder refused, and a `2xx`
+alone cannot tell "a shape we do not know" from "no token". A `0x7b` opening byte
+means JSON; `1f 8b` means the service compressed a response this client cannot
+decompress, since no `gzip`/`brotli`/`zstd` feature is enabled anywhere in the
+dependency graph.
+
 ## Why the alternative was rejected
 
 Reaching these endpoints without touching presage is not available:
@@ -146,8 +165,9 @@ authenticated service is only constructible from inside `Registered`.
 
 1. Replace the tree with the new rev.
 2. Re-apply all three methods above, **including the `HttpAuthOverride::
-   Unidentified` choice in `group_call_token` and the 4xx-body logging**. Both are
-   load-bearing and neither is visible from the signature.
+   Unidentified` choice, the `Vec<u8>` body, and the 4xx/success logging** in
+   `group_call_token`. All three are load-bearing and none is visible from the
+   signature alone.
 3. `cargo test --all-targets` in `rust-core/`. The test
    `call::tests::an_authorization_header_appends_rather_than_replaces` asserts
    the append behavior the override works around; if reqwest ever changes it,

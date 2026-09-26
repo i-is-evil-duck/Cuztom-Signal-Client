@@ -423,6 +423,19 @@ impl<S: Store> Manager<S, Registered> {
     /// HTTP client rejects it while this one - already built with the service
     /// configuration's certificate authority - accepts it.
     ///
+    /// Returns the raw response bytes, not a `String`. The body is a protobuf and
+    /// must reach the decoder exactly as received: a `String` here would mean a
+    /// `from_utf8_lossy` round trip, which substitutes U+FFFD for every
+    /// non-UTF-8 byte and so silently rewrites the message. A token is opaque and
+    /// cannot be assumed to be text.
+    ///
+    /// The `Content-Type` and the first four body bytes are logged. Neither is
+    /// secret - one is the server's declared format, the other is a length prefix
+    /// or an opening brace - and together they distinguish "protobuf", "JSON" and
+    /// "compressed" without writing a single byte of the credential. Format was
+    /// the unknown when this endpoint first answered 200 and the decode still
+    /// failed, and the status could not say.
+    ///
     /// `authorization` is the complete `Authorization` header value, which for
     /// this endpoint carries the membership proof. It is never logged.
     ///
@@ -441,7 +454,7 @@ impl<S: Store> Manager<S, Registered> {
     pub async fn group_call_token(
         &self,
         authorization: &str,
-    ) -> Result<(u16, String), Error<S::Error>> {
+    ) -> Result<(u16, Vec<u8>), Error<S::Error>> {
         use libsignal_service::configuration::Endpoint;
         use libsignal_service::push_service::HttpAuthOverride;
 
@@ -478,6 +491,13 @@ impl<S: Store> Manager<S, Registered> {
             Error::IoError(std::io::Error::other(e))
         })?;
         let status = response.status();
+        // Read before the body is consumed, which takes `response` by value.
+        let declared = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("none")
+            .to_string();
         let bytes = response.bytes().await.map_err(|e| {
             eprintln!("[core] group token body failed: {e}");
             Error::IoError(std::io::Error::other(e))
@@ -488,7 +508,6 @@ impl<S: Store> Manager<S, Registered> {
                 "group token response too large",
             )));
         }
-        let body = String::from_utf8_lossy(&bytes).to_string();
         if !status.is_success() {
             // A rejection body is the service's reason for refusing, and the
             // status alone does not distinguish "malformed authorization" from
@@ -496,12 +515,29 @@ impl<S: Store> Manager<S, Registered> {
             // travels in the `Authorization` header, not here, so a 4xx body
             // cannot echo it. Bounded, and only for a rejection: a success body
             // holds the token and is never written.
-            let shown: String = body.chars().take(400).collect();
+            let shown: String = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(400)
+                .collect();
             eprintln!("[core] group token rejected HTTP {status}: {shown}");
         } else {
-            eprintln!("[core] group token responded HTTP {status}, {} bytes", body.len());
+            // Format only, never content: the declared content type, and the
+            // leading bytes, which are a protobuf tag plus length or the opening
+            // of a JSON object. A 0x7b here would mean the service answered JSON
+            // to a request that asked for protobuf, and 0x1f 0x8b would mean it
+            // compressed a response this client cannot decompress.
+            let prefix: Vec<String> = bytes
+                .iter()
+                .take(4)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            eprintln!(
+                "[core] group token responded HTTP {status}, {} bytes, content-type={declared}, first-bytes=[{}]",
+                bytes.len(),
+                prefix.join(" ")
+            );
         }
-        Ok((status.as_u16(), body))
+        Ok((status.as_u16(), bytes.to_vec()))
     }
 
     /// Fetches raw ZK group auth credentials for a day range, as JSON, along
