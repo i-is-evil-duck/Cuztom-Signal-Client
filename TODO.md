@@ -73,10 +73,9 @@ See `IMPLEMENTATION_PLAN.md` for the detailed status matrix and
       test has passed. Pre-existing — reproduced at `e2608cb` with this session's
       changes stashed. Teardown, not a test failure, but it hides real failures
       and should be found.
-- [ ] **Group call audio: the member map does not resolve.** `remote_devices` is
-      empty because the SFU's `opaqueUserId` values do not match
-      `hex(sha256(member_id))` for the roster we supply, and an empty device list
-      switches audio recording, outgoing media and playout off together. Next
-      step is the new `resolved=N` figure in the peek log: 0 means the encrypted
-      member ids differ from what the SFU hashed, `untried` means no roster
-      reached RingRTC. This is the confirmed root cause of the silence.
+- [x] **Group call audio: the member map did not resolve.** Cause found and
+      fixed: the member id was 64 bytes where the SFU hashes 65. zkgroup's
+      `UuidCiphertext` carries a leading `ReservedByte` that has to be sent;
+      Signal's own client passes the whole serialization. Pinned by
+      `a_member_id_keeps_the_reserved_byte_the_sfu_hashes`. Still needs one live
+      call to confirm `resolved=` goes above 0 and audio appears.

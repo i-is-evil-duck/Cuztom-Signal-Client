@@ -604,6 +604,45 @@ The same thing seen from the other side is the `DerivedState(value=<Not
 calculated>)@…` label a peer reported: the SFU attributing a participant it cannot
 resolve.
 
+### The bug, found in Signal's own client
+
+`resolved=0`, never `untried`: the roster reached RingRTC and none of it matched.
+So the encrypted member ids this client computes are not the ones the SFU hashed.
+
+Signal Desktop answers it exactly. Its group-call member list is built as:
+
+```js
+#h(e){ return Bkt(e).map(e => new F.GroupMemberInfo(t.Rr(e.aci), e.uuidCiphertext)) }
+```
+
+and the ciphertext it puts there is freshly derived from the secret params, the
+same as ours — so re-encrypting was never the problem:
+
+```js
+function up(e,t){ return e.encryptServiceId(Xf(t)).serialize() }
+```
+
+Note `.serialize()`, and **nothing stripped off the front**. zkgroup's
+`UuidCiphertext` is a `ReservedByte` (`VersionByte<0>`, serialized as a single
+leading `0x00`) followed by two Ristretto points:
+
+```
+serialize()          len=65  first=00
+serialize()[1..]     len=64      <-- what we were sending
+sha256(full)     = 57b420fe…
+sha256(stripped) = b6cd21b3…
+```
+
+A 64-byte value against the SFU's 65. The hashes could never agree, so no
+participant ever resolved, and every step in the chain from there followed.
+
+The comment that produced this said "zkgroup serializes a leading ReservedByte
+that peers do not send". The second half of that was an assumption nobody checked,
+and it was wrong: peers do send it, and Signal's own client passes the whole thing.
+The length is now measured and enforced at `GROUP_MEMBER_ID_LEN` rather than left
+to a comment, because a length that is wrong here yields a call that connects
+perfectly and is silent, with nothing anywhere reporting a fault.
+
 ### The one measurement that settles which half is wrong
 
 `set_group_members` now records the opaque ids its member list implies

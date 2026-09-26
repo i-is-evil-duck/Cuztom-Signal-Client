@@ -36,6 +36,13 @@ use uuid::Uuid;
 /// The ZK group identifier the SFU keys a group call's room on.
 pub const GROUP_CALL_GROUP_ID_LEN: usize = GROUP_IDENTIFIER_LEN;
 
+/// Length of the encrypted-UID ciphertext a group call member id is made of.
+///
+/// zkgroup's `UuidCiphertext` is a one-byte `ReservedByte` followed by two
+/// Ristretto points, and the whole thing is what gets hashed into a member's
+/// opaque call id. Measured, not assumed — see `member`.
+const GROUP_MEMBER_ID_LEN: usize = 1 + 64;
+
 /// CDNs serve the membership proof at this path. Callers supply the CDN host.
 pub const GROUP_TOKEN_PATH: &str = "v2/groups/token";
 
@@ -422,12 +429,33 @@ impl GroupCallIdentity {
         let mut user_id = [0u8; 16];
         user_id.copy_from_slice(&fixed[1..17]);
         let ciphertext = self.secret_params.encrypt_service_id(service_id);
-        // zkgroup serializes a leading ReservedByte that peers do not send.
+        // The whole serialization goes to the SFU, including zkgroup's leading
+        // `ReservedByte` (`VersionByte<0>`, serialized as a single `0x00`).
+        //
+        // That byte is not ours to strip. It is part of the member id the SFU
+        // hashes: RingRTC derives a participant's opaque id as
+        // `hex(sha256(member_id))` over exactly these bytes, and the SFU derives
+        // the same hash over the member id in the group credential. Dropping the
+        // reserved byte produced a 64-byte value where the credential has 65, so
+        // the two hashes could never agree, no participant could be resolved,
+        // and the call was silent in both directions while looking perfectly
+        // healthy.
+        //
+        // The failure is silent and total: an unresolvable participant is dropped
+        // from RingRTC's device list without a word, an empty device list is
+        // read as "nobody else is here", and that switches off audio recording,
+        // outgoing media and playout together.
+        //
+        // Signal's own client passes the full serialization:
+        // `encryptServiceId(aci).serialize()`.
         let member_id = serialize(&ciphertext);
-        if member_id.len() <= 1 {
+        // 1 reserved byte + 2 Ristretto points. Checked rather than assumed,
+        // because a length that is wrong here produces a call that connects and
+        // is silent, with nothing anywhere reporting a fault.
+        if member_id.len() != GROUP_MEMBER_ID_LEN {
             return Err(GroupCallError::Serialization("member uid ciphertext"));
         }
-        Ok(GroupMemberIdentity { user_id, member_id: member_id[1..].to_vec() })
+        Ok(GroupMemberIdentity { user_id, member_id })
     }
 
     /// Present a server-issued ZK auth credential for this group.
@@ -793,6 +821,77 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member id is the *whole* zkgroup `UuidCiphertext`, reserved byte and
+    /// all.
+    ///
+    /// RingRTC derives a participant's opaque id as `hex(sha256(member_id))`, and
+    /// the SFU derives the same hash over the member id recorded in the group
+    /// credential. Strip zkgroup's leading `ReservedByte` and the two hashes can
+    /// never agree, so no participant resolves — and an unresolvable participant
+    /// is dropped from RingRTC's device list without a word. An empty device list
+    /// reads as "nobody else is here", which switches off audio recording,
+    /// outgoing media and playout together, and the call is then silent in both
+    /// directions while joining perfectly and reporting no error anywhere.
+    ///
+    /// This is the bug that made every group call silent, so the length and the
+    /// leading byte are pinned rather than left to a comment.
+    #[test]
+    fn a_member_id_keeps_the_reserved_byte_the_sfu_hashes() {
+        let master_key = hex::decode(&"ab".repeat(32)).expect("hex");
+        let identity = GroupCallIdentity::from_master_key(&master_key).expect("identity");
+        let member = identity
+            .member("8c2f1a94-3b7d-4e65-9f01-2a6d5c8e7b40")
+            .expect("member");
+
+        assert_eq!(
+            member.member_id.len(),
+            65,
+            "1 reserved byte + 2 Ristretto points; a 64-byte value can never match the SFU"
+        );
+        assert_eq!(
+            member.member_id[0], 0,
+            "zkgroup's ReservedByte is VersionByte<0>, serialized as a leading zero"
+        );
+        assert_eq!(
+            member.user_id.len(),
+            16,
+            "the SFU's user id is the bare service id, not the 17-byte kind-prefixed form"
+        );
+    }
+
+    /// Encrypting the same member twice must give the same member id.
+    ///
+    /// The SFU holds one member id per member, hashed. If our encryption were
+    /// randomised the two would disagree on every call and the same silent,
+    /// faultless failure would appear intermittently — which is much harder to
+    /// diagnose than a consistent one, so this is worth pinning.
+    #[test]
+    fn a_member_id_is_the_same_every_time_it_is_derived() {
+        let master_key = hex::decode(&"cd".repeat(32)).expect("hex");
+        let identity = GroupCallIdentity::from_master_key(&master_key).expect("identity");
+        let first = identity
+            .member("8c2f1a94-3b7d-4e65-9f01-2a6d5c8e7b40")
+            .expect("first");
+        let second = identity
+            .member("8c2f1a94-3b7d-4e65-9f01-2a6d5c8e7b40")
+            .expect("second");
+        assert_eq!(
+            first.member_id, second.member_id,
+            "uid encryption is deterministic, so a repeated derivation must be identical"
+        );
+    }
+
+    /// Two members must not collide, or one could be attributed to the other.
+    #[test]
+    fn different_members_get_different_member_ids() {
+        let master_key = hex::decode(&"ef".repeat(32)).expect("hex");
+        let identity = GroupCallIdentity::from_master_key(&master_key).expect("identity");
+        let a = identity.member("8c2f1a94-3b7d-4e65-9f01-2a6d5c8e7b40").expect("a");
+        let b = identity.member("1b7d4e65-9f01-2a6d-5c8e-7b408c2f1234").expect("b");
+        assert_ne!(a.member_id, b.member_id);
+        assert_ne!(a.user_id, b.user_id);
+    }
 
     #[test]
     fn a_group_call_announcement_names_the_group_and_carries_nothing_else() {
