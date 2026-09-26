@@ -1179,9 +1179,45 @@ struct GroupCallControllerTests {
         #expect(announced.count == 2, "a busy outcome is not an incoming call")
     }
 
+    /// A prepared client is a live client, so it is released like any other.
+    ///
+    /// Leaving it would keep the group occupied natively, and the next call for
+    /// that group would fail as `Client already exists for call` — which is the
+    /// same refusal the reuse fix avoids, arriving by the back door.
+    @Test @MainActor func aPreparedButUnansweredClientIsReleasedOnReset() async throws {
+        let bridge = FakeBridge()
+        let roster = FakeRoster(knownGroupIdHex: Self.groupIdHex)
+        let controller = makeController(bridge: bridge, roster: roster)
+        await controller.receive(
+            event: GroupCallSignalEvent(
+                sender: "22222222-2222-2222-2222-222222222222",
+                senderDeviceId: 1,
+                groupIdHex: Self.groupIdHex,
+                immediate: true,
+                timestamp: 1
+            )
+        )
+        await settle(controller)
+        #expect(bridge.steps.contains("start"))
+
+        controller.reset()
+        await settle(controller)
+
+        #expect(bridge.steps.contains("end"), "the prepared client is not leaked")
+        #expect(controller.current == nil)
+    }
+
     // MARK: - Inbound
 
-    @Test @MainActor func anInboundCallForAKnownGroupIsJoined() async throws {
+    /// An inbound signal must prepare a client, not join the call.
+    ///
+    /// A client has to exist for RingRTC to route signaling to it, so one is
+    /// created — but joining is the user's decision. This used to join, which is
+    /// what made an incoming call look like a call: the SFU admitted the client,
+    /// so the app sat saying "Joining the call…" for a call nobody had answered
+    /// and that could only be left by ending it. It also made answering fail, as
+    /// RingRTC refuses a second active client for a group.
+    @Test @MainActor func anInboundSignalPreparesAClientWithoutJoining() async throws {
         let bridge = FakeBridge()
         let roster = FakeRoster(knownGroupIdHex: Self.groupIdHex)
         let controller = makeController(bridge: bridge, roster: roster)
@@ -1197,7 +1233,22 @@ struct GroupCallControllerTests {
         )
         await settle(controller)
 
-        #expect(bridge.steps.contains("start"))
+        #expect(bridge.steps.contains("start"), "a client must exist to receive on")
+        #expect(!bridge.steps.contains("join"), "a call must not join itself")
+        #expect(controller.current == nil, "no call is in progress until answered")
+
+        // Answering it joins, and reuses the client that was prepared rather than
+        // asking for a second one for the same group.
+        let state = await controller.answer(
+            GroupCallController.GroupCallRing(
+                groupIdHex: Self.groupIdHex,
+                ringId: 1,
+                senderIdHex: nil,
+                title: nil
+            )
+        )
+        #expect(state != nil)
+        #expect(bridge.steps.filter { $0 == "start" }.count == 1, "one client, not two")
         #expect(bridge.steps.contains("join"))
         #expect(controller.current?.isOutgoing == false)
         #expect(controller.current?.phase == .connecting)

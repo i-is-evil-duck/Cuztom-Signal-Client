@@ -274,6 +274,18 @@ re-apply it after an upstream update.
   before anyone has joined — and then runs the ordinary join. Declining is local:
   a cancellation has to echo the ringer's `ring_id` back in a message this client
   does not send, so declining does not pretend to cancel anything.
+- **An inbound signal prepares a client; it does not join the call.** A client has
+  to exist for RingRTC to route signaling to it, so one is created — but joining
+  is the user's decision. It used to join, which is what made an incoming call
+  *look* like a call: the SFU admitted the client, so the app sat saying "Joining
+  the call…" for a call nobody had answered and that could only be left by ending
+  it. The banner was then invisible because a call was already showing, so it
+  appeared only once the call was ended. It also made answering fail, since
+  RingRTC refuses a second active client for a group as `Client already exists for
+  call`; the prepared client is now kept and reused, and released on reset so it
+  cannot hold the group occupied.
+  (`anInboundSignalPreparesAClientWithoutJoining`,
+  `aPreparedButUnansweredClientIsReleasedOnReset`)
 - **An incoming ring must be announced, not merely stored.** The controller is a
   Combine `ObservableObject`; the host model is Swift `@Observable`. A computed
   property reading `incoming` across that boundary registers no observation

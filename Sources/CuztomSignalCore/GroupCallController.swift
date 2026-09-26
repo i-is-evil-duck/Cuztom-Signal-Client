@@ -364,6 +364,14 @@ public final class GroupCallController: ObservableObject {
     public func reset() {
         lifecycleGeneration += 1
         cancelTrackedTasks()
+        // A prepared-but-unanswered client is a live native client, so it is
+        // released like any other. Leaving it would keep the group occupied and
+        // make the next call for that group fail as `Client already exists`.
+        if let prepared = pendingInbound {
+            let handle = prepared.handle
+            Task { [bridge] in try? await bridge?.endGroupCall(handle) }
+        }
+        pendingInbound = nil
         if let bridge, let session {
             let handle = session.handle
             // Best effort: the native teardown path already refuses untracked
@@ -372,6 +380,7 @@ public final class GroupCallController: ObservableObject {
         }
         session = nil
         current = nil
+        setIncoming(nil)
         self.bridge?.onGroupCallUpdate = nil
         self.bridge?.onHTTPRequest = nil
         bridge = nil
@@ -501,26 +510,25 @@ public final class GroupCallController: ObservableObject {
         }
         do {
             let handle = try await bridge.startGroupCall(groupIdHex: groupIdHex, sfuURL: sfuURL)
-            let stateID = UUID()
-            let members = roster.members(masterKeyHex: masterKeyHex)
-            let title = roster.title(masterKeyHex: masterKeyHex)
-            session = Session(
-                stateID: stateID,
-                handle: handle,
-                masterKeyHex: masterKeyHex,
-                memberACIs: members,
-                title: title,
-                isOutgoing: false
-            )
-            current = GroupCallState(
-                id: stateID,
+            // **Created, not joined.** A client has to exist for RingRTC to route
+            // signaling to it, but joining is the user's decision: a call that
+            // joins itself the moment a packet arrives is not a call, and it
+            // looked exactly like one - the SFU admitted the client, so the app
+            // sat saying "Joining the call…" for a call the user had never
+            // answered and could not get out of without ending it.
+            //
+            // It also caused `Client already exists for call`: the client created
+            // here was still active when the user answered, and answering created
+            // a second one for the same group. So the client is kept here and
+            // reused by `answer`.
+            pendingInbound = PendingInboundCall(
                 groupIdHex: groupIdHex,
                 masterKeyHex: masterKeyHex,
-                title: title,
-                phase: .connecting,
-                isOutgoing: false
+                handle: handle
             )
-            try await bridge.joinGroupCall(handle)
+            Log.info(
+                "[group-call] inbound signal for \(Self.short(groupIdHex)) prepared a client; waiting to be answered"
+            )
         } catch {
             fail("Could not join: \(Self.describe(error))")
         }
@@ -876,6 +884,20 @@ public final class GroupCallController: ObservableObject {
         await roster.masterKeyHex(forGroupIdHex: groupIdHex)
     }
 
+    /// A client created for an inbound call that has not been answered.
+    ///
+    /// RingRTC drops signaling for a group it has no client for, so one has to
+    /// exist before the call can be received. It is kept rather than joined:
+    /// joining is the user's decision, and creating a second client for the same
+    /// group is refused by RingRTC as `Client already exists for call`.
+    private struct PendingInboundCall {
+        let groupIdHex: String
+        let masterKeyHex: String
+        let handle: RustCoreService.GroupCallHandle
+    }
+
+    private var pendingInbound: PendingInboundCall?
+
     /// Answer an incoming group call by joining it.
     ///
     /// The group id comes from the ring, which is the only notification that
@@ -898,18 +920,36 @@ public final class GroupCallController: ObservableObject {
             return nil
         }
         setIncoming(nil)
+        // A client already prepared for this group by the inbound signal is
+        // reused. RingRTC refuses a second active client for a group as
+        // `Client already exists for call`, which is what answering hit every time
+        // a call had been signalled before the user answered it.
+        let prepared = pendingInbound.flatMap {
+            $0.groupIdHex.caseInsensitiveCompare(ring.groupIdHex) == .orderedSame ? $0 : nil
+        }
+        pendingInbound = nil
         // Primed here for the same reason the outgoing path primes it: without a
         // loaded roster the SFU is given no member map, so it cannot attribute
         // this client or encrypt anything towards it. That is not a cosmetic
         // gap - a call joined with an empty roster connects and is useless, and
         // peers report the client as malfunctioning.
         await primeRoster(masterKeyHex: masterKeyHex)
-        Log.info("[group-call] answering ring for \(Self.short(ring.groupIdHex))")
+        Log.info(
+            "[group-call] answering ring for \(Self.short(ring.groupIdHex))"
+                + (prepared == nil ? " (new client)" : " (reusing the prepared client)")
+        )
         do {
-            let handle = try await bridge.startGroupCall(
-                groupIdHex: ring.groupIdHex,
-                sfuURL: sfuURL
-            )
+            // Not `??` with an autoclosure: the right side is an async call, and
+            // an autoclosure cannot await.
+            let handle: RustCoreService.GroupCallHandle
+            if let prepared {
+                handle = prepared.handle
+            } else {
+                handle = try await bridge.startGroupCall(
+                    groupIdHex: ring.groupIdHex,
+                    sfuURL: sfuURL
+                )
+            }
             let stateID = UUID()
             let members = roster.members(masterKeyHex: masterKeyHex)
             let title = roster.title(masterKeyHex: masterKeyHex)
