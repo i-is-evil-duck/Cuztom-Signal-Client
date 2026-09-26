@@ -176,6 +176,14 @@ struct GroupCallControllerTests {
         }
     }
 
+    /// A counter usable from a `@Sendable` closure, which a captured `var` is not.
+    final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var value: Int { lock.withLock { count } }
+        func bump() { lock.withLock { count += 1 } }
+    }
+
     /// A class so the call count is observable after the fact.
     final class FakeHTTP: GroupCallController.HTTPPerforming, @unchecked Sendable {
         var status = 200
@@ -1205,6 +1213,95 @@ struct GroupCallControllerTests {
 
         #expect(bridge.steps.contains("end"), "the prepared client is not leaked")
         #expect(controller.current == nil)
+    }
+
+    /// Every group call must ask for the microphone before it is created.
+    ///
+    /// The 1:1 path has always done this and the group path did not, so a group
+    /// call joined the SFU with no microphone access at all: no prompt, no audio,
+    /// and peers reporting "can't receive audio and video from this client". Every
+    /// step of the call succeeded and the one that carries a voice did not happen.
+    ///
+    /// Asked before the client exists, not at first capture: RingRTC disables
+    /// recording while it believes it is alone in the call, so capture may not
+    /// begin until long after a prompt would be useful.
+    @Test @MainActor func everyGroupCallAsksForTheMicrophoneFirst() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        let asked = Counter()
+        controller.microphonePermissionOverride = {
+            asked.bump()
+            return true
+        }
+
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        #expect(asked.value == 1, "an outgoing group call asks for the microphone")
+        #expect(bridge.steps.contains("start"), "and then creates the client")
+
+        // Answering a ring asks too, before the call is visible to anyone.
+        var roster = FakeRoster()
+        roster.knownGroupIdHex = Self.groupIdHex
+        let answering = makeController(bridge: FakeBridge(), roster: roster)
+        let askedAgain = Counter()
+        answering.microphonePermissionOverride = {
+            askedAgain.bump()
+            return true
+        }
+        _ = await answering.answer(
+            GroupCallController.GroupCallRing(
+                groupIdHex: Self.groupIdHex,
+                ringId: 1,
+                senderIdHex: nil,
+                title: nil
+            )
+        )
+        #expect(askedAgain.value == 1, "answering a ring asks for the microphone")
+    }
+
+    /// A denied microphone stops the call rather than producing a silent one.
+    ///
+    /// Joining an SFU conference with no audio is, to everyone else,
+    /// indistinguishable from a broken client — which is exactly the report peers
+    /// gave. Refusing is the honest outcome: no call, and a reason.
+    @Test @MainActor func aDeniedMicrophoneStopsTheCallInsteadOfJoiningSilently() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        controller.microphonePermissionOverride = { false }
+
+        await #expect(throws: (any Error).self) {
+            _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        }
+        #expect(!bridge.steps.contains("start"), "no client is created without a microphone")
+        #expect(!bridge.steps.contains("join"))
+
+        // And the same on the answer path, where the user is mid-decision.
+        var roster = FakeRoster()
+        roster.knownGroupIdHex = Self.groupIdHex
+        let answerBridge = FakeBridge()
+        let answering = makeController(bridge: answerBridge, roster: roster)
+        answering.microphonePermissionOverride = { false }
+        // Raised the way a real ring arrives, so the assertion is about the path
+        // the user takes rather than about a ring handed in directly.
+        answerBridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .groupCallRing,
+                clientId: 0,
+                groupIdHex: Self.groupIdHex,
+                ringId: 1,
+                ringUpdate: "Requested"
+            )
+        )
+        await settle(answering)
+        let ring = try #require(answering.incoming)
+
+        let state = await answering.answer(ring)
+        #expect(state == nil, "a ring is not answered without a microphone")
+        #expect(!answerBridge.steps.contains("start"), "no client is created")
+        // The ring is kept, not cleared. A microphone denial is fixable in System
+        // Settings and the user is mid-decision, so making them answer again from
+        // scratch - with the banner gone and the reason only in the log - is the
+        // worst of the three options.
+        #expect(answering.incoming != nil, "the ring survives so it can be retried")
     }
 
     // MARK: - Inbound

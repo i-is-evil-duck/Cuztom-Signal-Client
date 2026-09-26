@@ -375,8 +375,25 @@ evidence that the body is the message expected, and it is not evidence that a
 token was issued. Both are claimed only once the body is parsed, and the format
 is logged so a mismatch names itself.
 
-## Where the group-call join actually stands
+- **Every group call asks for the microphone before the client is created.** The
+  1:1 path has always done this; the group path did not, so a group call joined
+  the SFU with **no microphone access at all** — no prompt, no audio, and peers
+  reporting "can't receive audio and video from this client". Every step of the
+  call succeeded and the one that carries a voice did not happen.
+  `NSMicrophoneUsageDescription` was present in the bundle the whole time, so the
+  app declared the intent and simply never asked.
+  Asked *before* the client is created, not at first capture: RingRTC disables
+  recording while it believes it is alone in the call
+  (`set_audio_recording_enabled(false)`), so capture may not begin until long
+  after a prompt would be useful, and a permission never asked for is a
+  permission never granted. A denial refuses the call rather than joining
+  silently, and on the answer path the ring is *kept* so it can be retried after
+  the user grants access — clearing the banner and leaving the reason only in the
+  log is the worst of the three outcomes.
+  (`everyGroupCallAsksForTheMicrophoneFirst`,
+  `aDeniedMicrophoneStopsTheCallInsteadOfJoiningSilently`)
 
+## Where the group-call join actually stands
 **A group call connects.** Verified 2026-09-25 against the real SFU,
 `sfu.voip.signal.org`:
 

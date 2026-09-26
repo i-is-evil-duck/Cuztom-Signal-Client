@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 
 /// A group call as the user sees it.
 ///
@@ -410,6 +411,9 @@ public final class GroupCallController: ObservableObject {
             // silently replacing the first would leave a native client running.
             throw SignalError.network("a group call is already in progress")
         }
+        // Before anything is created, so a refusal costs nothing. A group call
+        // that joins with no microphone is a call nobody can hear.
+        try await ensureMicrophonePermission()
         let key = masterKeyHex.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else {
             throw SignalError.network("group call needs a group master key")
@@ -884,6 +888,49 @@ public final class GroupCallController: ObservableObject {
         await roster.masterKeyHex(forGroupIdHex: groupIdHex)
     }
 
+    /// Ask for the microphone, before a call that would need it is created.
+    ///
+    /// The 1:1 path has always done this and the group path did not, so a group
+    /// call opened a peer connection and joined the SFU with no microphone access
+    /// at all: no prompt, no audio, and peers reporting "can't receive audio and
+    /// video from this client". Every step of the call succeeded and the one that
+    /// actually carries a voice did not happen.
+    ///
+    /// Asked *before* the client is created rather than at first capture, because
+    /// RingRTC disables recording while it believes it is the only device in the
+    /// call — `set_audio_recording_enabled(false)` — so capture may not begin
+    /// until long after a prompt would be useful, and a permission never asked
+    /// for is a permission never granted.
+    ///
+    /// A denial stops the call rather than producing a silent one. Joining an SFU
+    /// conference with no audio is indistinguishable, to everyone else, from a
+    /// broken client, and that is worse than not joining.
+    private func ensureMicrophonePermission() async throws {
+        if let override = microphonePermissionOverride {
+            guard await override() else { throw SignalError.unsupported("microphone access was denied") }
+            return
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return
+        case .notDetermined:
+            let granted = await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .audio) { value in
+                    continuation.resume(returning: value)
+                }
+            }
+            guard granted else { throw SignalError.unsupported("microphone access was denied") }
+        case .denied, .restricted:
+            throw SignalError.unsupported("microphone access was denied")
+        @unknown default:
+            throw SignalError.unsupported("microphone access was denied")
+        }
+    }
+
+    /// Test seam: replaces the AVFoundation microphone prompt so the group call
+    /// path can be exercised without a device or TCC approval.
+    var microphonePermissionOverride: (@Sendable () async -> Bool)?
+
     /// A client created for an inbound call that has not been answered.
     ///
     /// RingRTC drops signaling for a group it has no client for, so one has to
@@ -911,6 +958,18 @@ public final class GroupCallController: ObservableObject {
     /// and failed.
     public func answer(_ ring: GroupCallRing) async -> GroupCallState? {
         guard let bridge else { return nil }
+        // Asked here for the same reason as on the outgoing path, and answering is
+        // the last moment it can be asked without the call already being visible
+        // to everyone as a participant with no voice. A refusal keeps the ring: the
+        // permission is fixable in System Settings and the user is mid-decision,
+        // so clearing the banner and leaving the reason in the log would be the
+        // worst outcome of the three.
+        do {
+            try await ensureMicrophonePermission()
+        } catch {
+            Log.error("[group-call] not answered: \(Self.describe(error))")
+            return nil
+        }
         guard let masterKeyHex = await roster.masterKeyHex(forGroupIdHex: ring.groupIdHex) else {
             // Either this device is not in the group, or the id map could not be
             // read. The ring is not answerable in that case, and is not guessed
