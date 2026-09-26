@@ -1680,7 +1680,7 @@ pub fn receive_group_call_signal(event: &serde_json::Value) -> bool {
     true
 }
 
-/// Redeem a group membership proof for a call token at the configured CDN.
+/// Redeem a group membership proof for a call token at the storage service.
 ///
 /// Returns the token bytes, or a message describing why it could not be
 /// redeemed. The response body is decoded here so a malformed credential is
@@ -1692,15 +1692,15 @@ pub async fn redeem_group_call_proof(
     manager: &StoredManager,
     authorization: &str,
 ) -> Result<Vec<u8>, String> {
-    // The basic-auth value is the authorization string exactly. Signal's CDN
-    // expects `Authorization: Basic base64(<that>)`.
+    // The basic-auth value is the authorization string exactly, base64'd:
+    // Signal builds it as `base64(utf8(<paramsHex>:<presentationHex>))`.
     let basic = base64::engine::general_purpose::STANDARD.encode(authorization.as_bytes());
     let header = format!("Basic {basic}");
     // A request that never answers would leave the join hanging with nothing to
-    // show for it, so the whole set of hosts is bounded.
+    // show for it, so the request is bounded.
     let (status, body) = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        manager.cdn_group_token(&header),
+        manager.group_call_token(&header),
     )
     .await
     .map_err(|_| "the call service did not answer".to_string())?

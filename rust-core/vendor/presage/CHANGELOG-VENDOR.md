@@ -13,53 +13,108 @@ Added one dependency:
 reqwest = { version = "0.13", default-features = false }
 ```
 
-Needed for `reqwest::Method` in the new request. `reqwest` was already in the
+Needed for `reqwest::Method` in the new requests. `reqwest` was already in the
 dependency graph through `libsignal-service`, at the same version, so this
 adds no new crate — only a new direct edge. `default-features = false` keeps
 the TLS/cookie features that libsignal-service already enables.
 
 ## 2. `presage/src/manager/registered.rs`
 
-Added one method to `impl Registered`:
+Three methods added to `impl Registered`, all for group calls. Together they
+cover the whole ZK group proof flow: fetch a credential, present it locally, and
+redeem the presentation for a call token.
+
+### 2a. `group_auth_credentials_raw`
 
 ```rust
 pub async fn group_auth_credentials_raw(
     &self,
-    start_day: u64,
-    end_day: u64,
-) -> Result<String, Error<S::Error>>
+    start_secs: u64,
+    end_secs: u64,
+) -> Result<(String, ServerPublicParams), Error<S::Error>>
 ```
 
-It issues:
+Issues:
 
 ```
 GET /v1/certificate/auth/group
-      ?redemptionStartSeconds=<start_day>
-      &redemptionEndSeconds=<end_day>
+      ?redemptionStartSeconds=<start_secs>
+      &redemptionEndSeconds=<end_secs>
       &zkcCredential=true
 ```
 
-using the account's existing identified push service, and returns the response
-body as raw JSON.
+and returns the response body as raw JSON plus the server's ZK public params.
 
 Design notes:
 
+- **The window is in seconds.** The parameter names say `Seconds`; passing a day
+  index asks the service for a window in 1970. A day number here cannot return a
+  credential, so the join could never proceed.
 - **The body is returned unparsed.** The response shape belongs to the group-call
   protocol, not to presage, so decoding lives in
   `cuztom-signal-core/src/group_calls.rs` where it is unit tested.
+- **The ZK server public params come back with the credential** rather than
+  through a separate accessor, because `service_configuration` is private and
+  this is the only place they are needed. The presentation cannot be verified
+  without them.
 - **Non-2xx becomes an error** and the response body is dropped, because it can
   echo request material and the status is what a caller acts on.
 - `reqwest::Error` is mapped to `Error::IoError` because presage's `Error` has
   no `From<reqwest::Error>`.
 
-This is the minimum needed. The alternative — reaching the same endpoint without
-touching presage — is not available: `groups_manager()` is private, presage
-never handles group credentials, and the authenticated service is only
-constructible from inside `Registered`.
+### 2b. `group_call_token`
+
+```rust
+pub async fn group_call_token(
+    &self,
+    authorization: &str,
+) -> Result<(u16, String), Error<S::Error>>
+```
+
+Redeems a group membership proof for a call token.
+
+**The endpoint is on the storage service, not a CDN.** Traced from Signal
+Desktop 8.28.0, the group-token call is issued with `host: 'storageService'`
+whose base URL comes from the service configuration, and the path map entry is
+`v2/groups/token`. The same host serves the group-state `PUT` and the
+group-avatar upload, so the ZK group APIs all live there. Requesting this path
+from a CDN answers `403`.
+
+The request is made here rather than by the host because the storage service
+serves a certificate from Signal's own authority rather than the system roots: a
+host HTTP client rejects it, while this one is already built with the service
+configuration's certificate authority. The endpoint goes through
+`Endpoint::storage`, so the host is read from the configuration rather than
+written here.
+
+`authorization` is the complete `Authorization` header value, which for this
+endpoint carries the membership proof. It is never logged; only the URL, status
+and body length are.
+
+### 2c. `cdn_urls`
+
+```rust
+pub fn cdn_urls(&self) -> Vec<(u32, url::Url)>
+```
+
+Returns the CDN base URLs the service configuration declares. Used for
+diagnostics and so a host can see what the configuration contains.
+
+`cdn_urls` is private in `libsignal-service`, so the entries are resolved
+through the public `Endpoint::into_url`, which reports an id the configuration
+does not declare instead of inventing a host for it. A host therefore only
+appears here if the service declared it. This is a read of the configuration,
+not a guess.
+
+## Why the alternative was rejected
+
+Reaching these endpoints without touching presage is not available:
+`groups_manager()` is private, presage never handles group credentials, and the
+authenticated service is only constructible from inside `Registered`.
 
 ## Re-applying after an upstream update
 
 1. Replace the tree with the new rev.
-2. Re-apply both changes above.
+2. Re-apply all three changes above.
 3. `cargo test --all-targets` in `rust-core/`.
 4. `scripts/check-ffi-parity.sh`.

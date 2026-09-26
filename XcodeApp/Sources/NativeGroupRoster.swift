@@ -92,17 +92,22 @@ public final class NativeGroupRoster: GroupRosterProviding, @unchecked Sendable 
     }
 }
 
-/// Redeems a group membership proof at the CDN, natively.
+/// Redeems a group membership proof natively.
 ///
-/// The request is made by the native core rather than by `URLSession` because
-/// Signal's CDN serves a certificate from Signal's own authority, not the system
-/// roots. A host HTTP client rejects that; the native client, already built with
-/// the service configuration's certificate authority, accepts it. The chat
-/// service is reachable from both, which is what makes this a trust-path
-/// problem rather than a guess.
+/// Two things force this to the native side.
 ///
-/// The CDN hosts also come from the service configuration, so a staging build
-/// does not talk to production.
+/// The endpoint is on the **storage service**, not a CDN. Traced from Signal
+/// Desktop 8.28.0, the group-token call is issued with `host: 'storageService'`
+/// and path `v2/groups/token`; the same host serves the group-state `PUT` and the
+/// group-avatar upload. Requesting it from a CDN answers 403.
+///
+/// The storage service also serves a certificate from Signal's own authority
+/// rather than the system roots, so `URLSession` rejects it while the native
+/// client - already built with the service configuration's certificate
+/// authority - accepts it.
+///
+/// The host is resolved through the service configuration natively, so a staging
+/// build does not talk to production.
 public struct NativeGroupCallRedeemer: GroupCallController.ProofRedeeming {
     private let service: RustCoreService
 
@@ -111,15 +116,13 @@ public struct NativeGroupCallRedeemer: GroupCallController.ProofRedeeming {
     }
 
     public func cdnBaseURLs() async throws -> [URL] {
+        // The list is reporting only: the request is issued natively against the
+        // storage endpoint, so nothing here selects a host. Reported so a
+        // configuration problem is still visible.
         let configured = try await service.cdnUrls()
-        guard !configured.isEmpty else {
-            // Failing is the point: a made-up host would fail as an unreachable
-            // endpoint, which says nothing about the real problem.
-            throw SignalError.network("the service configuration declares no CDN")
-        }
         let hosts = configured.map { $0.host ?? "?" }.joined(separator: ", ")
-        Log.info("[group-call] configured CDNs: \(hosts)")
-        return configured
+        Log.info("[group-call] redeeming natively; configured CDNs (not used): \(hosts)")
+        return [URL(string: "https://storage.invalid")!]
     }
 
     public func fetchToken(
@@ -127,9 +130,6 @@ public struct NativeGroupCallRedeemer: GroupCallController.ProofRedeeming {
         authorization: String,
         groupIdHex: String
     ) async throws -> GroupCallProofService.Proof {
-        // The host is resolved natively so the request uses the right trust
-        // path. `cdnBaseURL` is only used to describe which host answered.
-        Log.info("[group-call] redeeming proof at \(cdnBaseURL.host ?? "?")")
         return try await service.groupCallRedeemProof(authorization: authorization)
     }
 }

@@ -406,26 +406,26 @@ impl<S: Store> Manager<S, Registered> {
         resolved
     }
 
-    /// Redeems a ZK group presentation for a call token at the configured CDN.
+    /// Redeems a ZK group presentation for a call token.
     ///
     /// Added for group calls. Returns `(status, body)` so the caller can decide
     /// what a non-2xx means, having the body size capped here.
     ///
-    /// This deliberately does the request natively rather than in the host. The
-    /// CDN serves a certificate from Signal's own authority, not the system
-    /// roots, so a host HTTP client rejects it while this one - already built
-    /// with the service configuration's certificate authority - accepts it. The
-    /// same request against the chat service works here and fails in the host,
-    /// which is what makes the trust path the reason rather than a guess.
+    /// The endpoint is on the **storage service**, not the CDN. Traced from
+    /// Signal Desktop 8.28.0: the group-token call is issued with
+    /// `host: 'storageService'`, whose base URL comes from the service
+    /// configuration, and the path map entry is `v2/groups/token`. The same
+    /// host is used for the group-state `PUT` and the group-avatar upload, so
+    /// the ZK group APIs all live there. Requesting it from a CDN returns 403.
+    ///
+    /// The request is made natively because the storage service serves a
+    /// certificate from Signal's own authority, not the system roots: a host
+    /// HTTP client rejects it while this one - already built with the service
+    /// configuration's certificate authority - accepts it.
     ///
     /// `authorization` is the complete `Authorization` header value, which for
     /// this endpoint carries the membership proof. It is never logged.
-    ///
-    /// Each configured CDN is tried in order. A transport failure moves to the
-    /// next host, because one that is not serving the endpoint should not end the
-    /// attempt; a response of any status is returned, because a host that exists
-    /// has given a real answer.
-    pub async fn cdn_group_token(
+    pub async fn group_call_token(
         &self,
         authorization: &str,
     ) -> Result<(u16, String), Error<S::Error>> {
@@ -435,62 +435,49 @@ impl<S: Store> Manager<S, Registered> {
         const MAX_BODY_BYTES: usize = 64 * 1024;
         const TOKEN_PATH: &str = "v2/groups/token";
 
-        let configured = self.cdn_urls();
-        if configured.is_empty() {
+        let service = self.identified_push_service();
+        let request = service
+            .request(
+                reqwest::Method::GET,
+                // Resolved through the service configuration, so the host is read
+                // rather than written here.
+                Endpoint::storage(TOKEN_PATH),
+                HttpAuthOverride::NoOverride,
+            )
+            .map_err(|e| Error::IoError(std::io::Error::other(e)))?
+            .header(reqwest::header::AUTHORIZATION, authorization)
+            .header(reqwest::header::ACCEPT, "application/x-protobuf")
+            .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
+            // The proof is short lived and must not be cached or replayed.
+            .header(reqwest::header::CACHE_CONTROL, "no-store");
+        // `build()` consumes the builder, so this is a throwaway clone purely for
+        // the log line. The Authorization header is not part of the URL and the
+        // proof is only in that header, so the URL is safe to log.
+        if let Some(url) = request
+            .try_clone()
+            .and_then(|clone| clone.build().ok())
+            .map(|built| built.url().to_string())
+        {
+            eprintln!("[core] group token GET {url}");
+        }
+        let response = request.send().await.map_err(|e| {
+            eprintln!("[core] group token request failed: {e}");
+            Error::IoError(std::io::Error::other(e))
+        })?;
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|e| {
+            eprintln!("[core] group token body failed: {e}");
+            Error::IoError(std::io::Error::other(e))
+        })?;
+        if bytes.len() > MAX_BODY_BYTES {
+            eprintln!("[core] group token response too large: {} bytes", bytes.len());
             return Err(Error::IoError(std::io::Error::other(
-                "the service configuration declares no CDN",
+                "group token response too large",
             )));
         }
-        let service = self.identified_push_service();
-        let mut last_transport_error: Option<String> = None;
-        for (_id, base) in configured {
-            let mut url = base;
-            url.set_path(TOKEN_PATH);
-            url.set_query(None);
-            let request = service
-                .request(reqwest::Method::GET, Endpoint::Absolute(url.clone()), HttpAuthOverride::NoOverride)
-                .map_err(|e| Error::IoError(std::io::Error::other(e)))?
-                .header(reqwest::header::AUTHORIZATION, authorization)
-                .header(reqwest::header::ACCEPT, "application/x-protobuf")
-                // The proof is short lived and must not be cached or replayed.
-                .header(reqwest::header::CACHE_CONTROL, "no-store");
-            eprintln!(
-                "[core] group token GET {}",
-                url.host_str().unwrap_or("?")
-            );
-            match request.send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    let body = match response.bytes().await {
-                        Ok(bytes) => {
-                            if bytes.len() > MAX_BODY_BYTES {
-                                eprintln!("[core] group token response too large");
-                                return Err(Error::IoError(std::io::Error::other(
-                                    "group token response too large",
-                                )));
-                            }
-                            String::from_utf8_lossy(&bytes).to_string()
-                        }
-                        Err(e) => {
-                            last_transport_error = Some(format!("group token body: {e}"));
-                            continue;
-                        }
-                    };
-                    eprintln!("[core] group token responded HTTP {status}, {} bytes", body.len());
-                    return Ok((status.as_u16(), body));
-                }
-                Err(e) => {
-                    // No response at all: this host may simply not be serving
-                    // the endpoint, so the next one is worth trying.
-                    eprintln!("[core] group token host {} failed: {e}", url.host_str().unwrap_or("?"));
-                    last_transport_error = Some(e.to_string());
-                }
-            }
-        }
-        Err(Error::IoError(std::io::Error::other(format!(
-            "no configured CDN answered: {}",
-            last_transport_error.unwrap_or_else(|| "unknown".to_string())
-        ))))
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        eprintln!("[core] group token responded HTTP {status}, {} bytes", body.len());
+        Ok((status.as_u16(), body))
     }
 
     /// Fetches raw ZK group auth credentials for a day range, as JSON, along
