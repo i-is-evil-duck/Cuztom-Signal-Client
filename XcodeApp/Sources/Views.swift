@@ -218,7 +218,8 @@ struct MessageListView: View {
                             call: call,
                             onEnd: { Task { await vm.endGroupCall() } },
                             onSetMuted: { muted in Task { await vm.setGroupCallMuted(muted) } },
-                            onSetCameraOff: { off in Task { await vm.setGroupCallCameraOff(off) } }
+                            onSetCameraOff: { off in Task { await vm.setGroupCallCameraOff(off) } },
+                            videoFeeds: vm.groupCallVideoFeeds
                         )
                     }
                 }
@@ -1591,12 +1592,53 @@ struct IncomingGroupCallBanner: View {
     }
 }
 
+/// Draws one participant's video, polling for new frames while shown.
+///
+/// The poll is tied to the view's lifetime with `.task`, so it stops the moment
+/// the tile leaves the banner. A poll that outlived its view would keep asking
+/// the core for frames nobody is looking at.
+struct RemoteVideoTile: View {
+    let feed: RemoteVideoFeed
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.black.opacity(0.6))
+            if let image = feed.image {
+                // `.fit` inside a fixed frame, so the aspect ratio is kept rather
+                // than stretched. A squashed face is worse than a small one.
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .task(id: feed.demuxId) {
+            // Roughly video rate. Not a timer that has to be tuned: the core
+            // answers "nothing newer" immediately, so a poll costs one FFI call
+            // and asking more often than frames arrive is harmless.
+            while !Task.isCancelled {
+                let drew = await feed.poll()
+                if !drew {
+                    try? await Task.sleep(for: .milliseconds(40))
+                }
+            }
+        }
+        .accessibilityLabel(feed.isShowingVideo ? "Video" : "Waiting for video")
+    }
+}
+
 struct GroupCallBanner: View {
     @Environment(ChatViewModel.self) private var vm
     let call: GroupCallState
     let onEnd: () -> Void
     var onSetMuted: (Bool) -> Void = { _ in }
     var onSetCameraOff: (Bool) -> Void = { _ in }
+    /// One feed per participant who is sending video. Empty until somebody is, so
+    /// the strip costs nothing on an audio-only call.
+    var videoFeeds: [RemoteVideoFeed] = []
 
     /// Whether the media controls are offered.
     ///
@@ -1691,6 +1733,9 @@ struct GroupCallBanner: View {
             if isLive, !call.participants.isEmpty {
                 participantList
             }
+            if isLive, !videoFeeds.isEmpty {
+                videoStrip
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -1732,6 +1777,25 @@ struct GroupCallBanner: View {
             }
         }
         .accessibilityIdentifier("group-call-participants")
+    }
+
+    /// Live video for anyone sending it.
+    ///
+    /// A strip rather than a grid, because a banner is not a call screen and
+    /// pretending otherwise is how a two-tile strip ends up stretched across a
+    /// window it does not fit. Each tile keeps its own aspect ratio, so nobody's
+    /// face is squashed to fit a fixed box.
+    private var videoStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(videoFeeds) { feed in
+                    RemoteVideoTile(feed: feed)
+                        .frame(width: 132, height: 96)
+                }
+            }
+        }
+        .frame(height: 96)
+        .accessibilityIdentifier("group-call-video")
     }
 
     private func audioHelp(for participant: RustCoreService.GroupCallParticipant) -> String {

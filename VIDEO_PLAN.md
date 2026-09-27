@@ -245,14 +245,41 @@ length to check against. A short slice is an out-of-bounds read — not an error
 not a panic, just a frame full of whatever followed it in memory. It cost an hour
 here, and it is recorded in `vendor/ringrtc/CHANGELOG-VENDOR.md`.
 
-### Step 4 — Rendering in Swift
+### Step 4 — Rendering in Swift — **done, unverified against a real call**
 
-RGBA bytes to a `CVPixelBuffer` (`kCVPixelFormatType_32BGRA`), then onto a
-`CALayer`. Frames are dropped rather than queued, so a slow display costs
-smoothness and nothing else.
+`VideoFrameImage` (RGBA → `CGImage`) and `RemoteVideoFeed` (poll → draw), with
+`RemoteVideoTile` in the banner. A horizontal strip, one tile per participant the
+SFU reports as forwarding video, each keeping its own aspect ratio so nobody is
+squashed to fit a fixed box.
 
-*Done when:* a remote participant's video appears, and a shared screen appears and
-is labelled as a screen rather than a camera.
+`CGImage` rather than a `CVPixelBuffer` and `AVSampleBufferDisplayLayer`. The
+sample-buffer layer is the right tool for a continuous video stream; here the
+frames arrive already dropped and already at most 720px, and all that is wanted is
+something a layer can draw. `CGImage` is immutable, so one is built per frame —
+about 2 MB of extra copying at video rate, against a decoder doing far more work
+on the same frame. Not worth a data provider to avoid.
+
+Three things found by writing it:
+
+- **`CGImageAlphaInfo.last` is rejected** for 8-bit RGB device colour. `CGContext`
+  returns nil and the frame silently disappears — no error, just no picture.
+  `noneSkipLast` is the right one anyway: straight alpha, so CoreGraphics does not
+  divide colour by an alpha that is already 255. Correct by construction rather
+  than correct by accident.
+- **The feeds are derived, not imperatively refreshed.** The first attempt had a
+  `refreshGroupCallVideoFeeds()` called from a view body, which does not compile
+  and should not. `groupCallVideoFeeds` is now computed from the call's own
+  participant list, so it cannot be stale relative to the roster beside it.
+- **A tile is only made for a participant the SFU says is forwarding video** and
+  has told us a height. A tile for someone sending nothing is a black rectangle,
+  which reads as broken video rather than as no video.
+
+*Done when:* satisfied as far as it can be without a call. 4 tests on the
+conversion, including that a frame which cannot exist yields no image rather than
+a blank one, and that the caller's buffer is not written to. **What remains
+unverified is the only thing that matters: nobody has seen a real remote frame go
+through this.** That is step 6's problem too — the SFU will not forward video
+until it has been asked, and that has not been exercised.
 
 ### Step 5 — Outgoing video and the camera
 

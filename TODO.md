@@ -96,5 +96,10 @@ storage work. `CALLS_PLAN.md` remains the chronological record of the call path.
       through the real native conversion. Supplying it is also what turns
       `enable_video_frame_content` on — with a null sink the native layer was never
       asked to produce frames at all.
-- [ ] **Get frames from Rust to Swift**, then render them. The remaining half of
-      `VIDEO_PLAN.md`, steps 3 and 4.
+- [x] **Frames cross to Swift and render.** ABI 9, poll-based, with the
+      dimensions carried as out-parameters so a portrait frame is not drawn as a
+      square. A tile per participant actually forwarding video, in the banner.
+- [ ] **Receiving video has still never been seen working.** Everything up to the
+      display is built and tested, and the SFU will not forward video until it has
+      been asked — which has not been exercised. That is the next unknown, not
+      more code.

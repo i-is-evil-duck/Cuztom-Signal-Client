@@ -104,6 +104,8 @@ final class ChatViewModel {
     /// controller's own state so the views can render it without reaching into
     /// a second observable.
     var groupCall: GroupCallState?
+    /// The live native core, kept so the group call's video feeds can read frames.
+    private(set) var coreService: RustCoreService?
 
     var phase = LinkPhase.starting
     var conversations: [Conversation] = []
@@ -255,6 +257,10 @@ final class ChatViewModel {
         // there is nothing to connect to, so fail loudly with Retry.
         buildVersionTag = BuildInfo.displayTag
         let live = RustCoreService()
+        // Kept so the group call's video feeds can read frames. The feeds poll the
+        // core directly, and a poll that had no service would silently never draw
+        // anything.
+        coreService = live
         guard live.loadLibrary() else {
             errorMessage = "rust core not found — rebuild: cd rust-core && cargo build --release"
             phase = .failed
@@ -660,6 +666,9 @@ func sendTyping(started: Bool) async {
     func endGroupCall() async {
         await groupCallController?.end()
         groupCall = nil
+        // Frames belong to the call that has ended, and so does the memory they
+        // occupy.
+        releaseGroupCallVideo()
         sync()
     }
 
@@ -681,6 +690,46 @@ func sendTyping(started: Bool) async {
         sync()
     }
 
+    /// A video feed per participant who is sending video.
+    ///
+    /// Derived from the call's own participant list rather than kept in step with
+    /// it separately, so a feed exists exactly while somebody is in the call. A
+    /// feed for someone who has left would keep polling the core for frames nobody
+    /// is drawing.
+    ///
+    /// The feed objects themselves are cached, because a feed holds the last frame
+    /// it drew and the sequence it has already shown — rebuilding one per render
+    /// would throw both away and redraw from nothing.
+    private var videoFeedCache: [UInt32: RemoteVideoFeed] = [:]
+
+    var groupCallVideoFeeds: [RemoteVideoFeed] {
+        guard let call = groupCall, call.phase == .connected else {
+            videoFeedCache = [:]
+            return []
+        }
+        // Only participants the SFU says are forwarding video, and only once it has
+        // told us a height. A tile for someone sending nothing is a black
+        // rectangle, which reads as broken video rather than as no video.
+        let sending = call.participants
+            .filter { $0.isForwardingVideo == true && $0.videoHeight > 0 }
+            .map(\.demuxId)
+        // Forget anybody who has stopped, so a departed participant's last frame
+        // is released rather than held.
+        let keep = Set(sending)
+        videoFeedCache = videoFeedCache.filter { keep.contains($0.key) }
+        return sending.map { demuxId in
+            if let kept = videoFeedCache[demuxId] { return kept }
+            let made = RemoteVideoFeed(demuxId: demuxId, service: coreService)
+            videoFeedCache[demuxId] = made
+            return made
+        }
+    }
+
+    /// Release every frame, on a call ending.
+    func releaseGroupCallVideo() {
+        videoFeedCache = [:]
+        Task { await coreService?.groupCallResetVideo() }
+    }
     /// The group call somebody is ringing us for, if any.
     ///
     /// Mirrored here rather than read through the controller, because the
