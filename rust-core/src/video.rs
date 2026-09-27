@@ -203,7 +203,7 @@ fn accept_frame(sink: &VideoSinkState, demux_id: DemuxId, frame: VideoFrame) {
 
     let (width, height) = (frame.width(), frame.height());
     let needed = (width as usize) * (height as usize) * 4;
-    let mut slot = state.slots.entry(demux_id).or_default();
+    let slot = state.slots.entry(demux_id).or_default();
     // Reallocated only when the size actually changes, so a steady stream is not
     // churning the allocator on the decoder's thread.
     if slot.pixels.len() != needed {
@@ -252,6 +252,17 @@ pub fn forget(sink: &VideoSinkState, demux_id: DemuxId) {
     sink.lock().slots.remove(&demux_id);
 }
 
+/// Bytes a participant's current frame needs, or 0 if they have none.
+///
+/// A caller sizes its buffer with this before reading, because a frame's size is
+/// not known in advance and changes when a participant's resolution does.
+pub fn frame_size(sink: &VideoSinkState, demux_id: DemuxId) -> usize {
+    sink.lock()
+        .slots
+        .get(&demux_id)
+        .map_or(0, |slot| slot.pixels.len())
+}
+
 /// Counts for the log, so "video is not arriving" is distinguishable from "video
 /// is arriving and being dropped".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -288,6 +299,24 @@ pub fn reset(sink: &VideoSinkState) {
 mod tests {
     use super::*;
     use ringrtc::webrtc::media::VideoPixelFormat;
+
+    /// Alias so the out-parameter locals below read as the `u32` they are.
+    type UInt32Alias = u32;
+
+    /// Serialises the tests that touch the application's sink.
+    ///
+    /// The C ABI is inherently global — it reads the one sink the app uses — so
+    /// tests exercising it cannot each have an isolated instance the way the sink
+    /// tests above do. They therefore have to take turns. Without this they fail
+    /// intermittently, which is exactly what happened: one test's `reset_video`
+    /// wiped another's frame mid-assertion.
+    static SHARED_SINK: Mutex<()> = Mutex::new(());
+
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        SHARED_SINK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// A frame built from known pixels, going all the way round.
     ///
@@ -619,5 +648,144 @@ mod tests {
             take_frame(&sink, 2, &mut out).is_some(),
             "a frame delivered to a clone is visible through the original state"
         );
+    }
+
+    /// The video read has to behave at the boundary, not just inside Rust.
+    ///
+    /// A frame crosses into another language here, and the two ways that can go
+    /// wrong are a buffer overrun and a lost frame. Both are checked through the
+    /// real `extern "C"` entry points rather than the Rust functions behind them,
+    /// because the pointer arithmetic and the sequence handshake only exist at that
+    /// layer.
+    #[test]
+    fn the_read_abi_refuses_a_short_buffer_and_does_not_consume_the_frame() {
+        let _exclusive = exclusive();
+        use crate::{
+            core_cmd_group_call_forget_video, core_cmd_group_call_reset_video,
+            core_cmd_group_call_take_video_frame, core_cmd_group_call_video_frame_size,
+        };
+
+        crate::call::reset_video();
+        let demux = 5u32;
+        // 32x32 rather than something tiny: the native round trip is chroma
+        // subsampled, so a 4x4 frame comes back visibly wrong and an exact pixel
+        // assertion here would be measuring the subsampler, not the boundary.
+        let (w, h) = (32u32, 32u32);
+        // Published through the real sink, so the test exercises the same path the
+        // decoder does rather than reaching into the state.
+        let sink = CuztomVideoSink::shared();
+        use ringrtc::webrtc::media::VideoSink as _;
+        // The full frame, not just one pixel. `copy_from_slice` takes a `&[u8]`
+        // and hands only its *pointer* to the native library, which then reads
+        // `w * h * 4` bytes without any length to check against — so a short
+        // slice is an out-of-bounds read, not an error. That is what made an
+        // earlier version of this test return nonsense pixels.
+        let flat = vec![30u8, 30, 30, 255].repeat((w * h) as usize);
+        sink.on_video_frame(
+            demux,
+            VideoFrame::copy_from_slice(w, h, VideoPixelFormat::Rgba, &flat),
+        );
+
+        let needed = core_cmd_group_call_video_frame_size(demux);
+        assert_eq!(needed, (w * h * 4) as i64, "size is reported before reading");
+
+        // A buffer one byte short is refused, not truncated and not overrun.
+        let mut too_small = vec![0u8; (needed - 1) as usize];
+        let rc = unsafe {
+            core_cmd_group_call_take_video_frame(
+                demux,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                too_small.as_mut_ptr(),
+                too_small.len() as i64,
+            )
+        };
+        assert_eq!(rc, 0, "a short buffer yields nothing rather than a partial frame");
+        assert!(too_small.iter().all(|b| *b == 0), "and nothing was written");
+
+        // A null pointer is refused rather than dereferenced.
+        let rc = unsafe {
+            core_cmd_group_call_take_video_frame(
+                demux,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                needed,
+            )
+        };
+        assert_eq!(rc, 0, "a null buffer is refused");
+
+        // A correctly sized read gets the frame.
+        let mut buffer = vec![0u8; needed as usize];
+        // The dimensions come back with the frame, and are cleared on a miss --
+        // a caller that gets 0 must not be left holding the last frame's shape,
+        // which would draw this one stretched.
+        let read = |since: u64, buf: &mut [u8]| -> (u64, u32, u32) {
+            let mut width: UInt32Alias = 0;
+            let mut height: UInt32Alias = 0;
+            let sequence = unsafe {
+                core_cmd_group_call_take_video_frame(
+                    demux,
+                    since,
+                    &mut width,
+                    &mut height,
+                    buf.as_mut_ptr(),
+                    buf.len() as i64,
+                )
+            };
+            (sequence, width, height)
+        };
+        let (first, got_w, got_h) = read(0, &mut buffer);
+        assert_eq!(first, 1, "the first read returns the frame's sequence");
+        assert_eq!((got_w, got_h), (w, h), "and the frame's real dimensions");
+        for (index, pixel) in buffer.chunks(4).enumerate() {
+            let within = |got: u8| (got as i32 - 30).abs() <= 12;
+            assert!(
+                pixel.iter().take(3).all(|c| within(*c)) && pixel[3] == 255,
+                "pixel {index} is not the colour that went in: {pixel:?}"
+            );
+        }
+
+        // Nothing newer exists, so asking with the sequence just read yields
+        // nothing -- that is how a caller polls without spinning on old frames.
+        let (miss, cleared_w, cleared_h) = read(first, &mut buffer);
+        assert_eq!(miss, 0, "nothing newer, so nothing returned");
+        assert_eq!(
+            (cleared_w, cleared_h),
+            (0, 0),
+            "a miss clears the dimensions rather than leaving the previous frame's"
+        );
+
+        // And asking again with the older sequence still returns it: a frame is
+        // not consumed by being read, so a caller that lost a response does not
+        // also lose the frame.
+        let (replay, _, _) = read(0, &mut buffer);
+        assert_eq!(replay, first, "the same frame can be read again");
+
+        // Forgetting a participant releases their pixels.
+        core_cmd_group_call_forget_video(demux);
+        assert_eq!(core_cmd_group_call_video_frame_size(demux), 0, "forgotten on leaving");
+        core_cmd_group_call_reset_video();
+    }
+
+    /// Video counters, so "not arriving" and "arriving and dropped" are different
+    /// answers rather than the same blank rectangle.
+    #[test]
+    fn the_stats_abi_reports_what_happened() {
+        let _exclusive = exclusive();
+        crate::call::reset_video();
+        let stats = crate::call::video_stats();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stats).expect("stats are JSON");
+        assert_eq!(parsed["frames_seen"], 0);
+        assert_eq!(parsed["frames_published"], 0);
+        assert_eq!(parsed["participants"], 0);
+        assert!(
+            parsed["last_dropped_demux_id"].is_null(),
+            "nothing has been dropped yet, which is not the same as dropped-zero"
+        );
+        crate::call::reset_video();
     }
 }

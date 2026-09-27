@@ -205,6 +205,82 @@ pub fn invalidate_session() {
     teardown_group_calls();
 }
 
+// ---------------------------------------------------------------------------
+// Video frames out
+// ---------------------------------------------------------------------------
+//
+// Deliberately not routed through the command roundtrip. The frames live behind
+// one mutex, there is no actor to reach, and a caller-supplied buffer pointer has
+// no business travelling through a channel to another thread. Reading straight
+// from the sink keeps the pointer valid for exactly the duration of the call and
+// makes that obvious rather than something a reader has to verify.
+
+/// Bytes needed for `client_id`'s newest frame, or 0 if there is none.
+///
+/// Call this first to size a buffer, then call [`take_video_frame`] with it. Two
+/// calls rather than one because the frame's size is not known in advance and
+/// changes when a participant's resolution does.
+pub fn video_frame_size(client_id: u32) -> usize {
+    crate::video::frame_size(sink(), client_id)
+}
+
+/// Copy the newest frame for `client_id` into `out`, if it is newer than
+/// `since_sequence`.
+///
+/// Returns the sequence number written, or 0 when there is nothing newer. Zero is
+/// never a real sequence — published sequences start at 1 — so "no new frame" and
+/// "a frame numbered 0" cannot be confused.
+///
+/// Passing the same `since_sequence` twice returns the same frame both times.
+/// Consuming on read would mean a caller that lost the first response also lost
+/// the frame, which is a bug that would only appear under load.
+///
+/// # Safety
+///
+/// `out` must be at least `video_frame_size(client_id)` bytes, or the write is
+/// refused rather than truncated. The pointer is used only for the duration of
+/// this call and never retained.
+pub unsafe fn take_video_frame(
+    client_id: u32,
+    since_sequence: u64,
+    out: &mut [u8],
+) -> Option<(u32, u32, u64)> {
+    use ringrtc::lite::sfu::DemuxId;
+    // Either nothing at all, or nothing newer than the caller already has. Both
+    // are `None`, and the caller cannot tell them apart — which is correct,
+    // because neither calls for a different response.
+    let (width, height, sequence, _) = crate::video::take_frame(sink(), client_id, out)?;
+    (sequence > since_sequence).then_some((width, height, sequence))
+}
+
+/// Counts for the log.
+pub fn video_stats() -> String {
+    let counts = crate::video::counts(sink());
+    serde_json::json!({
+        "frames_seen": counts.seen,
+        "frames_published": counts.published,
+        "frames_dropped": counts.dropped,
+        "participants": counts.participants,
+        "last_dropped_demux_id": counts.last_drop.map(|(id, _)| id),
+    })
+    .to_string()
+}
+
+/// Forget a participant's frame, on leaving.
+pub fn forget_video(client_id: u32) -> Result<(), String> {
+    crate::video::forget(sink(), client_id);
+    Ok(())
+}
+
+/// Forget every frame, on a call ending.
+pub fn reset_video() {
+    crate::video::reset(sink());
+}
+
+fn sink() -> &'static std::sync::Arc<crate::video::VideoSinkState> {
+    crate::video::shared()
+}
+
 /// Open or close the microphone, without joining a call.
 ///
 /// RingRTC's audio device module never opens the input on its own.

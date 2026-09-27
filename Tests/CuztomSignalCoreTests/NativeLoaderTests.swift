@@ -19,5 +19,5 @@ import Testing
     // A dylib older than
     // those must fail to load rather than load with missing symbols and fail later
     // with a misleading error.
-    #expect(RustCoreService.expectedNativeABI == 8)
+    #expect(RustCoreService.expectedNativeABI == 9)
 }

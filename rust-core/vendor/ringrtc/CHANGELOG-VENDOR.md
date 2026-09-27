@@ -100,3 +100,22 @@ behaviour rather than adding any.
 **Re-applying after a re-vendor.** Add the method verbatim to `impl NativePlatform`
 in `src/rust/src/native.rs`. It has no dependencies beyond the existing
 `PeerConnectionFactory` import.
+
+## Note for anyone using `VideoFrame::copy_from_slice` in a test
+
+Not a change — a hazard found while building the sink, recorded here because it
+is invisible at the call site.
+
+```rust
+pub fn copy_from_slice(width: u32, height: u32, pixel_format: VideoPixelFormat, buffer: &[u8]) -> Self
+```
+
+`buffer` is only used for `buffer.as_ptr()`. The native library then reads
+`width * height * bytes_per_pixel` bytes from that pointer with **no length to
+check against**, so passing a slice shorter than the frame is an out-of-bounds
+read. It is not an error and it does not panic; it returns a frame full of
+whatever followed the slice in memory, which reads as mysterious colour
+corruption rather than as a bug.
+
+Pass a full `width * height * 4` buffer. A one-pixel slice for a 32x32 frame cost
+an hour of this session.

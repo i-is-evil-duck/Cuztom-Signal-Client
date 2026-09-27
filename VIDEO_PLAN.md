@@ -212,16 +212,38 @@ second demux id gets its own slot.
 *Note:* this is the step that turns `enable_video_frame_content` on, so it is also
 the point at which the native layer starts doing real work. Watch CPU.
 
-### Step 3 — Getting frames to Swift
+### Step 3 — Getting frames to Swift — **done**
 
-A small FFI surface: poll the slot for a demux id, get a pointer to the RGBA bytes
-plus width, height and sequence. No pointer ever escapes a single call.
+Five C entry points: frame size, take frame, stats, forget one, forget all. ABI 9.
 
-*Done when:* a test drains a slot and observes the sequence advancing, and an
-unchanged slot reports "no new frame" rather than re-delivering the old one.
+Two design points worth keeping:
 
-*Deliberately not:* a Swift callback invoked from the decoder thread. See the
-architecture note.
+- **Not routed through the command roundtrip.** The frames live behind one mutex,
+  there is no actor to reach, and a caller-supplied buffer pointer has no business
+  travelling through a channel to another thread. Reading straight from the sink
+  keeps the pointer valid for exactly the duration of the call.
+- **The caller drives by sequence number, and reads are not consuming.** Asking
+  twice with the same sequence returns the same frame twice. Consuming on read
+  would lose the frame for any caller that missed the first response — a bug that
+  would only ever appear under load.
+
+**The dimensions cross the boundary as out-parameters**, and getting that wrong
+was the first attempt: a byte count does not say whether a frame is 640x360 or
+360x640, and drawing it with the wrong shape stretches somebody's face. Both are
+cleared before anything else, so a zero return cannot leave a caller holding the
+previous frame's shape.
+
+*Done when:* satisfied. 12 tests, each confirmed to fail when the behaviour is
+reverted, including that a short buffer is refused rather than truncated, that a
+null pointer is refused, and that a miss clears the dimensions.
+
+### A hazard worth writing down
+
+`VideoFrame::copy_from_slice(w, h, format, buffer)` takes a `&[u8]` and hands only
+its **pointer** to the native library, which then reads `w * h * 4` bytes with no
+length to check against. A short slice is an out-of-bounds read — not an error,
+not a panic, just a frame full of whatever followed it in memory. It cost an hour
+here, and it is recorded in `vendor/ringrtc/CHANGELOG-VENDOR.md`.
 
 ### Step 4 — Rendering in Swift
 

@@ -166,7 +166,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// separately, so toggling one never has to restate the other.
     /// ABI 8 added `core_cmd_set_microphone_warmup`: RingRTC opens the audio input
     /// only from there, and never transmits otherwise.
-    public static let expectedNativeABI: UInt32 = 8
+    /// ABI 9 added the video frame read commands, so a host can display what it
+    /// receives rather than only counting it.
+    public static let expectedNativeABI: UInt32 = 9
     /// The production Signal SFU. Group calls use it unless a staging build
     /// explicitly overrides it, and it is never inferred from the environment.
     public static let defaultSFUURL = "https://sfu.voip.signal.org"
@@ -1704,6 +1706,106 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         }
     }
 
+    /// One participant's video frame, as display-ready pixels.
+    ///
+    /// Tightly packed RGBA. The conversion is lossy — the native frame buffer is
+    /// chroma subsampled — so these are pixels to draw, not data to compare.
+    public struct GroupCallVideoFrame: Sendable, Equatable {
+        public let demuxId: UInt32
+        public let width: Int
+        public let height: Int
+        /// Advances on every published frame. A caller passes the last one it drew
+        /// to ask for anything newer, so a slow reader misses frames instead of
+        /// building a queue of stale ones.
+        public let sequence: UInt64
+        public let pixels: [UInt8]
+
+        public var pixelCount: Int { pixels.count / 4 }
+    }
+
+    /// Bytes needed for a participant's newest frame, or 0 if they have none.
+    ///
+    /// Called before every read, because a frame's size is not known in advance
+    /// and changes when a participant's resolution does.
+    public func groupCallVideoFrameSize(clientId: UInt32) async -> Int {
+        let token = try? await sessionEpoch.capture()
+        guard let token else { return 0 }
+        // A failure to reach the core is 0 bytes, which the caller reads as "no
+        // frame" -- the same thing a participant who has not started sending looks
+        // like, and both mean there is nothing to draw.
+        return (try? await withCore(token: token, allowStale: true) { sym in
+            Int(sym.groupCallVideoFrameSize(clientId))
+        }) ?? 0
+    }
+
+    /// A participant's newest frame, if it is newer than `sinceSequence`.
+    ///
+    /// Returns `nil` for "nothing newer", which is not an error: a participant who
+    /// has not started sending video is a normal state, and a caller polling one
+    /// must not have to tell it apart from a failure.
+    ///
+    /// The native side refuses a short buffer rather than truncating, and does not
+    /// consume the frame — asking twice with the same sequence returns it twice,
+    /// so a caller that loses a response does not also lose the frame.
+    public func groupCallTakeVideoFrame(
+        clientId: UInt32,
+        sinceSequence: UInt64
+    ) async -> GroupCallVideoFrame? {
+        let token = try? await sessionEpoch.capture()
+        guard let token else { return nil }
+        // Sized first, every time: the dimensions are not known in advance and
+        // change when a participant's resolution does.
+        let needed = await groupCallVideoFrameSize(clientId: clientId)
+        guard needed > 0 else { return nil }
+        let pixels = [UInt8](repeating: 0, count: needed)
+        // The closure is `@Sendable`, so it returns its results rather than
+        // writing into captured `var`s. The bytes themselves are copied back out of
+        // the buffer inside it, which is also the only point at which the core's
+        // pointer is in scope.
+        let read = try? await withCore(token: token, allowStale: true) { sym -> (UInt64, UInt32, UInt32, [UInt8]) in
+            var width: UInt32 = 0
+            var height: UInt32 = 0
+            var out = pixels
+            let sequence = out.withUnsafeMutableBufferPointer { buffer in
+                sym.groupCallTakeVideoFrame(
+                    clientId,
+                    sinceSequence,
+                    &width,
+                    &height,
+                    buffer.baseAddress,
+                    Int64(buffer.count)
+                )
+            }
+            return (sequence, width, height, out)
+        }
+        guard let read, read.0 != 0, read.1 > 0, read.2 > 0 else { return nil }
+        return GroupCallVideoFrame(
+            demuxId: clientId,
+            width: Int(read.1),
+            height: Int(read.2),
+            sequence: read.0,
+            pixels: read.3
+        )
+    }
+
+    /// Drop a participant's frames, on leaving.
+    public func groupCallForgetVideo(clientId: UInt32) async {
+        let token = try? await sessionEpoch.capture()
+        guard let token else { return }
+        _ = try? await withCore(token: token, allowStale: true) { sym in
+            sym.groupCallForgetVideo(clientId)
+        }
+    }
+
+    /// Drop every participant's frames, on a call ending.
+    public func groupCallResetVideo() async {
+        let token = try? await sessionEpoch.capture()
+        guard let token else { return }
+        _ = try? await withCore(token: token, allowStale: true) { sym in
+            sym.groupCallResetVideo()
+        }
+    }
+
     public func groupCallSetVideoMuted(clientId: UInt32, muted: Bool) async throws {
         let token = try sessionEpoch.capture()
         try await withCore(token: token) { sym in
@@ -2451,6 +2553,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let groupCallMemberIdentities: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let groupCallSetAudioMuted: @convention(c) (UInt32, UInt32) -> Int32
         let groupCallSetVideoMuted: @convention(c) (UInt32, UInt32) -> Int32
+        let groupCallVideoFrameSize: @convention(c) (UInt32) -> Int64
+        let groupCallTakeVideoFrame: @convention(c) (UInt32, UInt64, UnsafeMutablePointer<UInt32>?, UnsafeMutablePointer<UInt32>?, UnsafeMutablePointer<UInt8>?, Int64) -> UInt64
+        let groupCallVideoStats: @convention(c) () -> UnsafePointer<CChar>?
+        let groupCallForgetVideo: @convention(c) (UInt32) -> Int32
+        let groupCallResetVideo: @convention(c) () -> Int32
         let setMicrophoneWarmup: @convention(c) (UInt32) -> Int32
         let groupCallSetMembershipProof: @convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupCallSetGroupMembers: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32
@@ -3116,6 +3223,11 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cgcmi = dlsym(handle, "core_cmd_group_call_member_identities"),
               let cgcas = dlsym(handle, "core_cmd_group_call_set_audio_muted"),
               let cgcvsm = dlsym(handle, "core_cmd_group_call_set_video_muted"),
+              let cgcvfs = dlsym(handle, "core_cmd_group_call_video_frame_size"),
+              let cgctvf = dlsym(handle, "core_cmd_group_call_take_video_frame"),
+              let cgcvst = dlsym(handle, "core_cmd_group_call_video_stats"),
+              let cgcfv = dlsym(handle, "core_cmd_group_call_forget_video"),
+              let cgcrv = dlsym(handle, "core_cmd_group_call_reset_video"),
               let cgsmu = dlsym(handle, "core_cmd_set_microphone_warmup"),
               let cgcsm = dlsym(handle, "core_cmd_group_call_set_membership_proof"),
               let cgcs = dlsym(handle, "core_cmd_group_call_set_group_members"),
@@ -3177,6 +3289,14 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             groupCallMemberIdentities: unsafeBitCast(cgcmi, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             groupCallSetAudioMuted: unsafeBitCast(cgcas, to: (@convention(c) (UInt32, UInt32) -> Int32).self),
             groupCallSetVideoMuted: unsafeBitCast(cgcvsm, to: (@convention(c) (UInt32, UInt32) -> Int32).self),
+            groupCallVideoFrameSize: unsafeBitCast(cgcvfs, to: (@convention(c) (UInt32) -> Int64).self),
+            groupCallTakeVideoFrame: unsafeBitCast(
+                cgctvf,
+                to: (@convention(c) (UInt32, UInt64, UnsafeMutablePointer<UInt32>?, UnsafeMutablePointer<UInt32>?, UnsafeMutablePointer<UInt8>?, Int64) -> UInt64).self
+            ),
+            groupCallVideoStats: unsafeBitCast(cgcvst, to: (@convention(c) () -> UnsafePointer<CChar>?).self),
+            groupCallForgetVideo: unsafeBitCast(cgcfv, to: (@convention(c) (UInt32) -> Int32).self),
+            groupCallResetVideo: unsafeBitCast(cgcrv, to: (@convention(c) () -> Int32).self),
             setMicrophoneWarmup: unsafeBitCast(cgsmu, to: (@convention(c) (UInt32) -> Int32).self),
             groupCallSetMembershipProof: unsafeBitCast(cgcsm, to: (@convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupCallSetGroupMembers: unsafeBitCast(cgcs, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32).self),

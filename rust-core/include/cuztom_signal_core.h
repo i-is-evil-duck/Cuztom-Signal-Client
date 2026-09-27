@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CUZTOM_SIGNAL_CORE_ABI_VERSION 8u
+#define CUZTOM_SIGNAL_CORE_ABI_VERSION 9u
 
 #ifdef __cplusplus
 extern "C" {
@@ -179,6 +179,50 @@ int32_t core_cmd_group_call_set_video_muted(uint32_t client_id, uint32_t muted);
  * incoming audio works perfectly. `enabled` is 0 or 1. Returns 0 on success,
  * -1 on error. */
 int32_t core_cmd_set_microphone_warmup(uint32_t enabled);
+
+/* Bytes needed for a group call participant's newest video frame, or 0 if they
+ * have none. Size a buffer with this before reading one: a frame's dimensions
+ * are not known in advance and change when a participant's resolution does. */
+int64_t core_cmd_group_call_video_frame_size(uint32_t client_id);
+
+/* Copy a participant's newest video frame into out_pixels as tightly packed RGBA,
+ * but only if it is newer than since_sequence.
+ *
+ * Returns the sequence number written, or 0 when there is nothing newer. Zero is
+ * never a real sequence -- published sequences start at 1 -- so "no new frame"
+ * and "a frame numbered 0" cannot be confused. Passing the same since_sequence
+ * twice returns the same frame both times: consuming on read would lose the frame
+ * for any caller that missed the first response.
+ *
+ * out_width and out_height receive the frame's dimensions. They are needed: the
+ * byte count alone does not say whether a frame is 640x360 or 360x640, and
+ * drawing it with the wrong shape stretches somebody's face. Both are cleared
+ * before anything else, so a zero return cannot leave a caller reading the
+ * dimensions of a previous frame.
+ *
+ * out_pixels must point to at least out_capacity writable bytes; a short buffer
+ * is refused rather than truncated. The pointer is used only for the duration of
+ * this call and is never retained. demux_id is RingRTC's participant id, not a
+ * service id. */
+uint64_t core_cmd_group_call_take_video_frame(
+    uint32_t client_id,
+    uint64_t since_sequence,
+    uint32_t *out_width,
+    uint32_t *out_height,
+    uint8_t *out_pixels,
+    int64_t out_capacity);
+
+/* Video counters as a JSON string: frames seen, published and dropped, how many
+ * participants have frames, and the last participant whose frame was dropped. So
+ * "video is not arriving" is distinguishable from "video is arriving and being
+ * dropped" -- without which both look like a blank rectangle. */
+const char *core_cmd_group_call_video_stats(void);
+
+/* Drop one participant's frames, on leaving. */
+int32_t core_cmd_group_call_forget_video(uint32_t client_id);
+
+/* Drop every participant's frames, on a call ending. */
+int32_t core_cmd_group_call_reset_video(void);
 
 /* Supply the member identities the SFU needs to attribute call traffic.
  * `user_ids` is `count` concatenated 16-byte service ids, `member_lens` is

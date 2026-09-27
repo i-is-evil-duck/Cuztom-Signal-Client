@@ -3087,7 +3087,7 @@ async fn cmd_fetch_attachment(
 /// 3 adds `core_cmd_http_response`, which lets the host perform the SFU
 /// requests RingRTC raises. Older dylibs lack that symbol, so the loader
 /// rejects them rather than stalling group calls on unanswered SFU requests.
-pub const CORE_ABI_VERSION: u32 = 8;
+pub const CORE_ABI_VERSION: u32 = 9;
 
 #[no_mangle]
 pub extern "C" fn core_abi_version() -> u32 {
@@ -3988,6 +3988,8 @@ pub extern "C" fn core_cmd_group_call_set_membership_proof(
 /// reads that as muted, so this has to be called or the rest of the call is told
 /// this client has its microphone off. `muted` is 0 or 1. Returns 0 on success,
 /// -1 on error.
+///
+
 /// Say whether this device's camera is off in a group call.
 ///
 /// RingRTC carries `video_muted` in the same heartbeat as the audio flag and
@@ -4012,6 +4014,107 @@ pub extern "C" fn core_cmd_set_microphone_warmup(enabled: u32) -> i32 {
 }
 
 #[no_mangle]
+/// Bytes needed for a group call participant's newest video frame, or 0.
+///
+/// Sized before reading, because a frame's dimensions are not known in advance
+/// and change when a participant's resolution does.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_video_frame_size(client_id: u32) -> i64 {
+    call::video_frame_size(client_id) as i64
+}
+
+/// Copy a participant's newest video frame out as RGBA, if it is newer than
+/// `since_sequence`. Returns the sequence written, or 0 for nothing newer.
+///
+/// `out_width` and `out_height` receive the frame's dimensions. They are needed:
+/// the byte count alone does not say whether a frame is 640x360 or 360x640, and
+/// drawing it with the wrong shape stretches somebody's face. Both are cleared
+/// before anything else, so a zero return cannot leave a caller reading the
+/// dimensions of a previous frame.
+///
+/// # Safety
+///
+/// `out_pixels` must point to at least `out_capacity` writable bytes, and
+/// `out_width`/`out_height` to writable `u32`s or null. The pixel buffer is used
+/// only within this call and never retained.
+#[no_mangle]
+pub unsafe extern "C" fn core_cmd_group_call_take_video_frame(
+    client_id: u32,
+    since_sequence: u64,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_pixels: *mut u8,
+    out_capacity: i64,
+) -> u64 {
+    // Every out-parameter is cleared first, so a caller that gets 0 back cannot
+    // read a stale width or height left over from a previous successful call.
+    if !out_width.is_null() {
+        *out_width = 0;
+    }
+    if !out_height.is_null() {
+        *out_height = 0;
+    }
+    if out_pixels.is_null() || out_capacity <= 0 {
+        return 0;
+    }
+    let buffer = std::slice::from_raw_parts_mut(out_pixels, out_capacity as usize);
+    match call::take_video_frame(client_id, since_sequence, buffer) {
+        Some((width, height, sequence)) => {
+            if !out_width.is_null() {
+                *out_width = width;
+            }
+            if !out_height.is_null() {
+                *out_height = height;
+            }
+            sequence
+        }
+        None => 0,
+    }
+}
+
+thread_local! {
+    /// Backing store for the JSON the stats function hands out.
+    ///
+    /// Thread-local because a `static` would need synchronisation to write, and
+    /// because the value only means anything to the thread that just asked for
+    /// it. The caller copies it across the boundary immediately.
+    static VIDEO_STATS: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Video counters as JSON. The returned pointer is owned by the core and is valid
+/// until the next call on this thread.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_video_stats() -> *const std::os::raw::c_char {
+    VIDEO_STATS.with(|cell| {
+        let mut bytes = call::video_stats().into_bytes();
+        // The trailing NUL is what makes this a C string, and it is not part of
+        // the content.
+        bytes.push(0);
+        *cell.borrow_mut() = bytes;
+        cell.borrow().as_ptr() as *const std::os::raw::c_char
+    })
+}
+
+/// Drop one participant's frames, on leaving.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_forget_video(client_id: u32) -> i32 {
+    match call::forget_video(client_id) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
+/// Drop every participant's frames, on a call ending.
+#[no_mangle]
+pub extern "C" fn core_cmd_group_call_reset_video() -> i32 {
+    call::reset_video();
+    0
+}
+
 pub extern "C" fn core_cmd_group_call_set_video_muted(client_id: u32, muted: u32) -> i32 {
     match roundtrip(|reply| Command::GroupCallSetVideoMuted {
         client_id,
@@ -4704,7 +4807,8 @@ mod tests {
         //     a host toggling one must not have to restate the other
         // 8 - core_cmd_set_microphone_warmup, because RingRTC opens the audio
         //     input only from there and never transmits otherwise
-        assert_eq!(core_abi_version(), 8);
+        // 9 - the video frame read commands, so a host can display what it receives
+        assert_eq!(core_abi_version(), 9);
         assert_eq!(core_abi_version(), CORE_ABI_VERSION);
     }
 
