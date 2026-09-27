@@ -205,11 +205,17 @@ pub fn invalidate_session() {
     teardown_group_calls();
 }
 
+/// Tell RingRTC which service id this device is.
+///
+/// Through `ringrtc_user_id` so it cannot drift from the ids used to identify
+/// *other* participants. Those two must be the same form: RingRTC compares them
+/// by strict byte equality, so a mismatch here and there is a call that nobody
+/// can be identified in.
 pub fn set_self_uuid(uuid: &str) {
     let Some(manager) = manager() else { return };
-    let Ok(parsed) = uuid.parse::<uuid::Uuid>() else { return };
+    let Ok(service_id) = crate::sync::parse_service_id(uuid) else { return };
     let Ok(mut manager) = manager.lock() else { return };
-    let _ = manager.set_self_uuid(parsed.as_bytes().to_vec());
+    let _ = manager.set_self_uuid(crate::sync::ringrtc_user_id(&service_id));
 }
 
 pub fn set_local_device_id(device_id: u32) {
@@ -1994,12 +2000,14 @@ pub fn receive_group_call_signal(event: &serde_json::Value) -> bool {
         Some(guard) => guard,
         None => return false,
     };
-    // RingRTC identifies a caller by the raw service-id bytes, matching the
-    // format it is given for 1:1 signaling elsewhere in this file.
-    let sender_uuid = match sender_service {
-        ServiceId::Aci(aci) => aci.service_id_fixed_width_binary().to_vec(),
-        ServiceId::Pni(pni) => pni.service_id_fixed_width_binary().to_vec(),
-    };
+    // RingRTC identifies a caller by the bare 16-byte service id, which is the
+    // same form its member map holds and the same form `set_self_uuid` supplies.
+    //
+    // It is not the 17-byte kind-prefixed `service_id_fixed_width_binary`: a media
+    // key is matched against the member map by strict byte equality, so one extra
+    // byte means every inbound media key is discarded and no incoming audio can
+    // be decrypted. See `sync::ringrtc_user_id`.
+    let sender_uuid = crate::sync::ringrtc_user_id(&sender_service);
     let _ = guard.received_call_message(
         sender_uuid,
         sender_device as DeviceId,
@@ -2326,6 +2334,119 @@ mod tests {
         // A different member id must not collide with it, or one member could be
         // attributed to another.
         assert_ne!(sha256_as_hexstring(b"abd"), sha256_as_hexstring(b"abc"));
+    }
+
+    /// A sender id and a member id must be the same bytes, or media keys are
+    /// silently thrown away.
+    ///
+    /// RingRTC applies an inbound media key only on strict equality
+    /// (`group_call.rs:3757`, `device.user_id == user_id`). The left side is
+    /// built from the group member map, the right from whoever sent the
+    /// signaling message. When the two forms differ by even one byte the key is
+    /// discarded with "the demux ID doesn't make sense", `media_keys_received`
+    /// never becomes true, and no incoming frame can be decrypted — while the
+    /// call joins, connects and reports itself healthy throughout.
+    ///
+    /// `service_id_fixed_width_binary` is a 17-byte kind-prefixed form, so this
+    /// is a one-byte mistake with no symptom other than silence.
+    #[test]
+    fn a_sender_id_and_a_member_id_are_the_same_bytes() {
+        use crate::group_calls::GroupCallIdentity;
+        let master_key = hex::decode(&"3c".repeat(32)).expect("hex");
+        let identity = GroupCallIdentity::from_master_key(&master_key).expect("identity");
+        let aci_text = "8c2f1a94-3b7d-4e65-9f01-2a6d5c8e7b40";
+
+        // The member map's user id, as `set_group_members` builds it.
+        let member = identity.member(aci_text).expect("member");
+        // The sender id, as `received_call_message` builds it.
+        let service_id = crate::sync::parse_service_id(aci_text).expect("service id");
+        let sender = crate::sync::ringrtc_user_id(&service_id);
+
+        assert_eq!(member.user_id.len(), 16, "RingRTC's UserId is the bare service id");
+        assert_eq!(
+            member.user_id.to_vec(),
+            sender,
+            "these are compared for equality; if they differ every media key is discarded"
+        );
+    }
+
+    /// The other half: this device's own id has to be in the same form too.
+    ///
+    /// RingRTC compares a message's creator against this, and a mismatch means a
+    /// client is never recognised as the creator — which is how a ring gets
+    /// refused with "someone else started the call first".
+    #[test]
+    fn our_own_id_is_in_the_same_form_as_everyone_elses() {
+        let aci_text = "8c2f1a94-3b7d-4e65-9f01-2a6d5c8e7b40";
+        let service_id = crate::sync::parse_service_id(aci_text).expect("service id");
+        let ours = crate::sync::ringrtc_user_id(&service_id);
+
+        // Parsing the same UUID as a raw uuid gives the same 16 bytes, which is
+        // what the member map's user id is. The kind-prefixed
+        // `service_id_fixed_width_binary` is 17 bytes and must never be used for
+        // anything RingRTC compares; the architecture test below is what enforces
+        // that, rather than a second copy of the wrong form here.
+        let parsed: uuid::Uuid = aci_text.parse().expect("uuid");
+        assert_eq!(ours, parsed.as_bytes().to_vec());
+        assert_eq!(ours.len(), 16, "RingRTC's UserId is the bare service id");
+    }
+
+    /// There must be exactly one way this codebase turns a service id into a
+    /// RingRTC `UserId`.
+    ///
+    /// Two byte-length bugs have now come out of having two: a member id one byte
+    /// short, and a sender id one byte long. Both were silent, both produced the
+    /// same symptom — a call that joins and reports itself healthy while nobody
+    /// can be identified and no media key is ever applied — and both were
+    /// invisible to every existing test because each conversion was correct in
+    /// isolation and only wrong *relative to the other*.
+    ///
+    /// So this checks the shape of the code rather than the value: the
+    /// kind-prefixed 17-byte form may only be produced in one place, and
+    /// everything that crosses into RingRTC must go through it. That is what
+    /// makes a second divergent conversion a build failure instead of a silence.
+    ///
+    /// It cannot prove a call works. It proves there is only one definition to be
+    /// wrong about.
+    #[test]
+    fn a_service_id_becomes_a_ringrtc_user_id_in_exactly_one_place() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders: Vec<(String, u32)> = Vec::new();
+        for entry in std::fs::read_dir(&root).expect("src is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            // The one legitimate producer, and the test that documents the wrong
+            // form on purpose.
+            if name == "sync.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source is readable");
+            // Only the production half of each file. Test code is allowed to
+            // mention the wrong form, since documenting what not to do is the
+            // point of `sync::ringrtc_user_id`.
+            let production = text
+                .split("#[cfg(test)]")
+                .next()
+                .expect("every file has at least one part");
+            for (index, line) in production.lines().enumerate() {
+                let line = line.trim();
+                if line.starts_with("//") || line.starts_with("///") {
+                    continue;
+                }
+                if line.contains("service_id_fixed_width_binary") {
+                    offenders.push((name.clone(), index as u32 + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these convert a service id outside sync::ringrtc_user_id, where RingRTC's 16-byte \
+             UserId is defined: {offenders:?}. Every id that crosses into RingRTC must come from \
+             that one function, or media keys stop matching the member map and the call is silent."
+        );
     }
 
     #[test]

@@ -53,6 +53,40 @@ pub(crate) fn parse_service_id(value: &str) -> Result<ServiceId, String> {
     })
 }
 
+/// A service id as RingRTC's `UserId`: the bare 16 bytes.
+///
+/// One function for this, because getting it wrong is silent and total.
+///
+/// `service_id_fixed_width_binary()` is a **17**-byte kind-prefixed form — a leading
+/// service-id kind byte followed by the 16 UUID bytes. RingRTC's `UserId` is the
+/// bare 16. Every place a user id crosses into RingRTC has to agree, because
+/// RingRTC matches them by strict byte equality:
+///
+/// - `group_call.rs:3757` — an inbound media key is applied only when
+///   `device.user_id == user_id`, where the left side comes from the member map
+///   (bare 16) and the right from the sender of the signaling message.
+/// - `set_self_uuid` — the id RingRTC compares a message creator against.
+///
+/// With a 17-byte sender id, every inbound media key is discarded with "the demux
+/// ID doesn't make sense", `media_keys_received` never becomes true, and not one
+/// incoming audio frame can be decrypted — while the call itself joins and reports
+/// itself healthy. Nothing anywhere reports a fault.
+///
+/// So: bare 16 bytes, everywhere, via this function.
+pub(crate) fn ringrtc_user_id(service_id: &ServiceId) -> Vec<u8> {
+    let fixed = match service_id {
+        ServiceId::Aci(aci) => aci.service_id_fixed_width_binary(),
+        ServiceId::Pni(pni) => pni.service_id_fixed_width_binary(),
+    };
+    // The kind byte is dropped and nothing else. The layout is 1 + 16; a slice
+    // that is not that shape is a libsignal change, and a wrong length here is
+    // exactly the fault this function exists to prevent, so it is stated rather
+    // than assumed.
+    debug_assert_eq!(fixed.len(), 17, "service id is a kind byte plus 16 bytes");
+    fixed[1..].to_vec()
+}
+
+
 fn display_name(names: &HashMap<String, String>, uuid: &str) -> String {
     if let Some(n) = names.get(uuid) {
         if !n.is_empty() {

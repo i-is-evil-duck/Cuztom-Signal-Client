@@ -423,11 +423,17 @@ impl GroupCallIdentity {
         let uuid = Uuid::parse_str(aci_uuid)
             .map_err(|_| GroupCallError::InvalidServiceId(aci_uuid.to_string()))?;
         let service_id: ServiceId = Aci::from(uuid).into();
-        // `service_id_fixed_width_binary` is a 17-byte kind-prefixed form; the
-        // SFU's user id is the bare 16-byte service id.
-        let fixed = service_id.service_id_fixed_width_binary();
+        // The SFU's user id is the bare 16-byte service id, and it goes through
+        // the one conversion that produces it — the same one the sender of an
+        // inbound signaling message uses. RingRTC compares the two by strict byte
+        // equality, so a second conversion here is a second chance to be wrong
+        // in a way nothing would report.
         let mut user_id = [0u8; 16];
-        user_id.copy_from_slice(&fixed[1..17]);
+        let bare = crate::sync::ringrtc_user_id(&service_id);
+        if bare.len() != user_id.len() {
+            return Err(GroupCallError::Serialization("member service id"));
+        }
+        user_id.copy_from_slice(&bare);
         let ciphertext = self.secret_params.encrypt_service_id(service_id);
         // The whole serialization goes to the SFU, including zkgroup's leading
         // `ReservedByte` (`VersionByte<0>`, serialized as a single `0x00`).

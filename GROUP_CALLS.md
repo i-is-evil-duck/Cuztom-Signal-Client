@@ -97,6 +97,43 @@ The chain that produced silence, all of it now understood:
 6. Silence in both directions, with the call joining perfectly and reporting
    nothing at any point.
 
+### 2.2b The second byte-length bug: sender id
+
+Fixed on 2026-09-26, the same day and the same family as the member id.
+
+The first instrumented run after the member-id fix produced:
+
+```
+sfu peek joined=1 identified=1 resolved=1 demux=[4188081344]
+group devices client=2 n=1 keys=0 unmuted=0 spoke=1 video=0
+```
+
+`resolved=1` and `n=1` — the member map works and a participant exists. `spoke=1`
+— someone is genuinely transmitting. But `keys=0`: **their media key never
+arrived**, and without it not one incoming frame can be decrypted.
+
+`group_call.rs:3757` applies an inbound media key on strict equality:
+
+```rust
+if device.user_id == user_id { … }   // else: "the demux ID doesn't make sense"
+```
+
+The left side is built from the member map. The right came from
+`received_call_message`, which was being handed
+`service_id_fixed_width_binary()` — a **17**-byte kind-prefixed form — where
+RingRTC's `UserId` is the bare 16. One byte, and every inbound media key was
+discarded. Same failure shape as the member id: silent, total, and reported by
+nothing.
+
+`set_self_uuid` was already passing 16 bytes, from a different code path. That
+divergence is what let it go unnoticed, so there is now exactly one conversion,
+`sync::ringrtc_user_id`, and the member map, the sender path and this device's own
+id all go through it. An architecture test enforces that: the kind-prefixed form
+may only be produced in that one function, anywhere in `src/`.
+
+It cannot prove a call works. It proves there is only one definition left to be
+wrong about, which is the part that has now bitten twice.
+
 ### 2.3 Observer surface
 
 | RingRTC event | Signal | This client | Status |
@@ -198,15 +235,19 @@ look finished without being finished.
 Everything else is downstream of this and none of it is worth building until it
 is confirmed.
 
-- [ ] **A1. One live two-party group call, end to end.** Place a group call with a
-      second device in the group, speak, and confirm both sides hear each other.
-      *Done when:* audio is heard in both directions for more than a few seconds.
-- [ ] **A2. Confirm the member map resolves.** `sfu peek … resolved=1` (or 2) and
-      `group devices … n=1 keys=1 unmuted=1`. *Done when:* `resolved` is
-      non-zero, which is the direct evidence the 65-byte fix took effect.
-- [ ] **A3. Then fix whatever A2 exposes.** The participant list becoming
-      non-empty re-enables audio, and the next most likely fault is decryption or
-      forwarding. Instrument before fixing.
+- [ ] **A1. Confirm media keys now arrive.** `group devices … n=1 keys=1`. This
+      is the check that matters now: `resolved=1` and `n=1` are already
+      confirmed, and `keys=0` is what stops audio being decryptable.
+- [ ] **A2. One live two-party group call, end to end.** Place a group call with a
+      second device in the group, speak for several seconds, and confirm both
+      sides hear each other. *Done when:* audio is heard in both directions for
+      more than a few seconds.
+- [ ] **A3. Then fix whatever A1 exposes.** The next most likely fault is frame
+      crypto or forwarding once keys are being accepted. Instrument before fixing.
+- [ ] **A4. `unmuted=0` in the same line.** Their heartbeat has never been
+      attributed either, so it is probably the same sender-id fault — but it
+      should be re-checked rather than assumed, since a participant can be
+      transmitting while its heartbeat is genuinely absent.
 
 ### B. Correctness
 
