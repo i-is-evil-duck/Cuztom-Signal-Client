@@ -318,6 +318,25 @@ pub struct NativePlatform {
 }
 
 impl NativePlatform {
+    /// Open (or close) the microphone without joining a call.
+    ///
+    /// Vendored addition. The audio device module only ever calls `init_recording`
+    /// from here: `update_recording_device` re-initialises only if it was already
+    /// initialised, and `start_recording` refuses with "Cannot start recording
+    /// without an input stream -- did you forget init_recording?" otherwise. So a
+    /// host that selects a recording device but never warms the microphone ends up
+    /// with a track that carries nothing, and the only symptom is that nobody can
+    /// hear it — incoming audio is unaffected, because playout initialises
+    /// separately.
+    ///
+    /// Signal's own clients call the equivalent (`setMicrophoneWarmupEnabled`)
+    /// before connecting a call, which is where this belongs.
+    pub fn set_microphone_warmup(&mut self, enabled: bool) -> Result<()> {
+        self.peer_connection_factory.set_audio_warmup(enabled)
+    }
+}
+
+impl NativePlatform {
     pub fn new(
         peer_connection_factory: PeerConnectionFactory,
 

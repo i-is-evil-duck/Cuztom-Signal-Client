@@ -164,7 +164,9 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// the rest of the call believes it is silent.
     /// ABI 7 added `core_cmd_group_call_set_video_muted`, for the same reason and
     /// separately, so toggling one never has to restate the other.
-    public static let expectedNativeABI: UInt32 = 7
+    /// ABI 8 added `core_cmd_set_microphone_warmup`: RingRTC opens the audio input
+    /// only from there, and never transmits otherwise.
+    public static let expectedNativeABI: UInt32 = 8
     /// The production Signal SFU. Group calls use it unless a staging build
     /// explicitly overrides it, and it is never inferred from the environment.
     public static let defaultSFUURL = "https://sfu.voip.signal.org"
@@ -1579,6 +1581,24 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
     /// Separate from the audio flag on purpose: the two are independent controls
     /// and combining them would force a host changing one to also restate the
     /// other correctly.
+    /// Open or close the microphone, independently of any call.
+    ///
+    /// Required, and not the same thing as unmuting. RingRTC's audio device module
+    /// opens its input only from here and only ever once — so a client that
+    /// selects a microphone but never warms it has an outgoing audio track
+    /// carrying nothing at all. The symptom is deceptive: incoming audio is
+    /// untouched, so such a client receives perfectly and transmits silence while
+    /// reporting itself joined, connected, unmuted, and holding a sent media key.
+    public func setMicrophoneWarmup(_ enabled: Bool) async throws {
+        let token = try sessionEpoch.capture()
+        try await withCore(token: token) { sym in
+            let rc = sym.setMicrophoneWarmup(enabled ? 1 : 0)
+            guard rc == 0 else {
+                throw SignalError.unsupported("could not open the microphone: \(Self.lastError(sym))")
+            }
+        }
+    }
+
     public func groupCallSetVideoMuted(clientId: UInt32, muted: Bool) async throws {
         let token = try sessionEpoch.capture()
         try await withCore(token: token) { sym in
@@ -2326,6 +2346,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let groupCallMemberIdentities: @convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
         let groupCallSetAudioMuted: @convention(c) (UInt32, UInt32) -> Int32
         let groupCallSetVideoMuted: @convention(c) (UInt32, UInt32) -> Int32
+        let setMicrophoneWarmup: @convention(c) (UInt32) -> Int32
         let groupCallSetMembershipProof: @convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32
         let groupCallSetGroupMembers: @convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32
         let groupCallStart: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64
@@ -2990,6 +3011,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
               let cgcmi = dlsym(handle, "core_cmd_group_call_member_identities"),
               let cgcas = dlsym(handle, "core_cmd_group_call_set_audio_muted"),
               let cgcvsm = dlsym(handle, "core_cmd_group_call_set_video_muted"),
+              let cgsmu = dlsym(handle, "core_cmd_set_microphone_warmup"),
               let cgcsm = dlsym(handle, "core_cmd_group_call_set_membership_proof"),
               let cgcs = dlsym(handle, "core_cmd_group_call_set_group_members"),
               let cgcs2 = dlsym(handle, "core_cmd_group_call_start"),
@@ -3050,6 +3072,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             groupCallMemberIdentities: unsafeBitCast(cgcmi, to: (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?).self),
             groupCallSetAudioMuted: unsafeBitCast(cgcas, to: (@convention(c) (UInt32, UInt32) -> Int32).self),
             groupCallSetVideoMuted: unsafeBitCast(cgcvsm, to: (@convention(c) (UInt32, UInt32) -> Int32).self),
+            setMicrophoneWarmup: unsafeBitCast(cgsmu, to: (@convention(c) (UInt32) -> Int32).self),
             groupCallSetMembershipProof: unsafeBitCast(cgcsm, to: (@convention(c) (UInt32, UnsafePointer<UInt8>?, Int) -> Int32).self),
             groupCallSetGroupMembers: unsafeBitCast(cgcs, to: (@convention(c) (UInt32, UInt32, UnsafePointer<UInt8>?, UnsafePointer<UInt32>?, UnsafePointer<UInt8>?, UInt32) -> Int32).self),
             groupCallStart: unsafeBitCast(cgcs2, to: (@convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UInt64).self),

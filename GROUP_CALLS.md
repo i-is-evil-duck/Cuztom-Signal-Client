@@ -16,6 +16,24 @@ not implemented here.
 
 ---
 
+## 0. Status
+
+**Two-party group call audio works in the receive direction, confirmed against a
+real second client on 2026-09-26.** A member of the group is heard, clearly, in
+this client, during a live call.
+
+That was the last of three byte-length bugs in the same family, each silent, each
+total, and each reported by nothing:
+
+| # | Fault | Effect |
+|---|---|---|
+| 1 | Member id 64 bytes where the SFU hashes 65 | No participant resolved; device list empty; RingRTC disabled audio outright. Total silence. |
+| 2 | Sender id 17 bytes where RingRTC's `UserId` is 16 | Every inbound media key discarded; incoming audio undecryptable. Silence inbound. |
+| 3 | Microphone never opened — `set_audio_warmup` never called | Outgoing track carried nothing. Silence outbound. |
+
+**The transmit direction was still broken at the time of writing** and is fixed but
+unconfirmed; see §4A.
+
 ## 1. Where this actually stands
 
 The group call joins Signal's production SFU. This is verified end to end and has
@@ -97,7 +115,7 @@ The chain that produced silence, all of it now understood:
 6. Silence in both directions, with the call joining perfectly and reporting
    nothing at any point.
 
-### 2.2b The second byte-length bug: sender id
+### 2.2b The second bug: the sender id
 
 Fixed on 2026-09-26, the same day and the same family as the member id.
 
@@ -133,6 +151,59 @@ may only be produced in that one function, anywhere in `src/`.
 
 It cannot prove a call works. It proves there is only one definition left to be
 wrong about, which is the part that has now bitten twice.
+
+### 2.2c The third bug: the microphone was never opened
+
+Not a byte-length bug, but found the same way: by asking what the log could still
+not explain once the first two were fixed.
+
+With `keys=1` and audio audible inbound, the remaining symptom was that nothing we
+sent could be heard. Every outward signal said otherwise — `state: Connected`,
+`audio muted=false`, a media key sent to the right recipient, heartbeats
+broadcast — and none of them is capable of detecting this, because none of them
+touches the audio device.
+
+`audio_device_module.rs` never opens the input on its own. `init_recording` is
+called from `set_audio_warmup` and from `update_recording_device` — and the latter
+only does so `if was_initialized`, which it cannot be the first time:
+
+```rust
+let was_initialized = self.input_stream.is_some();
+…
+if was_initialized { self.init_recording()?; }
+```
+
+So the first initialisation has to come from `set_audio_warmup`, which this client
+never called. `start_recording` then refuses outright:
+
+```
+Cannot start recording without an input stream -- did you forget init_recording?
+```
+
+and the outgoing track carries nothing. **Incoming audio is initialised on a
+separate path, so the client received perfectly and transmitted silence** — which is
+exactly what was observed, and exactly why it was so confusing: one direction
+working is strong evidence the media stack is fine, and it is.
+
+RingRTC logs a warning through a logger this build does not surface, so the failure
+was invisible.
+
+Signal's own clients call the equivalent (`RingRTC.setMicrophoneWarmupEnabled`)
+before connecting a call. `PeerConnectionFactory::set_audio_warmup` is already
+public but unreachable — the factory is a private field of `NativePlatform` — so
+this needs a three-line vendor patch, documented in
+`vendor/ringrtc/CHANGELOG-VENDOR.md` §2. There is no host-side workaround: the
+device module is reachable only through the factory, and the one function that
+opens the input is called from nowhere else in the crate.
+
+The microphone is now opened on both call paths and closed on every teardown path,
+because a microphone left open after a call ends is a privacy problem rather than a
+resource one.
+
+Note this is **not** the same as unmuting, and neither substitutes for the other.
+The mute flag is what the rest of the call is told; the warmup is whether the
+device is open. A client can be unmuted and transmitting nothing, and the reverse
+is equally possible.
 
 ### 2.3 Observer surface
 
@@ -235,19 +306,19 @@ look finished without being finished.
 Everything else is downstream of this and none of it is worth building until it
 is confirmed.
 
-- [ ] **A1. Confirm media keys now arrive.** `group devices … n=1 keys=1`. This
-      is the check that matters now: `resolved=1` and `n=1` are already
-      confirmed, and `keys=0` is what stops audio being decryptable.
-- [ ] **A2. One live two-party group call, end to end.** Place a group call with a
-      second device in the group, speak for several seconds, and confirm both
-      sides hear each other. *Done when:* audio is heard in both directions for
-      more than a few seconds.
-- [ ] **A3. Then fix whatever A1 exposes.** The next most likely fault is frame
-      crypto or forwarding once keys are being accepted. Instrument before fixing.
-- [ ] **A4. `unmuted=0` in the same line.** Their heartbeat has never been
-      attributed either, so it is probably the same sender-id fault — but it
-      should be re-checked rather than assumed, since a participant can be
-      transmitting while its heartbeat is genuinely absent.
+- [x] **A1. Media keys arrive.** `group devices … n=1 keys=1`. Confirmed
+      2026-09-26. This unblocked the receive direction, and audio is heard.
+- [x] **A2. Inbound audio is heard.** Confirmed against a real second client.
+- [ ] **A3. Confirm the microphone fix — the last leg.** `[core] microphone warmup
+      enabled=true`, then speak and have the other side confirm. *Done when:*
+      they say they can hear us. This is the only remaining audio fault known.
+- [ ] **A4. Both directions in one call.** Once A3 passes, confirm a single call
+      carries audio both ways for more than a few seconds, with no dropped frames
+      at either end.
+- [ ] **A5. `unmuted` flickers between 0 and 1** in `group devices` even while
+      audio flows. Their heartbeat is arriving but its mute field is not yet
+      understood. Not blocking audio, and not yet explained — instrument before
+      theorising.
 
 ### B. Correctness
 

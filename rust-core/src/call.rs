@@ -205,6 +205,35 @@ pub fn invalidate_session() {
     teardown_group_calls();
 }
 
+/// Open or close the microphone, without joining a call.
+///
+/// RingRTC's audio device module never opens the input on its own.
+/// `update_recording_device` only re-initialises when it was *already* initialised,
+/// and the one place that does it for the first time is `set_audio_warmup`. A host
+/// that selects a recording device and never warms the microphone therefore ends up
+/// with a live outgoing audio track carrying nothing at all.
+///
+/// The only symptom is that nobody can hear you. Incoming audio is untouched,
+/// because playout initialises on its own path — so a client in this state
+/// receives perfectly and transmits silence, and every outward signal looks
+/// healthy: joined, ICE connected, media key sent, heartbeat reporting unmuted.
+///
+/// Signal's own clients call the equivalent before connecting a call, which is
+/// where this belongs. RingRTC logs a warning if it fails and this build does not
+/// surface its logger, so a failure is reported here instead of being lost.
+pub fn set_microphone_warmup(enabled: bool) -> Result<(), String> {
+    with_manager(|m| {
+        let mut platform = m
+            .platform()
+            .map_err(|e| format!("microphone warmup: {e}"))?;
+        platform
+            .set_microphone_warmup(enabled)
+            .map_err(|e| format!("microphone warmup: {e:?}"))
+    })?;
+    eprintln!("[core] microphone warmup enabled={enabled}");
+    Ok(())
+}
+
 /// Tell RingRTC which service id this device is.
 ///
 /// Through `ringrtc_user_id` so it cannot drift from the ids used to identify

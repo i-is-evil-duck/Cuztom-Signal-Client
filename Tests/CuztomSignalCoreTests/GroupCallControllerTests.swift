@@ -114,6 +114,10 @@ struct GroupCallControllerTests {
             steps.append("setAudioMuted(\(muted))")
         }
 
+        func setMicrophoneWarmup(_ enabled: Bool) async throws {
+            steps.append("microphoneWarmup(\(enabled))")
+        }
+
         func groupCallSetVideoMuted(clientId: UInt32, muted: Bool) async throws {
             steps.append("setVideoMuted(\(muted))")
             if failVideoMute { throw FakeBridge.videoMuteRefused }
@@ -1581,6 +1585,54 @@ struct GroupCallControllerTests {
         #expect(asked.value == 1, "switching it off asks nothing")
         #expect(bridge.steps.contains("setVideoMuted(true)"))
         #expect(controller.current?.isCameraOff == true)
+    }
+
+    /// The microphone has to be opened, or the call receives perfectly and
+    /// transmits silence.
+    ///
+    /// RingRTC opens its audio input only from the warmup call, and only ever
+    /// once — its `update_recording_device` re-initialises only if it already was.
+    /// Unmuting is a different thing entirely: it is what the rest of the call is
+    /// told, and it is true whether or not the device is open. So a client can be
+    /// joined, ICE-connected, unmuted, and holding a sent media key while
+    /// capturing nothing at all, and every one of those signals says the call is
+    /// working.
+    ///
+    /// This is the whole of the remaining "they cannot hear me".
+    @Test @MainActor func aCallOpensTheMicrophoneAndClosesItAgain() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        #expect(
+            bridge.steps.contains("microphoneWarmup(true)"),
+            "a call that is about to transmit has to open the microphone"
+        )
+
+        await controller.end()
+        await settle(controller)
+        #expect(
+            bridge.steps.contains("microphoneWarmup(false)"),
+            "a microphone left open after the call is a privacy problem, not a resource one"
+        )
+    }
+
+    /// Answering has to open it too, or an answered call is receive-only.
+    @Test @MainActor func answeringAlsoOpensTheMicrophone() async throws {
+        var roster = FakeRoster()
+        roster.knownGroupIdHex = Self.groupIdHex
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge, roster: roster)
+        _ = await controller.answer(
+            GroupCallController.GroupCallRing(
+                groupIdHex: Self.groupIdHex,
+                ringId: 1,
+                senderIdHex: nil,
+                title: nil
+            )
+        )
+        await settle(controller)
+        #expect(bridge.steps.contains("microphoneWarmup(true)"))
     }
 
     // MARK: - Inbound

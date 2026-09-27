@@ -148,6 +148,10 @@ public protocol GroupCallNativeControlling: AnyObject, Sendable {
     /// Say whether this device's camera is off. Separate from the audio flag so
     /// toggling one never has to restate the other.
     func groupCallSetVideoMuted(clientId: UInt32, muted: Bool) async throws
+
+    /// Open or close the microphone. Not the same thing as unmuting, and not a
+    /// substitute for it: this is the audio device, that is what the call is told.
+    func setMicrophoneWarmup(_ enabled: Bool) async throws
     func groupCallSetGroupMembers(
         clientId: UInt32,
         members: [(userId: [UInt8], memberId: [UInt8])]
@@ -482,6 +486,10 @@ public final class GroupCallController: ObservableObject {
         // Before the join, so the very first heartbeat already says the
         // microphone is live. RingRTC's default is muted and nothing else in this
         // path would ever correct it.
+        // The microphone has to be opened before anything can be transmitted.
+        // This is the audio device, not the mute flag: the call below is told the
+        // microphone is unmuted either way, and both are true at once.
+        await openMicrophone()
         await setAudioMuted(false, clientId: handle.clientId)
         // The camera is stated too, even though leaving it unset happens to read
         // as off. Relying on an unset-means-muted default is the same assumption
@@ -597,6 +605,7 @@ public final class GroupCallController: ObservableObject {
     public func end() async {
         guard let bridge, let session else {
             current = nil
+            await closeMicrophone()
             return
         }
         do {
@@ -608,6 +617,7 @@ public final class GroupCallController: ObservableObject {
         }
         self.session = nil
         current = nil
+        await closeMicrophone()
     }
 
     private func leaveActiveCall() async {
@@ -616,6 +626,9 @@ public final class GroupCallController: ObservableObject {
         }
         self.session = nil
         current = nil
+        // The user moved to a different call, so this one is over and its
+        // microphone is not wanted open. The new call opens it again.
+        await closeMicrophone()
     }
 
     // MARK: - Native callbacks
@@ -1141,6 +1154,45 @@ public final class GroupCallController: ObservableObject {
         }
     }
 
+    /// Open the microphone for a call that is about to transmit.
+    ///
+    /// Not the same thing as unmuting, and neither substitutes for the other. The
+    /// mute flag is what the rest of the call is told; this is whether the audio
+    /// device is actually open. RingRTC opens its input only from here, and only
+    /// ever once — its `update_recording_device` re-initialises only if it was
+    /// already initialised — so a client that never does this selects a
+    /// microphone and then transmits nothing.
+    ///
+    /// The failure mode is why this is not optional. Incoming audio is
+    /// initialised separately, so such a client **receives perfectly and
+    /// transmits silence** while reporting itself joined, ICE-connected, unmuted,
+    /// and holding a media key it has already sent. Every outward signal says the
+    /// call is working.
+    ///
+    /// Reported rather than fatal: a call that cannot transmit is still a call, and
+    /// the person on it can still hear everyone else.
+    private func openMicrophone() async {
+        guard let bridge else { return }
+        do {
+            try await bridge.setMicrophoneWarmup(true)
+        } catch {
+            Log.error("[group-call] could not open the microphone: \(Self.describe(error))")
+        }
+    }
+
+    /// Close the microphone once no call is using it.
+    ///
+    /// A microphone left open after the call ends is a privacy problem rather than
+    /// a resource one, so it is closed wherever a call is torn down.
+    private func closeMicrophone() async {
+        guard let bridge else { return }
+        do {
+            try await bridge.setMicrophoneWarmup(false)
+        } catch {
+            Log.error("[group-call] could not close the microphone: \(Self.describe(error))")
+        }
+    }
+
     /// State this device's camera as off, before the join.
     ///
     /// A helper rather than an inline call because the point is that it happens
@@ -1257,6 +1309,10 @@ public final class GroupCallController: ObservableObject {
             // Before the join, so the very first heartbeat already says the
         // microphone is live. RingRTC's default is muted and nothing else in this
         // path would ever correct it.
+        // The microphone has to be opened before anything can be transmitted.
+        // This is the audio device, not the mute flag: the call below is told the
+        // microphone is unmuted either way, and both are true at once.
+        await openMicrophone()
         await setAudioMuted(false, clientId: handle.clientId)
         // The camera is stated too, even though leaving it unset happens to read
         // as off. Relying on an unset-means-muted default is the same assumption

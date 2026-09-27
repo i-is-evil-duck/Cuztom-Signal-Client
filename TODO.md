@@ -18,8 +18,13 @@ storage work. `CALLS_PLAN.md` remains the chronological record of the call path.
 - [x] The cause of the silence found and fixed: a 64-byte member id where the SFU
       hashes 65, so no participant could resolve and RingRTC disabled audio
       outright. Pinned by a regression test.
-- [ ] **One live two-party call to confirm the fix.** Nothing else is worth
-      building until `sfu peek … resolved=1` and audio is heard both ways.
+- [x] **Group call audio inbound — working.** Confirmed against a real second
+      client on 2026-09-26, after fixing two silent byte-length bugs: a member id
+      one byte short, and a sender id one byte long.
+- [ ] **Group call audio outbound — fix is in, unconfirmed.** RingRTC opens the
+      audio input only from `set_audio_warmup`, which was never called, so the
+      outgoing track carried nothing while incoming audio worked perfectly.
+- [ ] **One live two-party call to confirm both directions at once.**
 - [ ] Announce the call on join/leave with its `eraId` — the largest functional
       gap, since this client only ever receives rings.
 - [ ] Mirror the OS microphone mute into live calls.

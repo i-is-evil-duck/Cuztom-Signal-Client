@@ -59,3 +59,44 @@ asserts that anyway.
 If `ring_group` becomes unnecessary, the host-side fallback in
 `src/call.rs::ring_group` is the only thing to remove; it exists solely to call
 this.
+
+## 2. `src/rust/src/native.rs`
+
+One method added to `impl NativePlatform`.
+
+### `set_microphone_warmup`
+
+```rust
+pub fn set_microphone_warmup(&mut self, enabled: bool) -> Result<()>
+```
+
+Forwards to `PeerConnectionFactory::set_audio_warmup`, which is already public but
+unreachable: the factory is a private field and `CallManager` exposes no path to
+it beyond the platform.
+
+**Why it is needed.** `audio_device_module.rs` only ever calls `init_recording`
+from `set_audio_warmup` and from `update_recording_device` — and the latter does so
+only `if was_initialized`, which it cannot be on the first call. `start_recording`
+then fails outright:
+
+```
+Cannot start recording without an input stream -- did you forget init_recording?
+```
+
+So a host that selects a recording device but never warms the microphone ends up
+with a live outgoing audio track carrying nothing. The symptom is deceptive rather
+than loud: incoming audio initialises on a separate path, so such a client
+**receives perfectly and transmits silence** while reporting itself joined,
+ICE-connected, unmuted, and holding a media key it has already sent. RingRTC logs a
+warning, through a logger this build does not surface.
+
+**Why it is a vendor change and not a workaround.** There is no host-side
+alternative. The device module is reached only through the factory, the factory is
+private to the platform, and the one function that opens the input is not called
+from anywhere else in the crate. Signal's own clients call the equivalent
+(`setMicrophoneWarmupEnabled`) before connecting a call, so this restores intended
+behaviour rather than adding any.
+
+**Re-applying after a re-vendor.** Add the method verbatim to `impl NativePlatform`
+in `src/rust/src/native.rs`. It has no dependencies beyond the existing
+`PeerConnectionFactory` import.

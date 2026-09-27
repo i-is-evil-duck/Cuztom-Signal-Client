@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CUZTOM_SIGNAL_CORE_ABI_VERSION 7u
+#define CUZTOM_SIGNAL_CORE_ABI_VERSION 8u
 
 #ifdef __cplusplus
 extern "C" {
@@ -170,6 +170,15 @@ int32_t core_cmd_group_call_set_audio_muted(uint32_t client_id, uint32_t muted);
  * RingRTC carries video_muted in the same heartbeat as the audio flag and reads
  * an unset one as muted. `muted` is 0 or 1. Returns 0 on success, -1 on error. */
 int32_t core_cmd_group_call_set_video_muted(uint32_t client_id, uint32_t muted);
+
+/* Open or close the microphone, independently of any call.
+ *
+ * RingRTC's audio device module opens its input only from here, and only ever
+ * once: update_recording_device re-initialises only if it already was. A host
+ * that never calls this has an outgoing audio track carrying nothing, while
+ * incoming audio works perfectly. `enabled` is 0 or 1. Returns 0 on success,
+ * -1 on error. */
+int32_t core_cmd_set_microphone_warmup(uint32_t enabled);
 
 /* Supply the member identities the SFU needs to attribute call traffic.
  * `user_ids` is `count` concatenated 16-byte service ids, `member_lens` is

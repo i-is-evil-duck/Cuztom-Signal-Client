@@ -47,13 +47,14 @@ virtual audio device.
 - Group calls that join Signal's production SFU: the ZK membership proof is
   fetched, presented and redeemed natively, ICE connects, and media keys and
   heartbeats flow in both directions. Group ringing is composed by RingRTC.
-  Two-party audio was silent until 2026-09-26, when the cause was found to be a
-  64-byte member id where the SFU hashes 65; the fix is in and awaiting one live
-  call to confirm it. See `GROUP_CALLS.md`.
+  **Two-party group call audio works inbound**, confirmed against a real second
+  client on 2026-09-26; the transmit direction was fixed the same day and is
+  awaiting confirmation. See `GROUP_CALLS.md`.
 
 ### Not yet complete
 
-- Two-party group call audio, pending confirmation of the member-id fix above.
+- Two-party group call audio **outbound**, pending confirmation of the
+  microphone fix. Inbound audio is confirmed working.
 - The call never announces itself: unlike Signal, this client does not send a
   group-call update carrying the call's `eraId` on join, so a member who is not
   ringing has no way to learn the call exists.
