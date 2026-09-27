@@ -1592,6 +1592,7 @@ struct IncomingGroupCallBanner: View {
 }
 
 struct GroupCallBanner: View {
+    @Environment(ChatViewModel.self) private var vm
     let call: GroupCallState
     let onEnd: () -> Void
     var onSetMuted: (Bool) -> Void = { _ in }
@@ -1633,63 +1634,133 @@ struct GroupCallBanner: View {
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            if call.phase == .connecting {
-                ProgressView().controlSize(.small)
-            }
-            VStack(alignment: .leading, spacing: 1) {
-                Text(call.title.isEmpty ? "Group call" : call.title)
-                    .font(.callout.weight(.medium))
-                Text(statusText)
-                    .font(.caption)
-                    .foregroundStyle(statusColor)
-                    .lineLimit(2)
-            }
-            Spacer()
-            if isLive {
-                // The icons read as state rather than as an action, and the help
-                // says which, because a slashed microphone on a call where the
-                // microphone is live is a contradiction the user has to be able
-                // to resolve.
-                Button {
-                    onSetMuted(!call.isMuted)
-                } label: {
-                    Image(systemName: call.isMuted ? "mic.slash.fill" : "mic.fill")
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                if call.phase == .connecting {
+                    ProgressView().controlSize(.small)
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(call.isMuted ? Color.red : Color.primary)
-                .help(call.isMuted ? "Unmute microphone" : "Mute microphone")
-                .accessibilityLabel(call.isMuted ? "Unmute microphone" : "Mute microphone")
-                .accessibilityIdentifier("group-call-mic")
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(call.title.isEmpty ? "Group call" : call.title)
+                        .font(.callout.weight(.medium))
+                    Text(statusText)
+                        .font(.caption)
+                        .foregroundStyle(statusColor)
+                        .lineLimit(2)
+                }
+                Spacer()
+                if isLive {
+                    // The icons read as state rather than as an action, and the help
+                    // says which, because a slashed microphone on a call where the
+                    // microphone is live is a contradiction the user has to be able
+                    // to resolve.
+                    Button {
+                        onSetMuted(!call.isMuted)
+                    } label: {
+                        Image(systemName: call.isMuted ? "mic.slash.fill" : "mic.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(call.isMuted ? Color.red : Color.primary)
+                    .help(call.isMuted ? "Unmute microphone" : "Mute microphone")
+                    .accessibilityLabel(call.isMuted ? "Unmute microphone" : "Mute microphone")
+                    .accessibilityIdentifier("group-call-mic")
 
-                Button {
-                    onSetCameraOff(!call.isCameraOff)
-                } label: {
-                    Image(systemName: call.isCameraOff ? "video.slash.fill" : "video.fill")
+                    Button {
+                        onSetCameraOff(!call.isCameraOff)
+                    } label: {
+                        Image(systemName: call.isCameraOff ? "video.slash.fill" : "video.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(call.isCameraOff ? Color.secondary : Color.primary)
+                    .help(call.isCameraOff ? "Turn camera on" : "Turn camera off")
+                    .accessibilityLabel(call.isCameraOff ? "Turn camera on" : "Turn camera off")
+                    .accessibilityIdentifier("group-call-camera")
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(call.isCameraOff ? Color.secondary : Color.primary)
-                .help(call.isCameraOff ? "Turn camera on" : "Turn camera off")
-                .accessibilityLabel(call.isCameraOff ? "Turn camera on" : "Turn camera off")
-                .accessibilityIdentifier("group-call-camera")
+                if call.phase == .connected || call.phase == .failed {
+                    Button("End", action: onEnd)
+                        .buttonStyle(.plain)
+                } else if call.phase == .ended {
+                    // An ended call stays on screen with its reason, so a call that
+                    // failed is not the same as a call the user never made.
+                    Button("Dismiss", action: onEnd)
+                        .buttonStyle(.plain)
+                } else {
+                    Button("End", action: onEnd)
+                        .buttonStyle(.plain)
+                }
             }
-            if call.phase == .connected || call.phase == .failed {
-                Button("End", action: onEnd)
-                    .buttonStyle(.plain)
-            } else if call.phase == .ended {
-                // An ended call stays on screen with its reason, so a call that
-                // failed is not the same as a call the user never made.
-                Button("Dismiss", action: onEnd)
-                    .buttonStyle(.plain)
-            } else {
-                Button("End", action: onEnd)
-                    .buttonStyle(.plain)
+            if isLive, !call.participants.isEmpty {
+                participantList
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color.gray.opacity(0.12))
         .accessibilityIdentifier("group-call-banner")
+    }
+
+    /// Who else is in the call.
+    ///
+    /// Each person is shown with what is actually known about them rather than
+    /// with a guess: a muted state that has not been reported yet says nothing,
+    /// and a participant whose media key has not arrived cannot be heard, which is
+    /// worth surfacing because it is otherwise invisible.
+    private var participantList: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(call.participants) { participant in
+                HStack(spacing: 5) {
+                    Image(systemName: participant.isAudioMuted == true ? "mic.slash.fill" : "mic.fill")
+                        .font(.caption2)
+                        .foregroundStyle(participant.isAudioMuted == true ? Color.secondary : Color.green)
+                        .help(audioHelp(for: participant))
+                    Text(displayName(for: participant))
+                        .font(.caption)
+                    if participant.isSharingScreen == true || participant.isPresenting == true {
+                        // Presenting and screen sharing are distinct things and the
+                        // SFU reports them separately, so they are not merged.
+                        Image(systemName: "rectangle.on.rectangle")
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                            .help(participant.isPresenting == true ? "Presenting" : "Sharing their screen")
+                    } else if participant.isForwardingVideo == true, participant.videoHeight > 0 {
+                        Image(systemName: "video.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                            .help("Sending video")
+                    }
+                    Spacer()
+                }
+            }
+        }
+        .accessibilityIdentifier("group-call-participants")
+    }
+
+    private func audioHelp(for participant: RustCoreService.GroupCallParticipant) -> String {
+        if !participant.hasMediaKeys {
+            // Not a claim that they are silent: without their key nothing they
+            // send can be decrypted, so they are inaudible either way.
+            return "Cannot be heard yet: their media key has not arrived"
+        }
+        switch participant.isAudioMuted {
+        case .some(true): return "Muted"
+        case .some(false): return participant.hasSpoken ? "Speaking or has spoken" : "Unmuted"
+        case .none: return "Microphone state not reported yet"
+        }
+    }
+
+    private func displayName(for participant: RustCoreService.GroupCallParticipant) -> String {
+        guard let serviceId = UUID(uuidString: Self.uuidText(fromHex: participant.serviceIdHex))
+        else { return "Unknown participant" }
+        return vm.displayName(for: serviceId.uuidString, in: call.masterKeyHex)
+    }
+
+    /// The native side reports a service id as 32 hex characters with no dashes.
+    static func uuidText(fromHex hex: String) -> String {
+        guard hex.count == 32 else { return hex }
+        let chars = Array(hex)
+        func slice(_ range: Range<Int>) -> String { String(chars[range]) }
+        return [
+            slice(0..<8), slice(8..<12), slice(12..<16), slice(16..<20), slice(20..<32)
+        ].joined(separator: "-")
     }
 
     private var statusColor: Color {

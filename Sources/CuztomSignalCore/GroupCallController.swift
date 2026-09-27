@@ -42,6 +42,13 @@ public struct GroupCallState: Sendable, Equatable, Identifiable {
     /// for video, and a control implying otherwise would be claiming a capability
     /// the call is not using.
     public var isCameraOff: Bool
+    /// Everyone else currently in the call.
+    ///
+    /// Populated from RingRTC's remote device state, so a participant appears only
+    /// once its opaque id has been resolved against the member map. An empty list
+    /// while the call reports other people are present therefore means the member
+    /// map has not resolved — not that the call is empty.
+    public var participants: [RustCoreService.GroupCallParticipant] = []
     /// Whether audio from another participant is arriving.
     ///
     /// `nil` until the first audio level report arrives, which is different from
@@ -791,25 +798,37 @@ public final class GroupCallController: ObservableObject {
     ///
     /// A call where everyone is simply quiet is the third case, not the second.
     private func noteRemoteDevices(_ update: RustCoreService.GroupCallUpdate) {
-        guard var call = current,
-              let deviceCount = update.deviceCount,
-              let withKeys = update.devicesWithMediaKeys,
-              let spoke = update.devicesThatSpoke
-        else { return }
-        let receiving: Bool?
-        if spoke > 0 {
-            receiving = true
-        } else if deviceCount > 0 && withKeys == 0 {
-            // Others are here and none of them has sent a key, so nothing they
-            // say could be turned back into sound. That is a definite fault, not
-            // an absence of one.
-            receiving = false
-        } else {
-            receiving = nil
+        guard var call = current else { return }
+        // Both the roster and the audio claim come from this one update, and both
+        // are applied together. Deriving them separately would let the list of
+        // people shown and the statement about hearing them disagree, which is
+        // exactly the kind of quiet inconsistency this has been prone to.
+        var changed = false
+        if call.participants != update.participants {
+            call.participants = update.participants
+            changed = true
         }
-        guard call.isReceivingAudio != receiving else { return }
-        call.isReceivingAudio = receiving
-        current = call
+        if let deviceCount = update.deviceCount,
+           let withKeys = update.devicesWithMediaKeys,
+           let spoke = update.devicesThatSpoke
+        {
+            let receiving: Bool?
+            if spoke > 0 {
+                receiving = true
+            } else if deviceCount > 0 && withKeys == 0 {
+                // Others are here and none of them has sent a key, so nothing they
+                // say could be turned back into sound. That is a definite fault,
+                // not an absence of one.
+                receiving = false
+            } else {
+                receiving = nil
+            }
+            if call.isReceivingAudio != receiving {
+                call.isReceivingAudio = receiving
+                changed = true
+            }
+        }
+        if changed { current = call }
     }
 
     /// Present a membership proof.

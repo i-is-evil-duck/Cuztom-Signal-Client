@@ -82,3 +82,12 @@ storage work. `CALLS_PLAN.md` remains the chronological record of the call path.
 - [x] Call observability: the SFU peek, RingRTC's participant resolution, per
       device state, audio levels and WebRTC transport counters are all read and
       logged, which is what located the member-id bug.
+- [x] **A group call mute now actually mutes.** It only set the heartbeat flag, so
+      the call was told it was muted and transmitted anyway. RingRTC states that
+      handling the track is the host's job; the 1:1 path always did, the group path
+      did not.
+- [x] **The group call banner lists everyone in the call**, each with their own
+      mute state, presenting/screen-sharing, and whether they have been heard.
+- [ ] **Receiving video and screen share are blocked on one thing**: there is no
+      real `VideoSink`, so decoded frames are discarded. That is native interop,
+      not Swift, and it gates everything else about video.

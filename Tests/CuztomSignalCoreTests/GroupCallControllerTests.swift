@@ -1635,6 +1635,81 @@ struct GroupCallControllerTests {
         #expect(bridge.steps.contains("microphoneWarmup(true)"))
     }
 
+    /// Who is in the call has to be shown from what is actually known, and the
+    /// roster and the audio claim have to come from the same update.
+    ///
+    /// A participant only appears once RingRTC has resolved its opaque id against
+    /// the member map, so an empty roster while the call reports other people
+    /// present means the member map has not resolved — not that the call is empty.
+    /// Showing the roster from a different source than the audio state would let
+    /// the two disagree, which is precisely the failure this whole debugging
+    /// session was made of.
+    @Test @MainActor func theRosterArrivesWithTheSameUpdateThatSettlesAudio() async throws {
+        let bridge = FakeBridge()
+        let controller = makeController(bridge: bridge)
+        _ = try await controller.startCall(masterKeyHex: Self.masterKeyHex)
+        await settle(controller)
+        #expect(controller.current?.participants.isEmpty == true, "nobody reported yet")
+
+        let participant = RustCoreService.GroupCallParticipant(
+            demuxId: 42,
+            serviceIdHex: String(repeating: "ab", count: 16),
+            hasMediaKeys: true,
+            isAudioMuted: false,
+            isVideoMuted: true,
+            isPresenting: nil,
+            isSharingScreen: false,
+            hasSpoken: true,
+            isForwardingVideo: nil,
+            videoHeight: 0
+        )
+        bridge.onGroupCallUpdate?(
+            RustCoreService.GroupCallUpdate(
+                kind: .remoteDevices,
+                clientId: bridge.nextClientId,
+                deviceCount: 1,
+                devicesWithMediaKeys: 1,
+                devicesThatSpoke: 1,
+                devicesUnmuted: 1,
+                participants: [participant]
+            )
+        )
+        await settle(controller)
+
+        #expect(controller.current?.participants.count == 1)
+        #expect(controller.current?.participants.first?.demuxId == 42)
+        #expect(
+            controller.current?.participants.first?.isAudible == true,
+            "unmuted with a media key is audible"
+        )
+        #expect(
+            controller.current?.isReceivingAudio == true,
+            "the roster and the audio claim come from one update, so they cannot disagree"
+        )
+    }
+
+    /// A participant we cannot decrypt is not audible, however unmuted they are.
+    ///
+    /// Without their media key nothing they send can be decrypted, so an unmuted
+    /// participant with no key is exactly as inaudible as a muted one — and it is
+    /// the state a call is in when the member map has not resolved, which looks
+    /// identical to a working call from the outside.
+    @Test @MainActor func anUnmutedParticipantWithoutAKeyIsNotAudible() {
+        let participant = RustCoreService.GroupCallParticipant(
+            demuxId: 1,
+            serviceIdHex: String(repeating: "cd", count: 16),
+            hasMediaKeys: false,
+            isAudioMuted: false,
+            isVideoMuted: nil,
+            isPresenting: nil,
+            isSharingScreen: nil,
+            hasSpoken: false,
+            isForwardingVideo: nil,
+            videoHeight: 0
+        )
+        #expect(participant.isAudible == false)
+    }
+
     // MARK: - Inbound
 
     /// An inbound signal must prepare a client, not join the call.

@@ -720,6 +720,31 @@ impl GroupUpdateHandler for CuztomGroupHandler {
                     speaking,
                     forwarding_video
                 );
+                // The participants themselves, so a call can show who is in it.
+                //
+                // These are service ids and nothing else: no names, no profile
+                // keys, nothing the SFU or the group state would consider
+                // sensitive. RingRTC can only offer a participant at all once its
+                // opaque id has been resolved against the member map, so a device
+                // that appears here is one this client can put a name to — which
+                // is worth exactly as much as the member map being right.
+                let participants: Vec<serde_json::Value> = devices
+                    .iter()
+                    .map(|device| {
+                        serde_json::json!({
+                            "demux_id": device.demux_id,
+                            "user_id_hex": hex::encode(&device.user_id),
+                            "has_media_keys": device.media_keys_received,
+                            "audio_muted": device.heartbeat_state.audio_muted,
+                            "video_muted": device.heartbeat_state.video_muted,
+                            "presenting": device.heartbeat_state.presenting,
+                            "sharing_screen": device.heartbeat_state.sharing_screen,
+                            "has_spoken": device.speaker_time.is_some(),
+                            "forwarding_video": device.forwarding_video,
+                            "video_height": device.server_allocated_height,
+                        })
+                    })
+                    .collect();
                 serde_json::json!({
                     "type": "group_update",
                     "update": "remote_devices",
@@ -729,6 +754,7 @@ impl GroupUpdateHandler for CuztomGroupHandler {
                     "devices_unmuted": unmuted,
                     "devices_that_spoke": speaking,
                     "devices_forwarding_video": forwarding_video,
+                    "participants": participants,
                 })
             }
             // Incoming audio, per participant. This is the one update that can
@@ -2213,7 +2239,29 @@ pub(crate) fn recipient_uuid_text_for_test(recipient: &[u8]) -> Option<String> {
 pub fn set_group_call_audio_muted(client_id: u32, muted: bool) -> Result<(), String> {
     require_tracked(client_id)?;
     with_manager(|m| m.set_outgoing_audio_muted(client_id, muted))?;
-    eprintln!("[core] group call audio muted={muted} client={client_id}");
+    // The heartbeat flag above is only what the *other* participants are told.
+    // RingRTC says so itself, at the end of `set_outgoing_audio_muted_inner`:
+    //
+    //     // We don't modify the outgoing audio track.  We expect the app to
+    //     // handle that.
+    //
+    // So without this the call is told it is muted and keeps transmitting the
+    // audio anyway — the worst possible combination, because the UI and every
+    // participant agree the microphone is off while it is very much on.
+    //
+    // The track is disabled rather than the device closed, so unmuting is instant
+    // and does not have to re-acquire the microphone mid-call. The 1:1 path has
+    // always done this; the group path did not, which is why muting worked in one
+    // and not the other.
+    match CALL_AUDIO_TRACK.get() {
+        Some(track) => track.set_enabled(!muted),
+        None => {
+            return Err(
+                "the audio track is gone, so muting could not be made true".to_string()
+            );
+        }
+    }
+    eprintln!("[core] group call audio muted={muted} client={client_id} track=disabled={muted}");
     Ok(())
 }
 
@@ -2475,6 +2523,50 @@ mod tests {
             "these convert a service id outside sync::ringrtc_user_id, where RingRTC's 16-byte \
              UserId is defined: {offenders:?}. Every id that crosses into RingRTC must come from \
              that one function, or media keys stop matching the member map and the call is silent."
+        );
+    }
+
+    /// Muting a group call has to actually stop the audio leaving.
+    ///
+    /// RingRTC is explicit that the heartbeat flag is not enough — at the end of
+    /// `set_outgoing_audio_muted_inner`:
+    ///
+    ///     // We don't modify the outgoing audio track.  We expect the app to
+    ///     // handle that.
+    ///
+    /// So setting the flag alone produces the worst possible state: the UI, the
+    /// heartbeat, and every other participant all agree the microphone is off
+    /// while the audio keeps being transmitted. The 1:1 path has always disabled
+    /// the track; the group path did not, which is why muting worked in one call
+    /// type and not the other.
+    ///
+    /// The track is disabled rather than the device closed, so unmuting is
+    /// immediate and does not have to re-acquire the microphone mid-call.
+    ///
+    /// This is a structural check, not a behavioural one: `AudioTrack` is a real
+    /// FFI type behind a `OnceLock` set up by `init_calls`, so there is no way to
+    /// observe the call without booting the native stack. What it does establish
+    /// is that the group path cannot regress to flag-only the way the 1:1 path
+    /// never did. A real run is still the only proof the audio stops.
+    #[test]
+    fn a_group_mute_reaches_the_core_rather_than_only_the_heartbeat() {
+        // Exercised through the exported entry point so the assertion is about
+        // the command's behaviour, not about a helper it happens to call.
+        let source = include_str!("call.rs");
+        let body = source
+            .split("pub fn set_group_call_audio_muted")
+            .nth(1)
+            .expect("the command exists")
+            .split("\n}\n")
+            .next()
+            .expect("the command has a body");
+        assert!(
+            body.contains("set_enabled"),
+            "the group mute must disable the outgoing track, not only set the heartbeat flag"
+        );
+        assert!(
+            body.contains("set_outgoing_audio_muted"),
+            "and must still tell the call, or other participants are not told"
         );
     }
 

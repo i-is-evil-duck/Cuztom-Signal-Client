@@ -1337,6 +1337,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         let devicesWithMediaKeys: Int?
         let devicesThatSpoke: Int?
         let devicesUnmuted: Int?
+        let participants: [ParticipantWire]?
 
         enum CodingKeys: String, CodingKey {
             case update, state, reason
@@ -1351,6 +1352,33 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             case devicesWithMediaKeys = "devices_with_media_keys"
             case devicesThatSpoke = "devices_that_spoke"
             case devicesUnmuted = "devices_unmuted"
+            case participants
+        }
+
+        struct ParticipantWire: Decodable {
+            let demuxId: UInt32
+            let userIdHex: String
+            let hasMediaKeys: Bool
+            let audioMuted: Bool?
+            let videoMuted: Bool?
+            let presenting: Bool?
+            let sharingScreen: Bool?
+            let hasSpoken: Bool
+            let forwardingVideo: Bool?
+            let videoHeight: UInt16
+
+            enum CodingKeys: String, CodingKey {
+                case demuxId = "demux_id"
+                case userIdHex = "user_id_hex"
+                case hasMediaKeys = "has_media_keys"
+                case audioMuted = "audio_muted"
+                case videoMuted = "video_muted"
+                case presenting
+                case sharingScreen = "sharing_screen"
+                case hasSpoken = "has_spoken"
+                case forwardingVideo = "forwarding_video"
+                case videoHeight = "video_height"
+            }
         }
 
         /// An unknown update is dropped rather than guessed at, so a newer core
@@ -1372,9 +1400,80 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
                 deviceCount: deviceCount,
                 devicesWithMediaKeys: devicesWithMediaKeys,
                 devicesThatSpoke: devicesThatSpoke,
-                devicesUnmuted: devicesUnmuted
+                devicesUnmuted: devicesUnmuted,
+                participants: (participants ?? []).map {
+                    GroupCallParticipant(
+                        demuxId: $0.demuxId,
+                        serviceIdHex: $0.userIdHex,
+                        hasMediaKeys: $0.hasMediaKeys,
+                        isAudioMuted: $0.audioMuted,
+                        isVideoMuted: $0.videoMuted,
+                        isPresenting: $0.presenting,
+                        isSharingScreen: $0.sharingScreen,
+                        hasSpoken: $0.hasSpoken,
+                        isForwardingVideo: $0.forwardingVideo,
+                        videoHeight: $0.videoHeight
+                    )
+                }
             )
         }
+    }
+
+    /// One other device in a live group call.
+    ///
+    /// A device is only ever reported once RingRTC has resolved its opaque id
+    /// against the member map, so `serviceIdHex` is a real service id that the
+    /// host can resolve to a name — not an opaque blob.
+    public struct GroupCallParticipant: Sendable, Equatable, Identifiable {
+        public var id: UInt32 { demuxId }
+        public let demuxId: UInt32
+        /// The 16-byte service id, hex.
+        public let serviceIdHex: String
+        /// Whether their media key has arrived, so their audio can be decrypted.
+        public let hasMediaKeys: Bool
+        /// `nil` until their heartbeat says; unset is not the same as unmuted.
+        public let isAudioMuted: Bool?
+        public let isVideoMuted: Bool?
+        public let isPresenting: Bool?
+        public let isSharingScreen: Bool?
+        /// Whether they have been heard at all, which is the only evidence in this
+        /// build that someone is actually transmitting.
+        public let hasSpoken: Bool
+        public let isForwardingVideo: Bool?
+        public let videoHeight: UInt16
+
+        public init(
+            demuxId: UInt32,
+            serviceIdHex: String,
+            hasMediaKeys: Bool,
+            isAudioMuted: Bool?,
+            isVideoMuted: Bool?,
+            isPresenting: Bool?,
+            isSharingScreen: Bool?,
+            hasSpoken: Bool,
+            isForwardingVideo: Bool?,
+            videoHeight: UInt16
+        ) {
+            self.demuxId = demuxId
+            self.serviceIdHex = serviceIdHex
+            self.hasMediaKeys = hasMediaKeys
+            self.isAudioMuted = isAudioMuted
+            self.isVideoMuted = isVideoMuted
+            self.isPresenting = isPresenting
+            self.isSharingScreen = isSharingScreen
+            self.hasSpoken = hasSpoken
+            self.isForwardingVideo = isForwardingVideo
+            self.videoHeight = videoHeight
+        }
+
+        /// Whether this participant is audible to us.
+        ///
+        /// Deliberately two conditions rather than one. A device can be unmuted
+        /// and still inaudible, because without its media key nothing it sends can
+        /// be decrypted — and that is exactly the state a call is in when the
+        /// member map has not resolved, which looks identical to a working call
+        /// from the outside.
+        public var isAudible: Bool { hasMediaKeys && isAudioMuted == false }
     }
 
     /// A live group call, addressed by its RingRTC client id.
@@ -1524,6 +1623,10 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
         public let devicesWithMediaKeys: Int?
         public let devicesThatSpoke: Int?
         public let devicesUnmuted: Int?
+        /// For `remoteDevices`: who is in the call. A device appears here only
+        /// once RingRTC has resolved its opaque id against the member map, so
+        /// every entry is one this client can name.
+        public let participants: [GroupCallParticipant]
 
         public init(
             kind: Kind,
@@ -1540,7 +1643,8 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             deviceCount: Int? = nil,
             devicesWithMediaKeys: Int? = nil,
             devicesThatSpoke: Int? = nil,
-            devicesUnmuted: Int? = nil
+            devicesUnmuted: Int? = nil,
+            participants: [GroupCallParticipant] = []
         ) {
             self.kind = kind
             self.clientId = clientId
@@ -1557,6 +1661,7 @@ public final class RustCoreService: SignalService, @unchecked Sendable {
             self.devicesWithMediaKeys = devicesWithMediaKeys
             self.devicesThatSpoke = devicesThatSpoke
             self.devicesUnmuted = devicesUnmuted
+            self.participants = participants
         }
     }
 

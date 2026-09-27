@@ -31,8 +31,24 @@ total, and each reported by nothing:
 | 2 | Sender id 17 bytes where RingRTC's `UserId` is 16 | Every inbound media key discarded; incoming audio undecryptable. Silence inbound. |
 | 3 | Microphone never opened — `set_audio_warmup` never called | Outgoing track carried nothing. Silence outbound. |
 
-**The transmit direction was still broken at the time of writing** and is fixed but
-unconfirmed; see §4A.
+**Both directions now confirmed working** against a real second client on
+2026-09-26.
+
+**A fourth fault, found immediately afterwards and now fixed:** muting a group call
+only set the heartbeat flag. RingRTC says outright that this is the host's job —
+at the end of `set_outgoing_audio_muted_inner`:
+
+```rust
+// We don't modify the outgoing audio track.  We expect the app to handle that.
+```
+
+So the call was told it was muted and transmitted anyway: the UI, the heartbeat and
+every other participant agreed the microphone was off while it was very much on.
+The 1:1 path has always disabled the track; the group path did not. The track is
+now disabled rather than the device closed, so unmuting is immediate.
+
+This is the worst class of bug in the set, because it is not a failure to work — it
+is a claim to others that something is off when it is on.
 
 ## 1. Where this actually stands
 
@@ -239,7 +255,7 @@ peek is the real signal and is where the participant counts come from.
 | Announce the call to the group with its `eraId` | `GroupCallUpdate` on join/leave | — | **missing** |
 | Peek before joining, for a lobby | `peekGroupCall()` | joins blind | **missing** |
 | Show participant count / capacity before joining | `maxDevices`, pending clients | — | **missing** |
-| Named participant roster in the UI | `GroupCallRemoteParticipantType` | a count only | **missing** |
+| Named participant roster in the UI | `GroupCallRemoteParticipantType` | names, mute state, presenting, video | match |
 | Full call screen | `CallScreen.dom.tsx` | a banner | **missing** |
 | Record group calls in history | yes | 1:1 only | **missing** |
 
@@ -339,18 +355,37 @@ is confirmed.
       read under a mutex that can only fail if a test panics mid-hold; decide
       whether a poisoned lock should be recovered from or surfaced.
 
-### C. Video
+### C. Video and screen sharing
+
+Ordered by dependency. **None of this is started**, and the honest position is that
+C2 is the gate on all of it.
 
 - [ ] **C1. Stop 1:1 video pretending.** Either wire `setLocalVideoEnabled` to the
-      core or remove the control. *Done when:* no control in the app claims a
+      core or remove the control. Cheapest item here and the only one that is
+      purely a matter of not lying. *Done when:* no control in the app claims a
       capability the app does not have.
-- [ ] **C2. A real incoming `VideoSink`.** `NativeCallContext` is given a
-      `NullVideoSink`, so decoded remote frames are discarded. Rendering them
-      needs real native interop.
-- [ ] **C3. Bind the outgoing video source to the camera.** It is created and left
+- [ ] **C2. A real incoming `VideoSink`. `NativeCallContext` is given a
+      `NullVideoSink`, so every decoded remote frame is discarded — screen share
+      included, since it arrives as video.** This is the gate: receiving video and
+      receiving a screen share are the same work, and neither can start until there
+      is somewhere to put frames.
+      *What it involves:* a `VideoSink` implementation that receives
+      `VideoFrame`s, a CoreMedia/VideoToolbox path to get them on screen, and the
+      native callback wiring to deliver them across the FFI boundary. This is
+      native interop, not Swift.
+      *Done when:* a remote participant's video and a shared screen both appear.
+- [ ] **C3. Bind the outgoing video source to the camera.** Created and left
       alone. Camera permission is already requested correctly — only on demand,
-      and a refusal leaves the camera off without ending the call.
+      and a refusal leaves the camera off without ending the call — so the
+      permission half is done and the capture half is not.
 - [ ] **C4. A local preview.** Needed before a group call screen is meaningful.
+- [ ] **C5. Screen share as a distinct mode.** Presenting and screen sharing are
+      separate fields in the SFU heartbeat and are not the same thing: a share is
+      usually 30fps with no audio, a camera is the opposite. RingRTC already
+      negotiates them separately, so the host has to as well.
+- [ ] **C6. Video requests.** The SFU only forwards video once asked, and RingRTC
+      drives that from the peer's height. It should follow automatically once C2
+      works, but it is unverified and belongs on the list rather than assumed.
 
 ### D. Group call experience
 
@@ -359,8 +394,10 @@ is confirmed.
       (`maxDevices`), and whether joining is possible at all.
 - [ ] **D2. A group call screen.** 1:1 has one; groups have a banner. Reuse
       `CallControlsBar`.
-- [ ] **D3. Named participants.** The roster is a count. The SFU can name
-      participants now that the member map resolves, so the data exists.
+- [x] **D3. Named participants.** The banner lists everyone RingRTC has resolved,
+      each with their own mute state, whether they are presenting or sharing their
+      screen, and whether they have been heard. A participant with no media key
+      says so, because they cannot be heard and that is otherwise invisible.
 - [ ] **D4. Group calls in history.** 1:1 only today.
 - [ ] **D5. Device reselection timer.** Re-run selection so a headset plugged in
       mid-call is picked up.
