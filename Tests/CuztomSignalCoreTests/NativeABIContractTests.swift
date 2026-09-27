@@ -201,6 +201,31 @@ struct NativeABIContractTests {
         }
     }
 
+    /// Every symbol the loader asks for must be declared in the header.
+    ///
+    /// The other half of the parity contract. `theSetOfUnwiredHeaderCommandsHasNot
+    /// Grown` catches a capability being declared and left unreachable; this
+    /// catches the opposite — the loader asking for something that does not exist.
+    ///
+    /// That is not hypothetical. `core_cmd_group_call_set_video_muted` lost its
+    /// `#[no_mangle]` to an editing mistake, so the dylib never exported it. The
+    /// loader's `resolve` needs *every* symbol and returns nil for a single missing
+    /// one, so the whole library was rejected and the app refused to start with
+    /// "rust core not found" — which points at the bundle rather than at a missing
+    /// attribute. A `dlsym` string typo would fail the same way and just as
+    /// unhelpfully.
+    @Test func everySymbolTheLoaderAsksForIsDeclared() throws {
+        let header = try Self.contents(of: "rust-core/include/cuztom_signal_core.h")
+        let loader = try Self.contents(of: "Sources/CuztomSignalCore/RustCoreService.swift")
+        let declared = Set(Self.declaredSymbols(in: header))
+        let asked = Set(Self.lookedUpSymbols(in: loader))
+        let undeclared = asked.subtracting(declared)
+        #expect(
+            undeclared.isEmpty,
+            "the loader asks for symbols the header does not declare: \(undeclared.sorted())"
+        )
+    }
+
     @Test func theSetOfUnwiredHeaderCommandsHasNotGrown() throws {
         // Some header commands are declared but not wired, either because they
         // are superseded or because the native side still refuses them. That is

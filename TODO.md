@@ -60,6 +60,11 @@ storage work. `CALLS_PLAN.md` remains the chronological record of the call path.
 - [ ] Reproducible signed and notarized DMG release script.
 - [ ] An update channel.
 - [ ] Notarization licensing and privacy review.
+- [x] A `#[no_mangle]` lost to an editing mistake no longer fails silently. It
+      cost a build that would not start, reported as "rust core not found" --
+      which points at the bundle rather than at the missing attribute. The parity
+      check is now three-way: Rust to header, header back to Rust, and header to
+      the Swift loader's `dlsym` names.
 - [ ] `swift test` segfaults at process exit roughly 1 run in 4, *after* every
       test has passed. Pre-existing — reproduced at `e2608cb` with later work
       stashed. Harmless to the results, but it hides real failures and should be

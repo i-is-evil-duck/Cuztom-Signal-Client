@@ -4115,6 +4115,7 @@ pub extern "C" fn core_cmd_group_call_reset_video() -> i32 {
     0
 }
 
+#[no_mangle]
 pub extern "C" fn core_cmd_group_call_set_video_muted(client_id: u32, muted: u32) -> i32 {
     match roundtrip(|reply| Command::GroupCallSetVideoMuted {
         client_id,
