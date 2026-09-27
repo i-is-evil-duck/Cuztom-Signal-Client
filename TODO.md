@@ -91,3 +91,10 @@ storage work. `CALLS_PLAN.md` remains the chronological record of the call path.
 - [ ] **Receiving video and screen share are blocked on one thing**: there is no
       real `VideoSink`, so decoded frames are discarded. That is native interop,
       not Swift, and it gates everything else about video.
+- [x] **Video sink written and wired in** (`rust-core/src/video.rs`). One slot per
+      demux id, scaled before conversion, dropped rather than queued, 10 tests
+      through the real native conversion. Supplying it is also what turns
+      `enable_video_frame_content` on — with a null sink the native layer was never
+      asked to produce frames at all.
+- [ ] **Get frames from Rust to Swift**, then render them. The remaining half of
+      `VIDEO_PLAN.md`, steps 3 and 4.

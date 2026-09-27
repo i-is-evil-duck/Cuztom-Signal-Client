@@ -1027,7 +1027,14 @@ pub fn start_group_call(
         peer_connection_factory: None,
         outgoing_audio_track: audio_track,
         outgoing_video_track: video_track,
-        incoming_video_sink: Some(Box::new(NullVideoSink)),
+        // A real sink, and this one line is the whole reason receiving video was
+        // impossible. `group_call.rs:5137` computes
+        // `enable_video_frame_content = incoming_video_sink.is_some()` and hands it
+        // to the native peer connection, so with a null sink the native layer was
+        // never asked to produce frame content at all — not discarding frames,
+        // never making any. Supplying a sink turns delivery on; there is no other
+        // flag to set.
+        incoming_video_sink: Some(Box::new(crate::video::CuztomVideoSink::shared())),
     };
 
     let client_id = with_manager_flat(|m| m.create_group_call_client(params))?;
@@ -1342,15 +1349,6 @@ fn ice_servers() -> Vec<IceServer> {
     )]
 }
 
-#[derive(Clone, Copy, Default)]
-struct NullVideoSink;
-impl VideoSink for NullVideoSink {
-    fn on_video_frame(&self, _demux_id: DemuxId, _frame: VideoFrame) {}
-    fn box_clone(&self) -> Box<dyn VideoSink> {
-        Box::new(Self)
-    }
-}
-
 /// Select the first CoreAudio input/output when the native audio device module
 /// has finished enumerating them. Failure is non-fatal: the default device
 /// selected by WebRTC remains usable and the next call can retry setup.
@@ -1417,12 +1415,17 @@ pub fn init_calls() -> Result<(), String> {
         .create_outgoing_video_track(&outgoing_video_source)
         .map_err(|e| format!("video track: {e}"))?;
 
+    // The 1:1 path gets the same sink rather than a null one. 1:1 video has no UI
+    // at all — `setLocalVideoEnabled` only flips a struct field — but dropping
+    // frames silently would mean "1:1 video does not work" and "1:1 video is
+    // never wired up" are indistinguishable from the outside. Capturing them
+    // costs one conversion and makes the counts honest.
     let call_context = NativeCallContext::new(
         false,
         ice_servers(),
         outgoing_audio_track,
         outgoing_video_track.clone(),
-        Box::new(NullVideoSink),
+        Box::new(crate::video::CuztomVideoSink::shared()),
     );
     let _ = CALL_CONTEXT.set(call_context);
     // Group calls need the outgoing tracks to build a new client, and the

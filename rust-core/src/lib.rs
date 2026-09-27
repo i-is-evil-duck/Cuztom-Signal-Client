@@ -43,6 +43,7 @@ mod groups;
 mod encrypted_store;
 
 mod call;
+pub mod video;
 
 pub mod group_calls;
 
